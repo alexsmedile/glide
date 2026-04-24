@@ -468,10 +468,15 @@ impl Reactor {
                     // a drag is in progress.
                 }
             }
-            Event::WindowsOnScreenUpdated { pid, on_screen } => match pid {
-                Some(_) => self.update_partial_window_server_info(on_screen),
-                None => self.update_complete_window_server_info(on_screen),
-            },
+            Event::WindowsOnScreenUpdated { pid, on_screen } => {
+                match pid {
+                    Some(_) => self.update_partial_window_server_info(on_screen),
+                    None => self.update_complete_window_server_info(on_screen),
+                }
+                if let Some(pid) = pid {
+                    self.window_list_updated(pid);
+                }
+            }
             Event::WindowReplaced { old, new } => {
                 self.send_layout_event(LayoutEvent::WindowReplaced { old, new });
             }
@@ -827,6 +832,10 @@ impl Reactor {
         self.window_ids
             .extend(new.iter().flat_map(|(wid, info)| info.sys_id.map(|wsid| (wsid, *wid))));
         self.windows.extend(new.into_iter().map(|(wid, info)| (wid, info.into())));
+        self.window_list_updated(pid);
+    }
+
+    fn window_list_updated(&mut self, pid: i32) {
         let mut app_windows: BTreeMap<SpaceId, Vec<(WindowId, LayoutWindowInfo)>> = BTreeMap::new();
         let app = self.apps.get(&pid);
         for wid in self
@@ -863,11 +872,11 @@ impl Reactor {
         }
         // If it's possible we just added the main window to the layout, make
         // sure the layout knows it's focused.
-        if let Some(main_window) = self.main_window() {
-            if main_window.pid == pid {
-                let spaces = self.screens.iter().flat_map(|screen| screen.space).collect();
-                self.send_layout_event(LayoutEvent::WindowFocused(spaces, main_window));
-            }
+        if let Some(main_window) = self.main_window()
+            && main_window.pid == pid
+        {
+            let spaces = self.screens.iter().flat_map(|screen| screen.space).collect();
+            self.send_layout_event(LayoutEvent::WindowFocused(spaces, main_window));
         }
     }
 
