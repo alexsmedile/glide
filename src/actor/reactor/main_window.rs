@@ -76,6 +76,15 @@ impl MainWindowTracker {
                 app.main_window = wid;
                 (pid, quiet)
             }
+            &Event::WindowReplaced { old, new } => {
+                if let Some(app) = self.apps.get_mut(&old.pid)
+                    && app.main_window == Some(old)
+                {
+                    app.main_window.replace(new);
+                }
+                // TODO is this correct?
+                return None;
+            }
             Event::ApplicationTerminated(..)
             | Event::StartupComplete
             | Event::WindowsDiscovered { .. }

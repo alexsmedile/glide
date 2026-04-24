@@ -67,6 +67,10 @@ pub enum LayoutEvent {
     WindowsOnScreenUpdated(SpaceId, pid_t, Vec<(WindowId, LayoutWindowInfo)>),
     WindowAdded(SpaceId, WindowId, LayoutWindowInfo),
     WindowRemoved(WindowId),
+    WindowReplaced {
+        old: WindowId,
+        new: WindowId,
+    },
     WindowFocused(Vec<SpaceId>, WindowId),
     WindowResized {
         wid: WindowId,
@@ -533,6 +537,10 @@ impl LayoutManager {
             LayoutEvent::WindowRemoved(wid) => {
                 self.tree.remove_window(wid);
                 self.floating_windows.remove(&wid);
+            }
+            LayoutEvent::WindowReplaced { old, new } => {
+                // TODO: replace other window ids in self
+                self.tree.replace_window(old, new);
             }
             LayoutEvent::WindowFocused(spaces, wid) => {
                 self.focused_window = Some(wid);

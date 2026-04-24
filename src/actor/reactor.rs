@@ -130,6 +130,10 @@ pub enum Event {
         pid: Option<pid_t>,
         on_screen: WindowsOnScreen,
     },
+    WindowReplaced {
+        old: WindowId,
+        new: WindowId,
+    },
 
     // TODO: Consider replacing with WindowsOnScreenUpdated.
     WindowBecameVisible(WindowId),
@@ -468,6 +472,9 @@ impl Reactor {
                 Some(_) => self.update_partial_window_server_info(on_screen),
                 None => self.update_complete_window_server_info(on_screen),
             },
+            Event::WindowReplaced { old, new } => {
+                self.send_layout_event(LayoutEvent::WindowReplaced { old, new });
+            }
             Event::WindowBecameVisible(wid) => {
                 if self.window_is_tracked(wid)
                     && let Some(window) = self.windows.get(&wid)

@@ -260,6 +260,10 @@ impl LayoutTree {
         }
     }
 
+    pub fn replace_window(&mut self, old: WindowId, new: WindowId) {
+        self.tree.data.window.replace_window(old, new);
+    }
+
     /// Adds and removes windows so that the set of windows in a space is exactly `wids`.
     ///
     /// For now, new windows are added directly to the root node.
