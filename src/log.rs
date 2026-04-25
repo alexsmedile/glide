@@ -13,6 +13,23 @@ use tracing_subscriber::{EnvFilter, Layer};
 use tracing_timing::{Histogram, group};
 use tracing_tree::time::UtcDateTime;
 
+#[allow(unused_macros)]
+#[deprecated = "remove before merging"]
+/// Like the dbg!() macro, but emits logs.
+macro_rules! log {
+    ($val:expr $(,)?) => {
+        match $val {
+            tmp => {
+                ::tracing::info!("{} = {:?}", ::core::stringify!($val), tmp);
+                tmp
+            }
+        }
+    };
+}
+#[allow(unused_imports)]
+#[expect(deprecated)]
+pub(crate) use log;
+
 pub fn init_logging() {
     let pid = std::process::id();
     // let logfile = tracing_appender::rolling::never("/tmp", format!("glide.{pid}.log"));
