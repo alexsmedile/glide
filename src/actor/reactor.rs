@@ -407,7 +407,8 @@ impl Reactor {
             Event::WindowFrameChanged(..)
             | Event::MouseUp
             | Event::LeftMouseDown(_)
-            | Event::LeftMouseDragged(_) => trace!(?event, "Event"),
+            | Event::LeftMouseDragged(_)
+            | Event::ScrollWheel { .. } => trace!(?event, "Event"),
             _ => debug!(?event, "Event"),
         }
     }
