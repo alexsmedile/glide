@@ -130,6 +130,11 @@ pub enum Event {
         pid: Option<pid_t>,
         on_screen: WindowsOnScreen,
     },
+
+    /// One window was replaced with another on screen. The new window should
+    /// replace the old one in the layout.
+    ///
+    /// This is usually the result of apps using "native tabs".
     WindowReplaced {
         old: WindowId,
         new: WindowId,
@@ -246,7 +251,7 @@ struct Screen {
 #[derive(Default, Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TransactionId(u32);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct WindowState {
     #[allow(unused)]
     title: Secret<String>,
@@ -479,6 +484,24 @@ impl Reactor {
                 }
             }
             Event::WindowReplaced { old, new } => {
+                // We may not have any info from the app or window_server actors
+                // about this window yet, which could result in it being removed
+                // from the layout. Backfill info from the original window in
+                // the meantime.
+                if let Some(old_ws) = old.wsid() {
+                    self.visible_windows.remove(&old_ws);
+                }
+                if let Some(new_ws) = new.wsid() {
+                    self.visible_windows.insert(new_ws);
+                    self.window_ids.insert(new_ws, new);
+                }
+                if !self.windows.contains_key(&new)
+                    && let Some(old_state) = self.windows.get(&old)
+                {
+                    let mut new_state = old_state.clone();
+                    new_state.window_server_id = new.wsid();
+                    self.windows.insert(new, new_state);
+                }
                 self.send_layout_event(LayoutEvent::WindowReplaced { old, new });
             }
             Event::WindowBecameVisible(wid) => {
@@ -510,7 +533,9 @@ impl Reactor {
                 self.send_layout_event(LayoutEvent::WindowRemoved(wid));
             }
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
-                let window = self.windows.get_mut(&wid).unwrap();
+                let Some(window) = self.windows.get_mut(&wid) else {
+                    return;
+                };
                 if last_seen != window.last_sent_txid {
                     // Ignore events that happened before the last time we
                     // changed the size or position of this window. Otherwise
@@ -942,6 +967,7 @@ impl Reactor {
         visible_window_order: &[WindowServerId],
         from_mouse: bool,
     ) {
+        debug!(?event, ?from_mouse, "send_layout_event");
         let response = self.layout.handle_event(event);
         self.handle_layout_response_with_visible_window_order(
             response,
