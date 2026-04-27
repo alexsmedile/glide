@@ -800,7 +800,8 @@ impl Reactor {
         // windows, even for partial (per-app) updates. Replace rather than
         // extend to avoid accumulating stale entries.
         self.visible_windows.clear();
-        self.visible_windows.extend(on_screen.visible);
+        self.visible_windows
+            .extend(on_screen.visible.into_iter().flat_map(|id| id.wsid()));
         self.window_server_info
             .extend(on_screen.info.into_iter().map(|info| (info.id, info)));
     }
@@ -858,6 +859,7 @@ impl Reactor {
         self.window_list_updated(pid);
     }
 
+    #[instrument(skip(self))]
     fn window_list_updated(&mut self, pid: i32) {
         let mut app_windows: BTreeMap<SpaceId, Vec<(WindowId, LayoutWindowInfo)>> = BTreeMap::new();
         let app = self.apps.get(&pid);
@@ -868,7 +870,9 @@ impl Reactor {
             .filter(|wid| wid.pid == pid)
             .filter(|wid| self.window_is_tracked(*wid))
         {
-            let Some(window) = self.windows.get(&wid) else { continue };
+            let Some(window) = self.windows.get(&wid) else {
+                continue;
+            };
             let Some(space) = self.best_space_for_window(&window.frame_monotonic) else {
                 continue;
             };

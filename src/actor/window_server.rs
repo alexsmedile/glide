@@ -6,17 +6,17 @@ use std::mem;
 use std::rc::{Rc, Weak};
 
 use objc2::MainThreadMarker;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument, trace, warn};
 
 pub use crate::actor::app::pid_t;
 use crate::actor::app::{self, AppInfo, AppThreadHandle, Quiet, WindowId, WindowInfo};
 use crate::actor::{self, reactor, space_manager};
-use crate::collections::HashMap;
+use crate::collections::{HashMap, HashSet};
 use crate::sys::event::MouseState;
 use crate::sys::screen::{NSScreenInfo, ScreenCache, SpaceId};
 use crate::sys::window_server::{
     self as sys_ws, SkylightConnection, SkylightNotifier, WindowServerId, WindowsOnScreen,
-    kCGSWindowIsTerminated,
+    kCGSWindowIsTerminated, kCGSWindowIsVisible,
 };
 
 /// CGWindowLevel values for windows we care about. Everything else (e.g.
@@ -36,7 +36,8 @@ pub struct WindowServer {
     /// Current space on each screen.
     cur_space: Vec<SpaceId>,
     /// Window server IDs currently visible on screen.
-    visible_window_ids: Vec<WindowServerId>,
+    visible_window_ids: HashSet<WindowServerId>,
+    visible_windows: HashMap<WindowServerId, sys_ws::WindowServerInfo>,
     sm_tx: space_manager::Sender,
     skylight_tx: SkylightSender,
 }
@@ -61,6 +62,9 @@ pub enum Event {
     ApplicationMainWindowChanged(pid_t, Option<WindowId>, Quiet),
     /// A window was minimized or unminimized.
     WindowVisibilityChanged(WindowId),
+    /// A window became visible.
+    WindowBecameVisible(pid_t, WindowServerId),
+    WindowDestroyed(WindowId),
     ApplicationLaunched {
         pid: pid_t,
         handle: AppThreadHandle,
@@ -86,8 +90,9 @@ impl WindowServer {
     pub fn new(sm_tx: space_manager::Sender, skylight_tx: SkylightSender) -> Self {
         Self {
             screen_cache: ScreenCache::new(),
-            cur_space: vec![],
-            visible_window_ids: vec![],
+            cur_space: Vec::new(),
+            visible_window_ids: HashSet::default(),
+            visible_windows: HashMap::default(),
             sm_tx,
             skylight_tx,
         }
@@ -102,6 +107,11 @@ impl WindowServer {
 
     #[instrument(skip(self))]
     fn on_event(&mut self, event: Event) {
+        if let Event::ReactorEvent(..) | Event::WindowBecameVisible(..) = &event {
+            trace!("event");
+        } else {
+            debug!("event");
+        }
         match event {
             Event::RegisterWindow(wsid, wid, tx) => {
                 self.skylight_tx.send(SkylightRequest::TrackWindow(wsid, wid, tx));
@@ -128,18 +138,30 @@ impl WindowServer {
                 self.sm_tx.send(space_manager::Event::SpaceChanged(spaces, on_screen));
             }
             Event::WindowCreated(wid, info, mouse_state) => {
-                let pid = wid.pid;
                 self.send_reactor_event(reactor::Event::WindowCreated(wid, info, mouse_state));
-                self.send_windows_on_screen_if_changed(Some(pid));
-                self.send_reactor_event(reactor::Event::WindowBecameVisible(wid));
+                self.send_windows_on_screen_if_changed(Some(wid.pid));
+            }
+            Event::WindowDestroyed(wid) => {
+                self.send_windows_on_screen_if_changed(Some(wid.pid));
+                self.send_reactor_event(reactor::Event::WindowDestroyed(wid));
             }
             Event::ApplicationMainWindowChanged(pid, wid, quiet) => {
+                self.send_windows_on_screen_if_changed(Some(pid));
                 self.send_reactor_event(reactor::Event::ApplicationMainWindowChanged(
                     pid, wid, quiet,
                 ));
             }
             Event::WindowVisibilityChanged(window_id) => {
                 self.send_windows_on_screen_if_changed(Some(window_id.pid));
+            }
+            Event::WindowBecameVisible(pid, wsid) => {
+                if self.visible_window_ids.contains(&wsid) {
+                    return;
+                }
+                // This is a trace log above because we ignore many of these
+                // events, but make it a debug log if we detected a change.
+                debug!("event");
+                self.send_windows_on_screen_if_changed(Some(pid));
             }
             Event::ApplicationLaunched {
                 pid,
@@ -170,9 +192,46 @@ impl WindowServer {
     /// Queries the window server for visible windows and sends a
     /// `WindowsOnScreenUpdated` event if the list changed.
     fn send_windows_on_screen_if_changed(&mut self, pid: Option<pid_t>) {
-        let prev = mem::take(&mut self.visible_window_ids);
+        let old_windows = mem::take(&mut self.visible_windows);
+        let old_ids = old_windows
+            .iter()
+            .filter(|(_id, w)| pid.is_none() || pid == Some(w.pid))
+            .map(|(id, _w)| *id)
+            .collect::<HashSet<_>>();
         let on_screen = self.get_windows_on_screen();
-        if self.visible_window_ids != prev {
+        let new_ids = on_screen
+            .visible
+            .iter()
+            .filter(|id| pid.is_none() || pid == Some(id.pid))
+            .flat_map(|id| id.wsid())
+            .collect::<HashSet<_>>();
+        debug!(?old_ids, ?new_ids);
+        #[allow(irrefutable_let_patterns)]
+        if let added_ids = new_ids.difference(&old_ids).copied().collect::<Vec<_>>().as_slice()
+            && let &[new_id] = added_ids
+            && let removed_ids =
+                old_ids.difference(&new_ids).copied().collect::<Vec<_>>().as_slice()
+            && let &[old_id] = removed_ids
+            && let Some(new) = self.visible_windows.get(&new_id)
+            && let Some(old) = old_windows.get(&old_id)
+            && new.pid == old.pid
+        {
+            debug!("{old_id:?} => {new_id:?}");
+            if let [old, new] = sys_ws::get_windows(&[old_id, new_id]).as_slice()
+                && (old.layer != new.layer || old.frame != new.frame)
+            {
+                // Not actually the same.
+                debug!("{old:?} != {new:?}");
+            } else {
+                warn!("Tab detected: {old:?} => {new:?}");
+                self.send_reactor_event(reactor::Event::WindowReplaced {
+                    old: WindowId::with_wsid(old.pid, old_id),
+                    new: WindowId::with_wsid(new.pid, new_id),
+                });
+                return;
+            }
+        }
+        if new_ids != old_ids {
             self.send_reactor_event(reactor::Event::WindowsOnScreenUpdated { pid, on_screen });
         }
     }
@@ -189,6 +248,7 @@ impl WindowServer {
             .into_iter()
             .filter(|w| matches!(w.layer, LAYER_NORMAL | LAYER_FLOATING | LAYER_STATUS))
             .collect();
+        self.visible_windows = windows.iter().map(|w| (w.id, w.clone())).collect();
         self.visible_window_ids = windows.iter().map(|w| w.id).collect();
         WindowsOnScreen::new(windows)
     }
@@ -223,8 +283,8 @@ struct SkylightWatcherState {
     connection: SkylightConnection,
     notifiers: Vec<SkylightNotifier>,
     weak_self: Weak<RefCell<Self>>,
-    /// Registered windows (for SkyLight destruction tracking).
     registered_windows: HashMap<WindowServerId, (WindowId, AppThreadHandle)>,
+    ws_tx: Sender,
 }
 
 /// Commands sent from the reactor-thread `WindowServer` to the main-thread
@@ -238,7 +298,7 @@ pub type SkylightSender = actor::Sender<SkylightRequest>;
 pub type SkylightReceiver = actor::Receiver<SkylightRequest>;
 
 impl SkylightWatcher {
-    pub fn new(mtm: MainThreadMarker) -> Self {
+    pub fn new(mtm: MainThreadMarker, ws_tx: Sender) -> Self {
         Self(Rc::new_cyclic(
             |weak_self: &Weak<RefCell<SkylightWatcherState>>| {
                 let mut state = SkylightWatcherState {
@@ -246,6 +306,7 @@ impl SkylightWatcher {
                     notifiers: vec![],
                     weak_self: weak_self.clone(),
                     registered_windows: HashMap::default(),
+                    ws_tx,
                 };
                 state.register_callbacks();
                 RefCell::new(state)
@@ -266,6 +327,13 @@ impl SkylightWatcherState {
     fn register_callbacks(&mut self) {
         self.register_callback(kCGSWindowIsTerminated, |this, wsid| {
             this.on_window_destroyed(wsid)
+        });
+        self.register_callback(kCGSWindowIsVisible, |this, wsid| {
+            let Some((wid, _)) = this.registered_windows.get(&wsid) else {
+                warn!("Got kCGSWindowIsVisible for unregistered window {wsid:?}");
+                return;
+            };
+            this.ws_tx.send(Event::WindowBecameVisible(wid.pid, wsid))
         });
     }
 
@@ -411,7 +479,8 @@ mod tests {
         let updates = find_windows_on_screen_updated(&reactor_events);
 
         assert_eq!(updates.len(), 1);
-        let visible_ids: Vec<u32> = updates[0].visible.iter().map(|id| id.as_u32()).collect();
+        let visible_ids: Vec<u32> =
+            updates[0].visible.iter().flat_map(|id| Some(id.wsid()?.as_u32())).collect();
         assert_eq!(visible_ids, vec![1, 2, 3]);
     }
 
@@ -468,13 +537,8 @@ mod tests {
         let sm_events = h.drain_sm();
         let reactor_events = find_reactor_events(&sm_events);
 
-        // Should have WindowCreated, WindowsOnScreenUpdated, WindowBecameVisible.
+        // Should have WindowCreated and WindowsOnScreenUpdated.
         assert!(reactor_events.iter().any(|e| matches!(e, reactor::Event::WindowCreated(..))));
         assert_eq!(find_windows_on_screen_updated(&reactor_events).len(), 1);
-        assert!(
-            reactor_events
-                .iter()
-                .any(|e| matches!(e, reactor::Event::WindowBecameVisible(_)))
-        );
     }
 }

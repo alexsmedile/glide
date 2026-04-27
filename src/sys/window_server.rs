@@ -33,6 +33,7 @@ use tracing::warn;
 
 use super::geometry::{CGRectDef, ToICrate};
 use super::screen::CoordinateConverter;
+use crate::actor::app::WindowId;
 use crate::sys::app::ProcessSerialNumber;
 use crate::sys::screen::SpaceId;
 
@@ -85,13 +86,13 @@ pub struct WindowServerInfo {
 /// A snapshot of windows currently visible on screen from the window server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowsOnScreen {
-    pub visible: Vec<WindowServerId>,
+    pub visible: Vec<WindowId>,
     pub info: Vec<WindowServerInfo>,
 }
 
 impl WindowsOnScreen {
     pub fn new(info: Vec<WindowServerInfo>) -> Self {
-        let visible = info.iter().map(|w| w.id).collect();
+        let visible = info.iter().map(|w| WindowId::with_wsid(w.pid, w.id)).collect();
         Self { visible, info }
     }
 }
@@ -501,6 +502,10 @@ impl Drop for SkylightNotifier {
 
 #[expect(non_upper_case_globals)]
 pub const kCGSWindowIsTerminated: u32 = 804;
+#[expect(non_upper_case_globals)]
+pub const kCGSWindowIsVisible: u32 = 815;
+#[expect(non_upper_case_globals)]
+pub const kCGSWindowIsInvisible: u32 = 816;
 
 /// This must be called to allow hiding the mouse from a background application.
 ///
