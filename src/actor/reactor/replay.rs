@@ -16,7 +16,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use tempfile::NamedTempFile;
 use tokio::sync::mpsc::unbounded_channel;
-use tracing::Span;
+use tracing::{Span, info_span};
 
 use super::{Event, Reactor};
 use crate::actor::app::{AppThreadHandle, Request};
@@ -112,7 +112,9 @@ pub fn replay(
         }
     });
     for line in lines {
-        reactor.handle_event(ron::de::from_str(&line?)?);
+        let event = ron::de::from_str(&line?)?;
+        let _span = info_span!("Event", event = ?event).entered();
+        reactor.handle_event(event);
     }
     Ok(())
 }
