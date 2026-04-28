@@ -1110,6 +1110,7 @@ impl Reactor {
             self.group_indicators_tx
                 .send(group_bars::Event::GroupsUpdated { space_id: space, groups });
 
+            let main_window = self.main_window();
             for &(wid, target_frame) in &result {
                 let Some(window) = self.windows.get_mut(&wid) else {
                     // If we restored a saved state the window may not be available yet.
@@ -1119,6 +1120,12 @@ impl Reactor {
                 let current_frame = window.frame_monotonic;
                 if target_frame.same_as(current_frame) {
                     continue;
+                }
+                if main_window == Some(wid)
+                    && let Some(mouse_tx) = &self.mouse_tx
+                {
+                    let center = target_frame.mid();
+                    mouse_tx.send(mouse::Request::WarpIfOutside(center, target_frame));
                 }
                 let Some(app) = self.apps.get(&wid.pid) else {
                     continue;

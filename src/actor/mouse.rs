@@ -26,6 +26,7 @@ use crate::{actor, trace_call};
 #[derive(Debug)]
 pub enum Request {
     Warp(CGPoint),
+    WarpIfOutside(CGPoint, CGRect),
     /// The system resets the hidden state of the mouse each time the focused
     /// application changes. WmController sends us this request when that
     /// happens, so we can re-hide the mouse if it is supposed to be hidden.
@@ -126,17 +127,15 @@ impl Mouse {
         let mut state = self.state.borrow_mut();
         let config = self.config.borrow();
         match request {
-            Request::Warp(point) => {
-                if let Err(e) = event::warp_mouse(point) {
-                    warn!("Failed to warp mouse: {e:?}");
-                }
-                if config.settings.mouse_follows_focus
-                    && config.settings.mouse_hides_on_focus
-                    && state.hide_count == 0
+            Request::WarpIfOutside(point, rect) => {
+                if let Some(pos) = event::get_mouse_pos(state.converter)
+                    && !rect.contains(pos)
                 {
-                    debug!("Hiding mouse");
-                    state.hide_mouse();
+                    warp_mouse(&mut state, &config, point);
                 }
+            }
+            Request::Warp(point) => {
+                warp_mouse(&mut state, &config, point);
             }
             Request::EnforceHidden => {
                 if state.hide_count > 0 {
@@ -197,6 +196,23 @@ impl Mouse {
             }
             _ => (),
         }
+    }
+}
+
+fn warp_mouse(
+    state: &mut std::cell::RefMut<'_, State>,
+    config: &std::cell::Ref<'_, Arc<Config>>,
+    point: CGPoint,
+) {
+    if let Err(e) = event::warp_mouse(point) {
+        warn!("Failed to warp mouse: {e:?}");
+    }
+    if config.settings.mouse_follows_focus
+        && config.settings.mouse_hides_on_focus
+        && state.hide_count == 0
+    {
+        debug!("Hiding mouse");
+        state.hide_mouse();
     }
 }
 
