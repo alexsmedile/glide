@@ -504,7 +504,12 @@ impl LayoutManager {
                         }
                     })
                     .collect();
-                self.tree.set_windows_for_app(self.layout(space), pid, tree_windows);
+                self.tree.set_windows_for_app_adding_after(
+                    self.layout(space),
+                    pid,
+                    tree_windows,
+                    self.tree.selection(layout),
+                );
                 for wid in new_windows {
                     self.add_scroll_window(layout, wid);
                 }

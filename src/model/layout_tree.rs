@@ -267,11 +267,23 @@ impl LayoutTree {
     /// Adds and removes windows so that the set of windows in a space is exactly `wids`.
     ///
     /// For now, new windows are added directly to the root node.
-    pub fn set_windows_for_app(
+    pub fn set_windows_for_app(&mut self, layout: LayoutId, app: pid_t, desired: Vec<WindowId>) {
+        let root = self.root(layout);
+        self.set_windows_for_app_adding_after(
+            layout,
+            app,
+            desired,
+            root.last_child(self.map()).unwrap_or(root),
+        );
+    }
+
+    /// Adds and removes windows so that the set of windows in a space is exactly `wids`.
+    pub fn set_windows_for_app_adding_after(
         &mut self,
         layout: LayoutId,
         app: pid_t,
         mut desired: Vec<WindowId>,
+        after: NodeId,
     ) {
         let root = self.root(layout);
         let mut current = root
@@ -292,11 +304,11 @@ impl LayoutTree {
                     current.next();
                 }
                 (Some(des), None) => {
-                    self.add_window_under(layout, root, *des);
+                    self.add_window_after(layout, after, *des);
                     desired.next();
                 }
                 (Some(des), Some((cur, _))) if des < cur => {
-                    self.add_window_under(layout, root, *des);
+                    self.add_window_after(layout, after, *des);
                     desired.next();
                 }
                 (_, Some((_, node))) => {
@@ -1063,6 +1075,76 @@ mod tests {
         assert_eq!(tree.focus_prev(layout, n1), Some(n3));
         assert_eq!(tree.focus_prev(layout, n3), Some(n2));
         assert_eq!(tree.focus_prev(layout, n2), Some(n1));
+    }
+
+    #[test]
+    fn set_windows_for_app_adding_after_inserts_next_to_node() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let a1 = tree.add_window_under(layout, root, w(1, 1));
+        let a2 = tree.add_container(root, ContainerKind::Vertical);
+        let _b1 = tree.add_window_under(layout, a2, w(2, 1));
+        let _a3 = tree.add_window_under(layout, root, w(1, 3));
+
+        let get_windows = |tree: &LayoutTree| {
+            root.traverse_postorder(tree.map())
+                .filter_map(|node| tree.window_at(node))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!([w(1, 1), w(2, 1), w(1, 3)], *get_windows(&tree));
+
+        // New windows for pid 2 should be inserted as siblings of a1, not under
+        // the existing pid-2 container a2 nor at the end of root.
+        tree.set_windows_for_app_adding_after(layout, 2, vec![w(2, 1), w(2, 2), w(2, 3)], a1);
+
+        // Each new desired window is inserted directly after `a1`, so the later
+        // insertions appear closer to a1. Existing w(2, 1) inside a2 stays put.
+        assert_eq!(
+            [w(1, 1), w(2, 3), w(2, 2), w(2, 1), w(1, 3)],
+            *get_windows(&tree)
+        );
+    }
+
+    #[test]
+    fn set_windows_for_app_adding_after_leaf_in_container() {
+        // When `after` is a leaf inside a container, new windows should join
+        // that container as siblings.
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let _a1 = tree.add_window_under(layout, root, w(1, 1));
+        let group = tree.add_container(root, ContainerKind::Vertical);
+        let g1 = tree.add_window_under(layout, group, w(1, 2));
+        let _a3 = tree.add_window_under(layout, root, w(1, 3));
+
+        tree.set_windows_for_app_adding_after(layout, 2, vec![w(2, 1)], g1);
+
+        // w(2, 1) becomes a sibling of g1 inside `group`, so postorder visits
+        // it between w(1, 2) and w(1, 3).
+        let windows: Vec<_> =
+            root.traverse_postorder(tree.map()).filter_map(|n| tree.window_at(n)).collect();
+        assert_eq!([w(1, 1), w(1, 2), w(2, 1), w(1, 3)], *windows);
+
+        let new_node = tree.window_node(layout, w(2, 1)).unwrap();
+        assert_eq!(Some(group), new_node.parent(tree.map()));
+    }
+
+    #[test]
+    fn set_windows_for_app_adding_after_root_falls_back_to_push_back() {
+        // If `after` is the root itself (e.g. an empty layout where the
+        // selection resolves to root), new windows should be appended as
+        // children of the root.
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+
+        tree.set_windows_for_app_adding_after(layout, 1, vec![w(1, 1), w(1, 2)], root);
+
+        let windows: Vec<_> =
+            root.traverse_postorder(tree.map()).filter_map(|n| tree.window_at(n)).collect();
+        assert_eq!([w(1, 1), w(1, 2)], *windows);
+        assert_eq!(2, root.children(tree.map()).count());
     }
 
     #[test]
