@@ -461,9 +461,6 @@ impl Reactor {
                 self.on_windows_discovered(pid, new, known_visible);
             }
             Event::WindowCreated(wid, window, mouse_state) => {
-                // TODO: It's possible for a window to be on multiple spaces
-                // or move spaces. (Add a test)
-                // FIXME: We assume all windows are on the main screen.
                 if let Some(wsid) = window.sys_id {
                     self.window_ids.insert(wsid, wid);
                 }
@@ -589,8 +586,8 @@ impl Reactor {
                     let Some(space) = screen.space else { continue };
                     self.send_layout_event(LayoutEvent::SpaceExposed(space, screen.frame.size));
                 }
+                // FIXME: Update visible windows from app actors if space changed.
                 self.update_active_screen();
-                // FIXME: Update visible windows if space changed.
                 // Forward the event to group_indicators. We serialize these
                 // through the reactor instead of delivering directly from
                 // wm_controller in order to eliminate possible races with other
@@ -1147,6 +1144,8 @@ impl Reactor {
     }
 }
 
+// TODO: It's possible for a window to be on multiple spaces
+// or move spaces. (Add a test)
 #[cfg(test)]
 pub mod tests {
     use itertools::Itertools;

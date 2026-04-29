@@ -174,6 +174,8 @@ impl WindowServer {
     }
 
     fn get_windows_on_screen(&mut self) -> WindowsOnScreen {
+        // FIXME: This can trigger during space change and cause havoc. Switch
+        // an API that allows us to specify a space.
         let windows: Vec<_> = self
             .get_all_visible_windows()
             .into_iter()
