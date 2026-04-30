@@ -23,10 +23,13 @@ use tracing::{debug, warn};
 #[repr(transparent)]
 pub struct SpaceId(NonZeroU64);
 
-#[cfg(test)]
 impl SpaceId {
     pub fn new(id: u64) -> SpaceId {
         SpaceId(NonZeroU64::new(id).unwrap())
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0.get()
     }
 }
 

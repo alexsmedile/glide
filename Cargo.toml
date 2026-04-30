@@ -90,8 +90,10 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
 ] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
     "alloc",
+    "CFArray",
     "CFCGTypes",
     "CFMessagePort",
+    "CFNumber",
     "CFRunLoop",
     "CFData",
     "CFDate",

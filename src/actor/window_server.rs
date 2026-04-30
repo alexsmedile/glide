@@ -13,7 +13,7 @@ use crate::actor::app::{self, AppInfo, AppThreadHandle, Quiet, WindowId, WindowI
 use crate::actor::{self, reactor, space_manager};
 use crate::collections::HashMap;
 use crate::sys::event::MouseState;
-use crate::sys::screen::{NSScreenInfo, ScreenCache};
+use crate::sys::screen::{NSScreenInfo, ScreenCache, SpaceId};
 use crate::sys::window_server::{
     self as sys_ws, SkylightConnection, SkylightNotifier, WindowServerId, WindowsOnScreen,
     kCGSWindowIsTerminated,
@@ -33,6 +33,8 @@ const LAYER_STATUS: i32 = 8; // kCGStatusWindowLevel (used by some panels)
 /// server before sending them on to the Reactor via the SpaceManager.
 pub struct WindowServer {
     screen_cache: ScreenCache,
+    /// Current space on each screen.
+    cur_space: Vec<SpaceId>,
     /// Window server IDs currently visible on screen.
     visible_window_ids: Vec<WindowServerId>,
     sm_tx: space_manager::Sender,
@@ -84,6 +86,7 @@ impl WindowServer {
     pub fn new(sm_tx: space_manager::Sender, skylight_tx: SkylightSender) -> Self {
         Self {
             screen_cache: ScreenCache::new(),
+            cur_space: vec![],
             visible_window_ids: vec![],
             sm_tx,
             skylight_tx,
@@ -108,18 +111,19 @@ impl WindowServer {
                 else {
                     return;
                 };
+                let spaces = self.get_spaces();
                 let on_screen = self.get_windows_on_screen();
                 self.sm_tx.send(space_manager::Event::ScreenParametersChanged {
                     screens: screens.iter().map(|s| s.id).collect(),
                     frames: screens.iter().map(|s| s.visible_frame).collect(),
                     converter,
-                    spaces: self.screen_cache.get_screen_spaces(),
+                    spaces,
                     scale_factors: screens.iter().map(|s| s.scale_factor).collect(),
                     on_screen,
                 });
             }
             Event::SpaceChanged | Event::RequestSpaceRefresh => {
-                let spaces = self.screen_cache.get_screen_spaces();
+                let spaces = self.get_spaces();
                 let on_screen = self.get_windows_on_screen();
                 self.sm_tx.send(space_manager::Event::SpaceChanged(spaces, on_screen));
             }
@@ -173,9 +177,13 @@ impl WindowServer {
         }
     }
 
+    fn get_spaces(&mut self) -> Vec<Option<SpaceId>> {
+        let spaces = self.screen_cache.get_screen_spaces();
+        self.cur_space = spaces.iter().copied().flatten().collect();
+        spaces
+    }
+
     fn get_windows_on_screen(&mut self) -> WindowsOnScreen {
-        // FIXME: This can trigger during space change and cause havoc. Switch
-        // an API that allows us to specify a space.
         let windows: Vec<_> = self
             .get_all_visible_windows()
             .into_iter()
@@ -187,7 +195,10 @@ impl WindowServer {
 
     #[cfg(not(test))]
     fn get_all_visible_windows(&self) -> Vec<sys_ws::WindowServerInfo> {
-        sys_ws::get_visible_windows_with_layer(None)
+        // Scope the query to the current space on each screen so that windows
+        // from a space we are switching away from don't leak in or out during
+        // the transition.
+        sys_ws::get_visible_windows_on_spaces(&self.cur_space)
     }
 
     #[cfg(test)]

@@ -3,6 +3,7 @@
 
 use std::ffi::{c_int, c_void};
 use std::marker::PhantomData;
+use std::ptr::NonNull;
 
 use accessibility::AXUIElement;
 use accessibility_sys::{AXError, AXUIElementRef, kAXErrorSuccess, pid_t};
@@ -20,7 +21,10 @@ use core_graphics::window::{
     kCGWindowNumber, kCGWindowOwnerPID,
 };
 use objc2_app_kit::NSWindow;
-use objc2_core_foundation::{CGPoint, CGRect};
+use objc2_core_foundation::{
+    CFArray as Cf2Array, CFNumber as Cf2Number, CFNumberType, CFRetained, CFType as Cf2Type,
+    CGPoint, CGRect, kCFTypeArrayCallBacks,
+};
 use objc2_foundation::MainThreadMarker;
 use serde::{Deserialize, Serialize};
 use sorted_vec::SortedVec;
@@ -30,6 +34,7 @@ use tracing::warn;
 use super::geometry::{CGRectDef, ToICrate};
 use super::screen::CoordinateConverter;
 use crate::sys::app::ProcessSerialNumber;
+use crate::sys::screen::SpaceId;
 
 /// The window ID used by the window server.
 ///
@@ -98,6 +103,106 @@ pub fn get_visible_windows_with_layer(layer: Option<i32>) -> Vec<WindowServerInf
         .iter()
         .filter_map(|win| make_info(win, layer))
         .collect::<Vec<_>>()
+}
+
+/// Returns a list of windows on the given spaces, scoped to those spaces.
+///
+/// Unlike `get_visible_windows_with_layer`, which depends on the window
+/// server's notion of "currently on screen" and can return inconsistent results
+/// during a space change, this function asks the window server for the windows
+/// belonging to a specific list of spaces. The window server is the source of
+/// truth for which space a window belongs to.
+///
+/// Uses the private SkyLight API `SLSCopyWindowsWithOptionsAndTags`.
+pub fn get_visible_windows_on_spaces(spaces: &[SpaceId]) -> Vec<WindowServerInfo> {
+    let ids = get_window_ids_on_spaces(spaces);
+    get_windows(&ids)
+}
+
+/// Returns the window IDs reported by SkyLight as belonging to the given
+/// spaces.
+///
+/// `options` is passed directly to `SLSCopyWindowsWithOptionsAndTags`. Common
+/// values are `0x2` (on-screen, non-minimized) and `0x7` (also include
+/// minimized).
+pub fn get_window_ids_on_spaces_with_options(
+    spaces: &[SpaceId],
+    options: u32,
+) -> Vec<WindowServerId> {
+    // See here for another example of using this API:
+    // https://github.com/asmvik/yabai/blob/f51e4b56ef988354245f1774b731fcfb25510e26/src/space.c#L25
+    if spaces.is_empty() {
+        return Vec::new();
+    }
+
+    // Build a CFArray of CFNumber<i64> of space IDs.
+    let space_numbers: Vec<CFRetained<Cf2Number>> = spaces
+        .iter()
+        .filter_map(|sid| {
+            let v: i64 = sid.get() as i64;
+            unsafe {
+                Cf2Number::new(None, CFNumberType::SInt64Type, (&raw const v).cast::<c_void>())
+            }
+        })
+        .collect();
+    let mut space_ptrs: Vec<*const c_void> = space_numbers
+        .iter()
+        .map(|n| (&**n as *const Cf2Number).cast::<c_void>())
+        .collect();
+    let Some(space_array) = (unsafe {
+        Cf2Array::new(
+            None,
+            space_ptrs.as_mut_ptr(),
+            space_ptrs.len() as isize,
+            &raw const kCFTypeArrayCallBacks,
+        )
+    }) else {
+        return Vec::new();
+    };
+
+    let mut set_tags: u64 = 0;
+    let mut clear_tags: u64 = 0;
+    let cid = SLSMainConnectionID();
+    let id_array = unsafe {
+        SLSCopyWindowsWithOptionsAndTags(
+            cid,
+            0,
+            &space_array,
+            options,
+            &mut set_tags,
+            &mut clear_tags,
+        )
+    };
+    let Some(id_array) = id_array.map(|p| unsafe { CFRetained::from_raw(p) }) else {
+        return Vec::new();
+    };
+
+    let count = id_array.count();
+    let mut ids = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let raw = unsafe { id_array.value_at_index(i) };
+        if raw.is_null() {
+            continue;
+        }
+        // SLSCopyWindowsWithOptionsAndTags returns CFNumbers wrapped in a
+        // CFArray with kCFTypeArrayCallBacks.
+        let cf = unsafe { &*(raw as *const Cf2Type) };
+        let Some(num) = cf.downcast_ref::<Cf2Number>() else {
+            continue;
+        };
+        let mut id_val: i64 = 0;
+        let ok = unsafe { num.value(CFNumberType::SInt64Type, (&raw mut id_val).cast::<c_void>()) };
+        if ok {
+            ids.push(WindowServerId(id_val as u32));
+        }
+    }
+    ids
+}
+
+/// Equivalent to `get_window_ids_on_spaces_with_options(spaces, 0x2)`:
+/// on-screen, non-minimized windows.
+pub fn get_window_ids_on_spaces(spaces: &[SpaceId]) -> Vec<WindowServerId> {
+    get_window_ids_on_spaces_with_options(spaces, 0x2)
 }
 
 /// Returns only the window server IDs of windows visible on the screen.
@@ -229,7 +334,7 @@ unsafe extern "C" {
 
     fn SLPSPostEventRecordTo(psn: *const ProcessSerialNumber, bytes: *const u8) -> CGError;
 
-    // safe fn SLSMainConnectionID() -> SLSConnectionID;
+    safe fn SLSMainConnectionID() -> SLSConnectionID;
     safe fn SLSDefaultConnectionForThread() -> SLSConnectionID;
 
     safe fn SLSRegisterConnectionNotifyProc(
@@ -251,6 +356,15 @@ unsafe extern "C" {
         window_list: *const CGWindowID,
         window_count: i32,
     ) -> CGError;
+
+    fn SLSCopyWindowsWithOptionsAndTags(
+        cid: SLSConnectionID,
+        owner: u32,
+        spaces: &Cf2Array,
+        options: u32,
+        set_tags: *mut u64,
+        clear_tags: *mut u64,
+    ) -> Option<NonNull<Cf2Array>>;
 }
 
 type SkylightNotifierCallback = extern "C-unwind" fn(

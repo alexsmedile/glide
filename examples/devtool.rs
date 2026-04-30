@@ -24,7 +24,7 @@ use glide_wm::actor::{self, reactor};
 use glide_wm::sys::app::{AXUIElementExt, AppInfo, NSRunningApplicationExt, WindowInfo};
 use glide_wm::sys::event::{self, get_mouse_pos};
 use glide_wm::sys::executor::Executor;
-use glide_wm::sys::screen::{self, ScreenCache};
+use glide_wm::sys::screen::{self, ScreenCache, SpaceId};
 use glide_wm::sys::window_server::{self, WindowServerId, get_window};
 use glide_wm::sys::{self};
 use livesplit_hotkey::{ConsumePreference, Modifiers};
@@ -103,6 +103,24 @@ enum WindowServer {
     },
     #[command()]
     Get { id: u32 },
+    /// Query SLSCopyWindowsWithOptionsAndTags scoped to specific spaces.
+    ///
+    /// With no `--space` arguments, uses the current spaces from each screen.
+    #[command()]
+    OnSpaces {
+        /// One or more space IDs. If omitted, the active space on each screen
+        /// is used.
+        #[arg(long = "space")]
+        spaces: Vec<u64>,
+        /// Options passed to SLSCopyWindowsWithOptionsAndTags. 0x2 = on-screen,
+        /// non-minimized (default). 0x7 = also include minimized.
+        #[arg(long, default_value_t = 0x2)]
+        options: u32,
+        /// Print only the window IDs returned by SLS, skipping the
+        /// CGWindowListCreateDescriptionFromArray follow-up.
+        #[arg(long)]
+        ids_only: bool,
+    },
 }
 
 #[derive(Parser, Clone)]
@@ -234,6 +252,9 @@ async fn main() -> anyhow::Result<()> {
                 None => println!("Could not find window {id}"),
             }
         }
+        Command::WindowServer(WindowServer::OnSpaces { spaces, options, ids_only }) => {
+            on_spaces(spaces, options, ids_only);
+        }
         Command::Replay(Replay { path }) => {
             reactor::replay(&path, |_span, request| {
                 info!(?request);
@@ -278,6 +299,41 @@ async fn main() -> anyhow::Result<()> {
         Command::Inspect => inspect(MainThreadMarker::new().unwrap()),
     }
     Ok(())
+}
+
+fn on_spaces(spaces: Vec<u64>, options: u32, ids_only: bool) {
+    let mtm = MainThreadMarker::new().unwrap();
+    let mut sc = ScreenCache::new();
+    let ns_screens = screen::get_ns_screens(mtm);
+    sc.update_screen_config(ns_screens);
+
+    let space_ids: Vec<SpaceId> = if spaces.is_empty() {
+        let cur = sc.get_screen_spaces();
+        println!("Per-screen current spaces: {cur:?}");
+        cur.into_iter().flatten().collect()
+    } else {
+        spaces.into_iter().map(SpaceId::new).collect()
+    };
+    println!("Querying spaces: {space_ids:?} (options=0x{options:x})");
+
+    let ids = window_server::get_window_ids_on_spaces_with_options(&space_ids, options);
+    println!("SLSCopyWindowsWithOptionsAndTags returned {} ids:", ids.len());
+    for id in &ids {
+        println!("  - {id:?}");
+    }
+
+    if ids_only {
+        return;
+    }
+
+    let infos = window_server::get_windows(&ids);
+    println!(
+        "\nResolved {} infos via CGWindowListCreateDescriptionFromArray:",
+        infos.len()
+    );
+    for info in &infos {
+        println!("  - {info:?}");
+    }
 }
 
 async fn run_app_actor(pid_or_bundle: String) -> anyhow::Result<()> {
