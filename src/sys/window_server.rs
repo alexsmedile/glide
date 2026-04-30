@@ -160,7 +160,11 @@ pub fn get_window(id: WindowServerId) -> Option<WindowServerInfo> {
 }
 
 fn get_windows_inner(ids: &[WindowServerId]) -> CFArray<CFDictionary<CFString, CFType>> {
-    let array = CFArray::from_copyable(ids);
+    // `CGWindowListCreateDescriptionFromArray` expects a CFArray of raw
+    // `CGWindowID` values stored one per pointer-sized slot, matching the
+    // format produced by `CGWindowListCreate`.
+    let ptrs: Vec<*const c_void> = ids.iter().map(|id| id.0 as usize as *const c_void).collect();
+    let array = CFArray::from_copyable(&ptrs);
     unsafe {
         CFArray::wrap_under_create_rule(CGWindowListCreateDescriptionFromArray(
             array.as_concrete_TypeRef(),
