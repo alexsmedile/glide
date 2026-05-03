@@ -614,9 +614,8 @@ impl State {
     }
 
     fn on_window_destroyed(&mut self, wid: WindowId) {
-        if self.windows.remove(&wid).is_some() {
-            self.send_event(Event::WindowDestroyed(wid));
-        }
+        // Local cleanup only. The reactor is notified by SkylightWatcher.
+        self.windows.remove(&wid);
     }
 }
 

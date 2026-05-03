@@ -377,7 +377,13 @@ impl SkylightWatcherState {
             return;
         };
         self.connection.on_window_destroyed(wsid);
+        // Notify the app actor so it can clean up its local state.
         _ = tx.send(app::Request::WindowDestroyed(wid));
+        // Forward to WindowServer. We treat this event as authoritative so that
+        // tab detection in WindowServer works when a tab is closed. Using the
+        // app actor event was problematic because of lack of synchronization
+        // with the window server.
+        self.ws_tx.send(Event::WindowDestroyed(wid));
     }
 }
 
