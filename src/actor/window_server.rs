@@ -217,7 +217,7 @@ impl WindowServer {
             && new.pid == old.pid
         {
             debug!("{old_id:?} => {new_id:?}");
-            if let [old, new] = sys_ws::get_windows(&[old_id, new_id]).as_slice()
+            if let [old, new] = Self::get_windows(&[old_id, new_id]).as_slice()
                 && (old.layer != new.layer || old.frame != new.frame)
             {
                 // Not actually the same.
@@ -264,6 +264,19 @@ impl WindowServer {
     #[cfg(test)]
     fn get_all_visible_windows(&self) -> Vec<sys_ws::WindowServerInfo> {
         MOCK_VISIBLE_WINDOWS.with(|w| w.borrow().clone())
+    }
+
+    /// Describes the given window server ids. Used to double-check a
+    /// candidate tab swap against the current server-side geometry.
+    #[cfg(not(test))]
+    fn get_windows(ids: &[WindowServerId]) -> Vec<sys_ws::WindowServerInfo> {
+        sys_ws::get_windows(ids)
+    }
+
+    #[cfg(test)]
+    fn get_windows(ids: &[WindowServerId]) -> Vec<sys_ws::WindowServerInfo> {
+        MOCK_WINDOWS
+            .with(|w| w.borrow().iter().filter(|info| ids.contains(&info.id)).cloned().collect())
     }
 
     fn send_reactor_event(&self, event: reactor::Event) {
@@ -390,6 +403,9 @@ impl SkylightWatcherState {
 #[cfg(test)]
 thread_local! {
     static MOCK_VISIBLE_WINDOWS: RefCell<Vec<sys_ws::WindowServerInfo>> = RefCell::new(vec![]);
+    /// Backs `WindowServer::get_windows` in tests. Defaults to empty,
+    /// which models a window that is no longer present on the server.
+    static MOCK_WINDOWS: RefCell<Vec<sys_ws::WindowServerInfo>> = RefCell::new(vec![]);
 }
 
 #[cfg(test)]
