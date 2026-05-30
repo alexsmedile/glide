@@ -38,9 +38,26 @@ pub struct WindowServer {
     /// Window server IDs currently visible on screen.
     visible_window_ids: HashSet<WindowServerId>,
     visible_windows: HashMap<WindowServerId, sys_ws::WindowServerInfo>,
+    /// Windows that disappeared from the visible list without an
+    /// accompanying arrival, hidden briefly so a follow-up event can pair
+    /// with them. Native tab swaps span multiple events: the old tab
+    /// vanishes in one query and the new one appears in a later query, and
+    /// without this buffer the swap pattern is invisible to the diff in
+    /// `send_windows_on_screen_if_changed`. Entries age out unconditionally
+    /// (see `PENDING_DISAPPEARED_MAX_AGE`) so an unexplained disappearance
+    /// is eventually forgotten rather than matched up with something
+    /// unrelated.
+    pending_disappeared: HashMap<WindowServerId, PendingDisappeared>,
     sm_tx: space_manager::Sender,
     skylight_tx: SkylightSender,
 }
+
+struct PendingDisappeared {
+    info: sys_ws::WindowServerInfo,
+    age: u32,
+}
+
+const PENDING_DISAPPEARED_MAX_AGE: u32 = 4;
 
 #[derive(Debug)]
 pub enum Event {
@@ -93,6 +110,7 @@ impl WindowServer {
             cur_space: Vec::new(),
             visible_window_ids: HashSet::default(),
             visible_windows: HashMap::default(),
+            pending_disappeared: HashMap::default(),
             sm_tx,
             skylight_tx,
         }
@@ -139,20 +157,20 @@ impl WindowServer {
             }
             Event::WindowCreated(wid, info, mouse_state) => {
                 self.send_reactor_event(reactor::Event::WindowCreated(wid, info, mouse_state));
-                self.send_windows_on_screen_if_changed(Some(wid.pid));
+                self.send_windows_on_screen_if_changed(Some(wid.pid), None);
             }
             Event::WindowDestroyed(wid) => {
-                self.send_windows_on_screen_if_changed(Some(wid.pid));
+                self.send_windows_on_screen_if_changed(Some(wid.pid), Some(wid));
                 self.send_reactor_event(reactor::Event::WindowDestroyed(wid));
             }
             Event::ApplicationMainWindowChanged(pid, wid, quiet) => {
-                self.send_windows_on_screen_if_changed(Some(pid));
+                self.send_windows_on_screen_if_changed(Some(pid), None);
                 self.send_reactor_event(reactor::Event::ApplicationMainWindowChanged(
                     pid, wid, quiet,
                 ));
             }
             Event::WindowVisibilityChanged(window_id) => {
-                self.send_windows_on_screen_if_changed(Some(window_id.pid));
+                self.send_windows_on_screen_if_changed(Some(window_id.pid), Some(window_id));
             }
             Event::WindowBecameVisible(pid, wsid) => {
                 if self.visible_window_ids.contains(&wsid) {
@@ -161,7 +179,7 @@ impl WindowServer {
                 // This is a trace log above because we ignore many of these
                 // events, but make it a debug log if we detected a change.
                 debug!("event");
-                self.send_windows_on_screen_if_changed(Some(pid));
+                self.send_windows_on_screen_if_changed(Some(pid), None);
             }
             Event::ApplicationLaunched {
                 pid,
@@ -191,8 +209,32 @@ impl WindowServer {
 
     /// Queries the window server for visible windows and sends a
     /// `WindowsOnScreenUpdated` event if the list changed.
-    fn send_windows_on_screen_if_changed(&mut self, pid: Option<pid_t>) {
-        let old_windows = mem::take(&mut self.visible_windows);
+    ///
+    /// `explained` names a window whose disappearance is accounted for
+    /// by the event being processed (e.g. `WindowDestroyed`,
+    /// `WindowVisibilityChanged`). A disappearance of any other window
+    /// is treated as unexplained and held back briefly so a follow-up
+    /// event can resolve it as a native tab swap.
+    fn send_windows_on_screen_if_changed(
+        &mut self,
+        pid: Option<pid_t>,
+        explained: Option<WindowId>,
+    ) {
+        // Age pending entries; drop those past the failsafe limit so
+        // we don't match an old disappearance with an unrelated later
+        // arrival.
+        self.pending_disappeared.retain(|_, p| {
+            p.age += 1;
+            p.age <= PENDING_DISAPPEARED_MAX_AGE
+        });
+
+        let mut old_windows = mem::take(&mut self.visible_windows);
+        // Treat still-pending disappearances as if the window were
+        // still visible, so that a later arrival can be recognized as
+        // the second half of a tab swap.
+        for (id, p) in &self.pending_disappeared {
+            old_windows.entry(*id).or_insert_with(|| p.info.clone());
+        }
         let old_ids = old_windows
             .iter()
             .filter(|(_id, w)| pid.is_none() || pid == Some(w.pid))
@@ -206,12 +248,12 @@ impl WindowServer {
             .flat_map(|id| id.wsid())
             .collect::<HashSet<_>>();
         debug!(?old_ids, ?new_ids);
-        #[allow(irrefutable_let_patterns)]
-        if let added_ids = new_ids.difference(&old_ids).copied().collect::<Vec<_>>().as_slice()
-            && let &[new_id] = added_ids
-            && let removed_ids =
-                old_ids.difference(&new_ids).copied().collect::<Vec<_>>().as_slice()
-            && let &[old_id] = removed_ids
+
+        let added_ids: Vec<_> = new_ids.difference(&old_ids).copied().collect();
+        let removed_ids: Vec<_> = old_ids.difference(&new_ids).copied().collect();
+
+        if let &[new_id] = added_ids.as_slice()
+            && let &[old_id] = removed_ids.as_slice()
             && let Some(new) = self.visible_windows.get(&new_id)
             && let Some(old) = old_windows.get(&old_id)
             && new.pid == old.pid
@@ -224,6 +266,7 @@ impl WindowServer {
                 debug!("{old:?} != {new:?}");
             } else {
                 warn!("Tab detected: {old:?} => {new:?}");
+                self.pending_disappeared.remove(&old_id);
                 self.send_reactor_event(reactor::Event::WindowReplaced {
                     old: WindowId::with_wsid(old.pid, old_id),
                     new: WindowId::with_wsid(new.pid, new_id),
@@ -231,7 +274,28 @@ impl WindowServer {
                 return;
             }
         }
+
+        // A lone unexplained disappearance might be the first half of
+        // a tab swap. Hold it back so the matching arrival (or an
+        // explicit destroy/visibility event) can resolve it.
+        if added_ids.is_empty()
+            && let &[id] = removed_ids.as_slice()
+            && explained.and_then(|w| w.wsid()) != Some(id)
+        {
+            if let Some(info) = old_windows.get(&id) {
+                self.pending_disappeared
+                    .entry(id)
+                    .or_insert(PendingDisappeared { info: info.clone(), age: 0 });
+                return;
+            }
+        }
+
         if new_ids != old_ids {
+            // Whatever pending entries we just published are now
+            // resolved; drop them so the next call sees a clean state.
+            for id in &removed_ids {
+                self.pending_disappeared.remove(id);
+            }
             self.send_reactor_event(reactor::Event::WindowsOnScreenUpdated { pid, on_screen });
         }
     }
@@ -417,14 +481,24 @@ mod tests {
     use crate::actor::{self, space_manager};
     use crate::sys::window_server::{WindowServerId, WindowServerInfo};
 
+    const PID: pid_t = 1;
+
     fn wsid(id: u32) -> WindowServerId {
         WindowServerId::new(id)
     }
 
-    fn make_window(id: u32, layer: i32) -> WindowServerInfo {
+    fn make_window(id: u32) -> WindowServerInfo {
+        make_window_with_layer(id, LAYER_NORMAL)
+    }
+
+    fn make_window_with_layer(id: u32, layer: i32) -> WindowServerInfo {
+        make_window_with_layer_and_pid(id, layer, PID)
+    }
+
+    fn make_window_with_layer_and_pid(id: u32, layer: i32, pid: pid_t) -> WindowServerInfo {
         WindowServerInfo {
             id: wsid(id),
-            pid: 1,
+            pid,
             layer,
             frame: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(100.0, 100.0)),
         }
@@ -487,11 +561,11 @@ mod tests {
     #[test]
     fn filters_irrelevant_layers() {
         set_mock_windows(vec![
-            make_window(1, LAYER_NORMAL),   // 0 – keep
-            make_window(2, LAYER_FLOATING), // 3 – keep
-            make_window(3, LAYER_STATUS),   // 8 – keep
-            make_window(4, 25),             // screensaver – filter
-            make_window(5, -1),             // desktop – filter
+            make_window_with_layer(1, LAYER_NORMAL),   // 0 – keep
+            make_window_with_layer(2, LAYER_FLOATING), // 3 – keep
+            make_window_with_layer(3, LAYER_STATUS),   // 8 – keep
+            make_window_with_layer(4, 25),             // screensaver – filter
+            make_window_with_layer(5, -1),             // desktop – filter
         ]);
 
         let mut h = TestHarness::new();
@@ -508,7 +582,7 @@ mod tests {
 
     #[test]
     fn no_event_when_visible_windows_unchanged() {
-        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        set_mock_windows(vec![make_window(1)]);
 
         let mut h = TestHarness::new();
         // First call: visible_window_ids goes from [] to [1] – changed.
@@ -526,14 +600,14 @@ mod tests {
 
     #[test]
     fn event_sent_when_visible_windows_change() {
-        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        set_mock_windows(vec![make_window(1)]);
 
         let mut h = TestHarness::new();
         h.on_event(Event::WindowVisibilityChanged(WindowId::new(1, 1)));
         h.drain_sm();
 
         // Change the mock.
-        set_mock_windows(vec![make_window(1, LAYER_NORMAL), make_window(2, LAYER_NORMAL)]);
+        set_mock_windows(vec![make_window(1), make_window(2)]);
         h.on_event(Event::WindowVisibilityChanged(WindowId::new(1, 1)));
         let sm_events = h.drain_sm();
         let reactor_events = find_reactor_events(&sm_events);
@@ -544,7 +618,7 @@ mod tests {
 
     #[test]
     fn window_created_sends_windows_on_screen_if_changed() {
-        set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
+        set_mock_windows(vec![make_window(1)]);
 
         let mut h = TestHarness::new();
         let wid = WindowId::new(1, 1);
@@ -562,5 +636,186 @@ mod tests {
         // Should have WindowCreated and WindowsOnScreenUpdated.
         assert!(reactor_events.iter().any(|e| matches!(e, reactor::Event::WindowCreated(..))));
         assert_eq!(find_windows_on_screen_updated(&reactor_events).len(), 1);
+    }
+
+    const TAB_A: u32 = 100;
+    const TAB_B: u32 = 150;
+    const OTHER_1: u32 = 200;
+    const OTHER_2: u32 = 300;
+
+    #[test]
+    fn tab_swap_detected_in_single_query() {
+        let pid = 1;
+        set_mock_windows(vec![
+            make_window(TAB_A),
+            make_window(OTHER_1),
+            make_window(OTHER_2),
+        ]);
+        let mut h = TestHarness::new();
+        // Seed the visible_windows snapshot.
+        h.on_event(Event::WindowBecameVisible(pid, wsid(TAB_A)));
+        h.drain_sm();
+
+        // Atomic swap: TAB_A is replaced by TAB_B.
+        set_mock_windows(vec![
+            make_window(TAB_B),
+            make_window(OTHER_1),
+            make_window(OTHER_2),
+        ]);
+        h.on_event(Event::WindowBecameVisible(pid, wsid(TAB_B)));
+        let sm_events = h.drain_sm();
+        let reactor_events = find_reactor_events(&sm_events);
+
+        assert!(
+            reactor_events.iter().any(|e| matches!(
+                e,
+                reactor::Event::WindowReplaced { old, new }
+                    if old.wsid() == Some(wsid(TAB_A)) && new.wsid() == Some(wsid(TAB_B))
+            )),
+            "expected WindowReplaced({TAB_A}->{TAB_B}); got {reactor_events:#?}",
+        );
+        assert!(find_windows_on_screen_updated(&reactor_events).is_empty());
+    }
+
+    #[test]
+    fn tab_swap_detected_across_two_events() {
+        let pid = 1;
+        set_mock_windows(vec![
+            make_window(TAB_A),
+            make_window(OTHER_1),
+            make_window(OTHER_2),
+        ]);
+        let mut h = TestHarness::new();
+        h.on_event(Event::WindowBecameVisible(pid, wsid(TAB_A)));
+        h.drain_sm();
+
+        // Step 1: TAB_A is gone but TAB_B isn't visible yet. An
+        // unrelated event (here ApplicationMainWindowChanged) triggers
+        // the query.
+        set_mock_windows(vec![make_window(OTHER_1), make_window(OTHER_2)]);
+        h.on_event(Event::ApplicationMainWindowChanged(pid, None, Quiet::No));
+        let sm_events = h.drain_sm();
+        let reactor_events = find_reactor_events(&sm_events);
+        assert!(
+            find_windows_on_screen_updated(&reactor_events).is_empty(),
+            "lone removal should be deferred, not emitted; got {reactor_events:#?}",
+        );
+        assert!(
+            !reactor_events
+                .iter()
+                .any(|e| matches!(e, reactor::Event::WindowReplaced { .. }))
+        );
+
+        // Step 2: TAB_B appears. The deferred TAB_A removal pairs with
+        // it and produces a WindowReplaced.
+        set_mock_windows(vec![
+            make_window(TAB_B),
+            make_window(OTHER_1),
+            make_window(OTHER_2),
+        ]);
+        h.on_event(Event::WindowBecameVisible(pid, wsid(TAB_B)));
+        let sm_events = h.drain_sm();
+        let reactor_events = find_reactor_events(&sm_events);
+        assert!(
+            reactor_events.iter().any(|e| matches!(
+                e,
+                reactor::Event::WindowReplaced { old, new }
+                    if old.wsid() == Some(wsid(TAB_A)) && new.wsid() == Some(wsid(TAB_B))
+            )),
+            "expected WindowReplaced({TAB_A}->{TAB_B}); got {reactor_events:#?}",
+        );
+    }
+
+    #[test]
+    fn window_destroyed_explains_its_own_disappearance() {
+        // `WindowDestroyed` accounts for the removal, so it should
+        // commit immediately rather than defer.
+        let pid = 1;
+        set_mock_windows(vec![make_window(TAB_A), make_window(OTHER_1)]);
+        let mut h = TestHarness::new();
+        h.on_event(Event::WindowBecameVisible(pid, wsid(TAB_A)));
+        h.drain_sm();
+
+        set_mock_windows(vec![make_window(OTHER_1)]);
+        h.on_event(Event::WindowDestroyed(WindowId::with_wsid(pid, wsid(TAB_A))));
+        let sm_events = h.drain_sm();
+        let reactor_events = find_reactor_events(&sm_events);
+
+        let [event] = &*find_windows_on_screen_updated(&reactor_events) else {
+            panic!("expected WindowsOnScreenUpdated; got {reactor_events:#?}");
+        };
+        assert_eq!(&*event.visible, [WindowId::with_wsid(pid, wsid(OTHER_1))]);
+
+        assert!(
+            reactor_events.iter().any(|e| matches!(e, reactor::Event::WindowDestroyed(_))),
+            "expected WindowDestroyed; got {reactor_events:#?}",
+        );
+    }
+
+    #[test]
+    fn window_destroyed_explains_its_own_disappearance_deferred() {
+        // `WindowDestroyed` accounts for the removal, so it should
+        // commit immediately rather than defer.
+        let pid = 1;
+        set_mock_windows(vec![make_window(TAB_A), make_window(OTHER_1)]);
+        let mut h = TestHarness::new();
+        h.on_event(Event::WindowBecameVisible(pid, wsid(TAB_A)));
+        h.drain_sm();
+
+        h.on_event(Event::ApplicationMainWindowChanged(
+            pid,
+            Some(WindowId::with_wsid(PID, wsid(OTHER_1))),
+            Quiet::No,
+        ));
+
+        set_mock_windows(vec![make_window(OTHER_1)]);
+        h.on_event(Event::WindowDestroyed(WindowId::with_wsid(pid, wsid(TAB_A))));
+        let sm_events = h.drain_sm();
+        let reactor_events = find_reactor_events(&sm_events);
+
+        let [event] = &*find_windows_on_screen_updated(&reactor_events) else {
+            panic!("expected WindowsOnScreenUpdated; got {reactor_events:#?}");
+        };
+        assert_eq!(&*event.visible, [WindowId::with_wsid(pid, wsid(OTHER_1))]);
+
+        assert!(
+            reactor_events.iter().any(|e| matches!(e, reactor::Event::WindowDestroyed(_))),
+            "expected WindowDestroyed; got {reactor_events:#?}",
+        );
+    }
+
+    #[test]
+    fn explanation_is_scoped_to_the_named_window() {
+        // A WindowDestroyed for one window must not satisfy a pending
+        // disappearance for an unrelated window.
+        set_mock_windows(vec![make_window(TAB_A), make_window(OTHER_1)]);
+        let mut h = TestHarness::new();
+        h.on_event(Event::WindowBecameVisible(PID, wsid(TAB_A)));
+        h.on_event(Event::WindowBecameVisible(PID, wsid(OTHER_1)));
+        h.drain_sm();
+
+        // First window vanishes – deferred (no explanation for it).
+        set_mock_windows(vec![make_window(OTHER_1)]);
+        h.on_event(Event::ApplicationMainWindowChanged(PID, None, Quiet::No));
+        let sm_events = h.drain_sm();
+        let reactor_events = find_reactor_events(&sm_events);
+        assert!(
+            find_windows_on_screen_updated(&reactor_events).is_empty(),
+            "removal should be deferred; got {reactor_events:#?}",
+        );
+
+        // A WindowDestroyed for second window arrives. Its diff is scoped to
+        // OTHER_1.
+        set_mock_windows(vec![]);
+        h.on_event(Event::WindowDestroyed(WindowId::with_wsid(PID, wsid(OTHER_1))));
+        let sm_events = h.drain_sm();
+        let reactor_events = find_reactor_events(&sm_events);
+        assert!(
+            !reactor_events
+                .iter()
+                .any(|e| matches!(e, reactor::Event::WindowReplaced { .. })),
+            "must not pair pending removal with another window's destroy; got {reactor_events:#?}",
+        );
+        assert!(reactor_events.iter().any(|e| matches!(e, reactor::Event::WindowDestroyed(_))));
     }
 }

@@ -46,11 +46,11 @@ use crate::sys::screen::SpaceId;
 pub struct WindowServerId(pub CGWindowID);
 
 impl WindowServerId {
-    pub fn new(id: CGWindowID) -> Self {
+    pub const fn new(id: CGWindowID) -> Self {
         WindowServerId(id)
     }
 
-    pub fn as_u32(&self) -> u32 {
+    pub const fn as_u32(&self) -> u32 {
         self.0
     }
 }
