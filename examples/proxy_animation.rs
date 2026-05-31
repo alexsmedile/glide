@@ -480,6 +480,20 @@ fn inflate(r: CGRect, m: f64) -> CGRect {
     )
 }
 
+/// Clamp `rect` so it lies entirely within `bounds`: shrink it to fit if it is
+/// larger than `bounds` in a dimension, then shift it inward. The proxy is a
+/// screen capture, so any part of the window past the display edge captures as
+/// blank — clamping keeps the whole window on screen and the animation clean.
+fn clamp_to_rect(mut rect: CGRect, bounds: CGRect) -> CGRect {
+    rect.size.width = rect.size.width.min(bounds.size.width);
+    rect.size.height = rect.size.height.min(bounds.size.height);
+    let max_x = bounds.origin.x + bounds.size.width - rect.size.width;
+    let max_y = bounds.origin.y + bounds.size.height - rect.size.height;
+    rect.origin.x = rect.origin.x.clamp(bounds.origin.x, max_x);
+    rect.origin.y = rect.origin.y.clamp(bounds.origin.y, max_y);
+    rect
+}
+
 /// macOS window drop shadows extend well beyond the window frame. The real
 /// window is moved to its destination immediately (hidden behind the backdrop),
 /// but its shadow would otherwise spill past the backdrop edge at the new
@@ -846,10 +860,14 @@ fn slow_response() -> f64 {
 /// Pick a destination frame: shift down-right and grow, so the animation
 /// exercises both translation and stretch.
 fn destination_for(origin: CGRect) -> CGRect {
-    CGRect::new(
+    let dest = CGRect::new(
         CGPoint::new(origin.origin.x + 460.0, origin.origin.y + 280.0),
         CGSize::new(origin.size.width * 1.5, origin.size.height * 1.5),
-    )
+    );
+    // Keep the destination fully on the window's display; off-screen area would
+    // capture as blank and distort the proxy animation.
+    let bounds = unsafe { CGDisplayBounds(display_for(origin)) };
+    clamp_to_rect(dest, bounds)
 }
 
 fn ensure_screen_recording() -> bool {
