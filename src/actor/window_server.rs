@@ -265,7 +265,7 @@ impl WindowServer {
                 // Not actually the same.
                 debug!("{old:?} != {new:?}");
             } else {
-                warn!("Tab detected: {old:?} => {new:?}");
+                debug!("Tab detected: {old:?} => {new:?}");
                 self.pending_disappeared.remove(&old_id);
                 self.send_reactor_event(reactor::Event::WindowReplaced {
                     old: WindowId::with_wsid(old.pid, old_id),
