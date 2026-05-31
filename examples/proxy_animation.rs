@@ -136,6 +136,7 @@ unsafe extern "C" {
     fn SLSSetWindowOpacity(cid: SLSConnectionID, wid: CGWindowID, opaque: bool) -> i32;
     fn SLSSetWindowAlpha(cid: SLSConnectionID, wid: CGWindowID, alpha: f32) -> i32;
     fn SLSSetWindowLevel(cid: SLSConnectionID, wid: CGWindowID, level: c_int) -> i32;
+    fn SLSSetWindowSubLevel(cid: SLSConnectionID, wid: CGWindowID, sub_level: c_int) -> i32;
     fn SLSWindowSetShadowProperties(wid: CGWindowID, options: CFTypeRef) -> i32;
     fn SLSOrderWindow(cid: SLSConnectionID, wid: CGWindowID, mode: c_int, rel: CGWindowID) -> i32;
 
@@ -310,6 +311,10 @@ impl ProxyWindow {
             SLSSetWindowOpacity(cid, id, opaque);
             SLSSetWindowAlpha(cid, id, 1.0);
             SLSSetWindowLevel(cid, id, level);
+            // Match a normal app window's sub-level. Without this the window
+            // defaults to a high sub-level and floats above the app-window band,
+            // so the focused window can never cover it.
+            SLSSetWindowSubLevel(cid, id, 0);
 
             let context = SLWindowContextCreate(cid, id, std::ptr::null());
             let local = CGRect::new(CGPoint::new(0.0, 0.0), frame.size);
