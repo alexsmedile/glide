@@ -544,8 +544,24 @@ impl LayoutManager {
                 self.floating_windows.remove(&wid);
             }
             LayoutEvent::WindowReplaced { old, new } => {
-                // TODO: replace other window ids in self
                 self.tree.replace_window(old, new);
+
+                if self.focused_window == Some(old) {
+                    self.focused_window = Some(new);
+                }
+                if self.last_floating_focus == Some(old) {
+                    self.last_floating_focus = Some(new);
+                }
+                if self.floating_windows.remove(&old) {
+                    self.floating_windows.insert(new);
+                }
+                for per_space in self.active_floating_windows.values_mut() {
+                    if let Some(active) = per_space.get_mut(&old.pid) {
+                        if active.remove(&old) {
+                            active.insert(new);
+                        }
+                    }
+                }
             }
             LayoutEvent::WindowFocused(spaces, wid) => {
                 self.focused_window = Some(wid);
