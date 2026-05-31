@@ -25,8 +25,10 @@
 //!      yabai does) → the proxy bitmap.
 //!   2. Capture the backdrop (everything below the window, in the union of the
 //!      origin and destination rects).
-//!   3. Create two server-owned windows on a dedicated SLS connection: the
-//!      backdrop (static, below) and the proxy (animated, above).
+//!   3. Create server-owned windows on a dedicated SLS connection, bottom to
+//!      top: the backdrop (static, opaque), the proxy (animated), and a
+//!      foreground snapshot of any windows that were in front of the target
+//!      (transparent elsewhere) so they aren't covered by the proxy.
 //!   4. Move the real window to its destination *instantly* via AX — invisible,
 //!      because the backdrop covers it.
 //!   5. Animate the proxy's position *and* size from
@@ -60,6 +62,7 @@ use accessibility::{AXUIElement, AXUIElementAttributes};
 use core_graphics_types::geometry as cg;
 use glide_wm::model::spring::SpringAnimation;
 use glide_wm::sys::window_server::{self, WindowServerId};
+use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSFont,
@@ -87,6 +90,7 @@ type CVDisplayLinkRef = *mut c_void;
 type CVReturn = i32;
 type CVOptionFlags = u64;
 
+const KCG_WINDOW_LIST_OPTION_ON_SCREEN_ABOVE_WINDOW: CGWindowListOption = 1 << 1;
 const KCG_WINDOW_LIST_OPTION_ON_SCREEN_BELOW_WINDOW: CGWindowListOption = 1 << 2;
 const KCG_WINDOW_IMAGE_DEFAULT: CGWindowImageOption = 0;
 const KCV_RETURN_SUCCESS: CVReturn = 0;
@@ -430,14 +434,25 @@ fn capture_window(cid: SLSConnectionID, wid: CGWindowID) -> Option<CGImageRef> {
 /// Capture everything *behind* the window in `bounds` (window excluded), to use
 /// as the occluding backdrop. Returns a +1-retained `CGImageRef`.
 fn capture_backdrop(bounds: CGRect, wid: CGWindowID) -> Option<CGImageRef> {
-    let image = unsafe {
-        CGWindowListCreateImage(
-            bounds,
-            KCG_WINDOW_LIST_OPTION_ON_SCREEN_BELOW_WINDOW,
-            wid,
-            KCG_WINDOW_IMAGE_DEFAULT,
-        )
-    };
+    capture_relative_to_window(bounds, wid, KCG_WINDOW_LIST_OPTION_ON_SCREEN_BELOW_WINDOW)
+}
+
+/// Capture everything *in front of* the window in `bounds` (window excluded).
+/// The proxy is ordered above all real windows, so without this any windows that
+/// legitimately sat in front of the target would be wrongly covered by the
+/// animating proxy. We re-overlay this snapshot on top of the proxy to restore
+/// them. Areas with nothing in front are transparent, so the proxy shows
+/// through. Returns a +1-retained `CGImageRef`, or `None` if nothing is above.
+fn capture_foreground(bounds: CGRect, wid: CGWindowID) -> Option<CGImageRef> {
+    capture_relative_to_window(bounds, wid, KCG_WINDOW_LIST_OPTION_ON_SCREEN_ABOVE_WINDOW)
+}
+
+fn capture_relative_to_window(
+    bounds: CGRect,
+    wid: CGWindowID,
+    option: CGWindowListOption,
+) -> Option<CGImageRef> {
+    let image = unsafe { CGWindowListCreateImage(bounds, option, wid, KCG_WINDOW_IMAGE_DEFAULT) };
     if image.is_null() { None } else { Some(image) }
 }
 
@@ -496,13 +511,21 @@ fn animate(target: &Target, dest: CGRect) {
         }
         return;
     };
+    // Snapshot of any windows in front of the target (may be empty).
+    let foreground_img = capture_foreground(backdrop_bounds, wid);
 
-    // 3: create the backdrop (static, below) and proxy (animated, above).
+    // 3: create the layers, bottom to top: backdrop (opaque, hides the real
+    // windows in the region) → proxy (the animated window) → foreground (the
+    // windows that were in front of the target, transparent elsewhere).
     unsafe { SLSDisableUpdate(cid) };
     let backdrop = ProxyWindow::new(cid, backdrop_bounds, backdrop_img, level, true);
     let proxy = ProxyWindow::new(cid, origin, proxy_img, level, false);
-    // Proxy strictly above the backdrop.
     unsafe { SLSOrderWindow(cid, proxy.id, 1, backdrop.id) };
+    let foreground = foreground_img.map(|img| {
+        let fg = ProxyWindow::new(cid, backdrop_bounds, img, level, false);
+        unsafe { SLSOrderWindow(cid, fg.id, 1, proxy.id) };
+        fg
+    });
     unsafe { SLSReenableUpdate(cid) };
 
     // 4: move the real window to its destination *now*, while occluded.
@@ -574,6 +597,7 @@ fn animate(target: &Target, dest: CGRect) {
         dispatch_release(sem);
         SLSDisableUpdate(cid);
     }
+    drop(foreground);
     drop(proxy);
     drop(backdrop);
     unsafe {
@@ -658,8 +682,24 @@ fn main() {
     app.activateIgnoringOtherApps(true);
     app.finishLaunching();
 
-    let wsid = spawn_window(mtm);
+    let wsid = spawn_window(
+        mtm,
+        NSPoint { x: 200.0, y: 400.0 },
+        "glide",
+        NSColor::systemTealColor(),
+    );
     println!("spawned window {wsid:?}");
+
+    // Test the foreground overlay: spawn a second window *in front of* the
+    // target, over the destination, so the animating proxy must pass behind it.
+    if std::env::var("GLIDE_FG_TEST").is_ok() {
+        spawn_window(
+            mtm,
+            NSPoint { x: 640.0, y: 120.0 },
+            "front",
+            NSColor::systemPinkColor(),
+        );
+    }
 
     // Let AppKit lay out and the window server composite the window.
     pump_runloop(0.8);
@@ -685,9 +725,14 @@ fn main() {
     pump_runloop(0.6);
 }
 
-fn spawn_window(mtm: MainThreadMarker) -> WindowServerId {
+fn spawn_window(
+    mtm: MainThreadMarker,
+    origin: NSPoint,
+    text: &str,
+    color: Retained<NSColor>,
+) -> WindowServerId {
     let frame = NSRect {
-        origin: NSPoint { x: 200.0, y: 400.0 },
+        origin,
         size: objc2_foundation::NSSize { width: 360.0, height: 260.0 },
     };
     let style =
@@ -702,9 +747,9 @@ fn spawn_window(mtm: MainThreadMarker) -> WindowServerId {
         )
     };
     window.setTitle(&NSString::from_str("Proxy Animation Demo"));
-    window.setBackgroundColor(Some(&NSColor::systemTealColor()));
+    window.setBackgroundColor(Some(&color));
 
-    let label = NSTextField::labelWithString(&NSString::from_str("glide"), mtm);
+    let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
     label.setFrame(NSRect {
         origin: NSPoint { x: 0.0, y: 90.0 },
         size: objc2_foundation::NSSize { width: 360.0, height: 80.0 },
