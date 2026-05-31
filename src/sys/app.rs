@@ -7,7 +7,7 @@ use std::fmt::{Debug, Formatter};
 
 use accessibility::{AXAttribute, AXUIElement, AXUIElementAttributes};
 pub use accessibility_sys::pid_t;
-use accessibility_sys::{kAXStandardWindowSubrole, kAXWindowRole};
+use accessibility_sys::{AXUIElementGetPid, kAXStandardWindowSubrole, kAXWindowRole};
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::string::CFString;
@@ -123,6 +123,8 @@ pub trait AXUIElementExt {
     fn set_enhanced_user_interface(&self, enabled: bool) -> Result<(), accessibility::Error>;
 
     fn privacy_sensitive_inspect(&self) -> Inspect<'_>;
+
+    fn process_id(&self) -> Result<pid_t, accessibility::Error>;
 }
 
 impl AXUIElementExt for AXUIElement {
@@ -135,6 +137,15 @@ impl AXUIElementExt for AXUIElement {
 
     fn privacy_sensitive_inspect(&self) -> Inspect<'_> {
         Inspect(self)
+    }
+
+    fn process_id(&self) -> Result<pid_t, accessibility::Error> {
+        let mut pid: pid_t = 0;
+        let e = unsafe { AXUIElementGetPid(self.as_concrete_TypeRef(), &raw mut pid) };
+        match e {
+            0 => Ok(e),
+            e => Err(accessibility::Error::Ax(e)),
+        }
     }
 }
 
