@@ -70,13 +70,15 @@ use glide_wm::model::spring::SpringAnimation;
 use glide_wm::sys::app::AXUIElementExt;
 use glide_wm::sys::window_server::{self, WindowServerId};
 use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApp, NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSFont, NSRunningApplication, NSScreen, NSTextAlignment, NSTextField, NSWindow, NSWindowStyleMask, NSWorkspace
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSFont, NSScreen, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowOrderingMode, NSWindowStyleMask
 };
-use objc2_core_foundation::{CGAffineTransform, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGImage;
-use objc2_foundation::{NSPoint, NSRect, NSString};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_quartz_core::{CALayer, CATransaction};
 
 // ---------------------------------------------------------------------------
 // Private/undocumented FFI. These mirror the declarations yabai uses
@@ -89,7 +91,6 @@ type CGWindowID = u32;
 type CFTypeRef = *const c_void;
 type CFArrayRef = *const c_void;
 type CGImageRef = *const c_void;
-type CGContextRef = *mut c_void;
 type CGWindowImageOption = u32;
 type CGWindowListOption = u32;
 
@@ -101,11 +102,13 @@ const KCG_WINDOW_LIST_OPTION_ON_SCREEN_BELOW_WINDOW: CGWindowListOption = 1 << 2
 const KCG_WINDOW_IMAGE_DEFAULT: CGWindowImageOption = 0;
 const KCV_RETURN_SUCCESS: CVReturn = 0;
 
-// Tag bit used by yabai when creating proxy windows.
-const PROXY_WINDOW_TAG: u64 = 1 << 46;
 // SLSHWCaptureWindowList flags used by yabai.
 const SLS_CAPTURE_FLAGS: u32 = (1 << 11) | (1 << 8);
 
+// The only remaining private SkyLight calls are read-only window queries and the
+// hardware window capture used to snapshot the target. Window *creation*,
+// ordering, levels, shadow, and the per-frame transform are now done with public
+// AppKit/Core Animation APIs (see `ProxyWindow`).
 #[link(name = "SkyLight", kind = "framework")]
 unsafe extern "C" {
     fn SLSNewConnection(zero: c_int, cid: *mut SLSConnectionID) -> i32;
@@ -115,52 +118,12 @@ unsafe extern "C" {
     fn SLSGetWindowLevel(cid: SLSConnectionID, wid: CGWindowID, level: *mut c_int) -> i32;
     fn SLSGetWindowSubLevel(cid: SLSConnectionID, wid: CGWindowID) -> c_int;
 
-    fn SLSNewWindowWithOpaqueShapeAndContext(
-        cid: SLSConnectionID,
-        window_type: c_int,
-        region: CFTypeRef,
-        opaque_shape: CFTypeRef,
-        options: c_int,
-        tags: *const u64,
-        x: f32,
-        y: f32,
-        tag_size: c_int,
-        wid: *mut CGWindowID,
-        context: *mut c_void,
-    ) -> i32;
-    fn SLSReleaseWindow(cid: SLSConnectionID, wid: CGWindowID) -> i32;
-    fn SLWindowContextCreate(
-        cid: SLSConnectionID,
-        wid: CGWindowID,
-        options: CFTypeRef,
-    ) -> CGContextRef;
-
-    fn SLSSetWindowResolution(cid: SLSConnectionID, wid: CGWindowID, resolution: f64) -> i32;
-    fn SLSSetWindowOpacity(cid: SLSConnectionID, wid: CGWindowID, opaque: bool) -> i32;
-    fn SLSSetWindowAlpha(cid: SLSConnectionID, wid: CGWindowID, alpha: f32) -> i32;
-    fn SLSSetWindowLevel(cid: SLSConnectionID, wid: CGWindowID, level: c_int) -> i32;
-    fn SLSSetWindowSubLevel(cid: SLSConnectionID, wid: CGWindowID, sub_level: c_int) -> i32;
-    fn SLSWindowSetShadowProperties(wid: CGWindowID, options: CFTypeRef) -> i32;
-    fn SLSOrderWindow(cid: SLSConnectionID, wid: CGWindowID, mode: c_int, rel: CGWindowID) -> i32;
-
-    fn SLSDisableUpdate(cid: SLSConnectionID) -> i32;
-    fn SLSReenableUpdate(cid: SLSConnectionID) -> i32;
-
     fn SLSHWCaptureWindowList(
         cid: SLSConnectionID,
         window_list: *const CGWindowID,
         window_count: c_int,
         options: u32,
     ) -> CFArrayRef;
-
-    fn SLSSetWindowTransform(
-        cid: SLSConnectionID,
-        wid: CGWindowID,
-        transform: CGAffineTransform,
-    ) -> i32;
-
-    fn CGRegionCreateEmptyRegion() -> CFTypeRef;
-    fn CGSNewRegionWithRect(rect: *const CGRect, region: *mut CFTypeRef) -> i32;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -171,10 +134,6 @@ unsafe extern "C" {
         window_id: CGWindowID,
         image_option: CGWindowImageOption,
     ) -> CGImageRef;
-    fn CGContextClearRect(ctx: CGContextRef, rect: CGRect);
-    fn CGContextDrawImage(ctx: CGContextRef, rect: CGRect, image: CGImageRef);
-    fn CGContextFlush(ctx: CGContextRef);
-    fn CGContextRelease(ctx: CGContextRef);
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
     fn CGMainDisplayID() -> CGDirectDisplayID;
@@ -265,112 +224,134 @@ fn pump_runloop(seconds: f64) {
 }
 
 // ---------------------------------------------------------------------------
-// A server-owned window holding a static bitmap (the proxy or the backdrop).
+// A plain AppKit `NSWindow` holding a bitmap (the proxy or the backdrop).
+//
+// This is the heart of the migration away from server-owned SLS windows. The
+// window server already stacks an *inactive* app's windows below the *active*
+// app's windows, so a non-activating proxy owned by glide (an accessory app)
+// naturally sits behind whatever window the user is working in — and that
+// foreground window keeps rendering live on top. That is exactly the ordering
+// we could never get by hand-placing a private SLS window.
+//
+// We never change the active app or the key window: windows are ordered in with
+// `orderFront` (which, for a background app, lands above other inactive windows
+// but below the active app), and `orderWindow:relativeTo:` is used *only* to
+// stack the proxy above the backdrop — both ours. (That call cannot reorder a
+// foreign window, which is why it can't be used to climb above the foreground.)
 // ---------------------------------------------------------------------------
 
 struct ProxyWindow {
-    cid: SLSConnectionID,
-    id: CGWindowID,
-    context: CGContextRef,
-    image: CGImageRef,
-    frame: CGRect,
-    /// The window we order ourselves directly above. Ordering relative to a
-    /// specific window (rather than `0` = "above everything") is what lets
-    /// foreground windows stay on top: anything already above `order_above`
-    /// keeps its place above us. The backdrop sits above the target window; the
-    /// proxy sits above the backdrop.
-    order_above: CGWindowID,
+    window: Retained<NSWindow>,
+    layer: Retained<CALayer>,
 }
 
 impl ProxyWindow {
-    /// Create a window on `cid` at `frame`, draw `image` into it, and order it
-    /// in at `level`. Takes ownership of `image` (released on drop).
+    /// Create a borderless, non-activating window at `frame` (CG global coords)
+    /// showing `image`, at window level `level`.
     fn new(
-        cid: SLSConnectionID,
+        mtm: MainThreadMarker,
         frame: CGRect,
         image: CGImageRef,
         level: c_int,
         opaque: bool,
-        order_above: CGWindowID,
     ) -> Self {
         assert!(!image.is_null(), "cannot build a proxy from a null image");
-        unsafe {
-            let mut region: CFTypeRef = std::ptr::null();
-            CGSNewRegionWithRect(&frame, &mut region);
-            let empty = CGRegionCreateEmptyRegion();
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                cg_to_ns_rect(frame),
+                NSWindowStyleMask::Borderless,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        window.setLevel(level as isize);
+        window.setOpaque(opaque);
+        window.setHasShadow(false);
+        // Disable AppKit's automatic open/close scale+fade. Without this the
+        // proxy/backdrop "zoom" in and out, and during the fade-in the backdrop
+        // is briefly translucent, revealing the relocated real window's edge.
+        window.setAnimationBehavior(NSWindowAnimationBehavior::None);
+        window.setBackgroundColor(Some(&NSColor::clearColor()));
+        window.setIgnoresMouseEvents(true);
+        unsafe { window.setReleasedWhenClosed(false) };
 
-            let tags = PROXY_WINDOW_TAG;
-            let mut id: CGWindowID = 0;
-            // type 2, options 13 | (1<<18), tag_size 64: the exact incantation
-            // yabai uses to create a layer-backed, context-drawable window.
-            SLSNewWindowWithOpaqueShapeAndContext(
-                cid,
-                2,
-                region,
-                empty,
-                13 | (1 << 18),
-                &tags,
-                0.0,
-                0.0,
-                64,
-                &mut id,
-                std::ptr::null_mut(),
-            );
-            SLSSetWindowResolution(cid, id, 2.0);
-            SLSSetWindowOpacity(cid, id, opaque);
-            SLSSetWindowAlpha(cid, id, 1.0);
-            SLSSetWindowLevel(cid, id, level);
-            // Match a normal app window's sub-level. Without this the window
-            // defaults to a high sub-level and floats above the app-window band,
-            // so the focused window can never cover it.
-            SLSSetWindowSubLevel(cid, id, 0);
+        // Layer-backed content view; the bitmap lives in the layer and scales
+        // with the window (replacing yabai's per-frame SLSSetWindowTransform).
+        let content: Retained<NSView> = window.contentView().expect("content view");
+        content.setWantsLayer(true);
+        let layer = content.layer().expect("layer-backed view has a layer");
+        layer.setContentsGravity(&NSString::from_str("resize"));
+        set_layer_image(&layer, image);
 
-            let context = SLWindowContextCreate(cid, id, std::ptr::null());
-            let local = CGRect::new(CGPoint::new(0.0, 0.0), frame.size);
-            CGContextClearRect(context, local);
-            CGContextDrawImage(context, local, image);
-            CGContextFlush(context);
+        // Order in without activating glide (background app -> above other
+        // inactive windows, below the active app).
+        window.orderFront(None);
 
-            CFRelease(region);
-            CFRelease(empty);
+        ProxyWindow { window, layer }
+    }
 
-            // Order it in directly above `order_above` (not above the whole
-            // level), so windows already above that reference stay on top.
-            SLSOrderWindow(cid, id, 1, order_above);
-
-            ProxyWindow { cid, id, context, image, frame, order_above }
-        }
+    /// Stack this window directly above `other` (must be one of *our* windows;
+    /// AppKit relative ordering does not work across applications).
+    fn order_above(&self, other: &ProxyWindow) {
+        self.window
+            .orderWindow_relativeTo(NSWindowOrderingMode::Above, other.window.windowNumber());
     }
 
     fn without_shadow(self) -> Self {
-        disable_shadow(self.id);
+        // Shadow is already disabled in `new`; retained for call-site parity.
         self
     }
 
-    /// Replace the proxy's content with a freshly captured frame. The window's
-    /// position/scale come from the transform, so we only redraw the bitmap into
-    /// the window-local rect. Cheap enough to do every frame for one window.
+    /// Replace the bitmap with a freshly captured frame. The layer scales it to
+    /// the current window size, so we only swap contents here.
     fn redraw(&self, image: CGImageRef) {
         if image.is_null() {
             return;
         }
-        let local = CGRect::new(CGPoint::new(0.0, 0.0), self.frame.size);
-        unsafe {
-            CGContextClearRect(self.context, local);
-            CGContextDrawImage(self.context, local, image);
-            CGContextFlush(self.context);
-        }
+        set_layer_image(&self.layer, image);
     }
 
-    fn hide(&self, cid: SLSConnectionID) {
-        unsafe { SLSOrderWindow(cid, self.id, 0, 0) };
+    /// Move and resize the window to `frame` (CG global coords). Replaces the
+    /// per-frame SLS transform; the layer's `resize` gravity scales the bitmap.
+    fn set_frame(&self, frame: CGRect) {
+        self.window.setFrame_display(cg_to_ns_rect(frame), true);
     }
 
-    fn show(&self, cid: SLSConnectionID) {
-        // Order it back in directly above its reference (see `order_above`),
-        // not above the whole level, so foreground windows stay on top.
-        unsafe { SLSOrderWindow(cid, self.id, 1, self.order_above) };
+    /// The window-server id, for debug dumps.
+    fn id(&self) -> CGWindowID {
+        self.window.windowNumber() as CGWindowID
     }
+
+    fn hide(&self) {
+        self.window.orderOut(None);
+    }
+
+    fn show(&self) {
+        self.window.orderFront(None);
+    }
+}
+
+/// Assign a `CGImageRef` as a layer's contents with implicit animations off, so
+/// per-frame swaps don't cross-fade. The layer retains the image itself.
+fn set_layer_image(layer: &CALayer, image: CGImageRef) {
+    unsafe {
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        let obj: &AnyObject = &*(image as *const AnyObject);
+        layer.setContents(Some(obj));
+        CATransaction::commit();
+    }
+}
+
+/// Convert a CG global rect (top-left origin, y down) to an AppKit screen rect
+/// (bottom-left origin, y up) by flipping through the primary display's height.
+fn cg_to_ns_rect(r: CGRect) -> NSRect {
+    let primary_h = unsafe { CGDisplayBounds(CGMainDisplayID()) }.size.height;
+    NSRect::new(
+        NSPoint::new(r.origin.x, primary_h - (r.origin.y + r.size.height)),
+        NSSize::new(r.size.width, r.size.height),
+    )
 }
 
 /// A `CGImageRef` that can be sent between threads and releases on drop. Used to
@@ -387,16 +368,8 @@ impl Drop for SendImage {
 
 impl Drop for ProxyWindow {
     fn drop(&mut self) {
-        unsafe {
-            SLSOrderWindow(self.cid, self.id, 0, 0);
-            if !self.context.is_null() {
-                CGContextRelease(self.context);
-            }
-            if !self.image.is_null() {
-                CFRelease(self.image);
-            }
-            SLSReleaseWindow(self.cid, self.id);
-        }
+        self.window.orderOut(None);
+        self.window.close();
     }
 }
 
@@ -417,47 +390,6 @@ extern "C" fn display_link_callback(
 ) -> CVReturn {
     unsafe { dispatch_semaphore_signal(user_info as DispatchSemaphore) };
     KCV_RETURN_SUCCESS
-}
-
-/// Position *and* scale the proxy to `cur`, using yabai's transform recipe.
-///
-/// The SLS window transform maps *screen → window* (the inverse of where the
-/// content should land), so to show the captured bitmap at `cur` we translate by
-/// the negated current position and scale by original/current. See
-/// `window_manager.c:580` in yabai. The change only becomes visible once the
-/// run loop turns (the caller flushes each frame).
-fn set_proxy_transform(cid: SLSConnectionID, proxy_id: CGWindowID, origin: CGRect, cur: CGRect) {
-    let sx = origin.size.width / cur.size.width;
-    let sy = origin.size.height / cur.size.height;
-    let transform = CGAffineTransform {
-        a: sx,
-        b: 0.0,
-        c: 0.0,
-        d: sy,
-        tx: -cur.origin.x * sx,
-        ty: -cur.origin.y * sy,
-    };
-    let e = unsafe { SLSSetWindowTransform(cid, proxy_id, transform) };
-    if e != 0 {
-        eprintln!("SLSSetWindowTransform err={e}");
-    }
-}
-
-/// Disable the proxy window's drop shadow by zeroing its shadow density, the
-/// way yabai does (`sls_window_disable_shadow`). Passing a null options dict is
-/// a no-op, so we must build the dictionary explicitly.
-fn disable_shadow(id: CGWindowID) {
-    use core_foundation::base::TCFType;
-    use core_foundation::dictionary::CFDictionary;
-    use core_foundation::number::CFNumber;
-    use core_foundation::string::CFString;
-
-    let key = CFString::from_static_string("com.apple.WindowShadowDensity");
-    let value = CFNumber::from(0i32);
-    let dict = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), value.as_CFType())]);
-    unsafe {
-        SLSWindowSetShadowProperties(id, dict.as_concrete_TypeRef() as CFTypeRef);
-    }
 }
 
 fn lerp(a: f64, b: f64, t: f64) -> f64 {
@@ -558,7 +490,6 @@ fn capture_relative_to_window(
 struct Target {
     wsid: WindowServerId,
     elem: AXUIElement,
-    pid: i32,
 }
 
 /// Resolve an existing window id to an animatable target.
@@ -570,37 +501,22 @@ fn resolve_existing(wsid: WindowServerId) -> Option<Target> {
         .iter()
         .find(|w| WindowServerId::try_from(&**w).ok() == Some(wsid))
         .map(|w| w.clone())?;
-    Some(Target { wsid, elem, pid: info.pid })
-}
-
-/// The process id of the frontmost (focused) application, if any.
-fn frontmost_app_pid() -> Option<i32> {
-    NSWorkspace::sharedWorkspace()
-        .frontmostApplication()
-        .map(|a| a.processIdentifier())
-}
-
-/// Bring the app with `pid` back to the front, so its key window returns above
-/// our proxy/backdrop and keeps rendering live.
-fn reactivate_app(pid: i32) {
-    if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
-        #[allow(deprecated)]
-        app.activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps);
-    }
+    Some(Target { wsid, elem })
 }
 
 /// Run the full proxy-window animation for `target`, moving it to `dest`.
 /// Blocks until the animation settles, then tears everything down.
 fn animate(target: &Target, dest: CGRect) {
-    if !NSApp(MainThreadMarker::new().unwrap()).setActivationPolicy(NSApplicationActivationPolicy::Regular) {
-        println!("WARN: Failed to set activation policy");
-    }
+    let mtm = MainThreadMarker::new().expect("animate must run on the main thread");
+
+    // Run as an accessory (background) app and never activate. That is what lets
+    // `orderFront` place the proxy/backdrop above other *inactive* windows yet
+    // below the *active* app's windows — so the window the user is working in
+    // stays on top and keeps receiving input, with no reactivation dance.
+    NSApplication::sharedApplication(mtm)
+        .setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
     let wid = target.wsid.as_u32();
-
-    // Remember which app is focused before we create any windows, so we can
-    // restore it on top once the proxy/backdrop are up.
-    let focused_pid = frontmost_app_pid();
 
     let mut cid: SLSConnectionID = 0;
     unsafe { SLSNewConnection(0, &mut cid) };
@@ -636,52 +552,20 @@ fn animate(target: &Target, dest: CGRect) {
         dump_z_order(target.wsid);
     }
 
-    // 3: create the layers: backdrop (opaque, hides the relocated real target)
-    // and the proxy (animated) above it.
-    // Order the backdrop directly above the *target* window (not above the whole
-    // level), and the proxy directly above the backdrop. This keeps both above
-    // the relocated real window (so it stays hidden) while leaving any window
-    // the user has above the target — e.g. the terminal in the foreground — on
-    // top, instead of pinning our windows to the absolute front.
-    unsafe { SLSDisableUpdate(cid) };
+    // 3: create the windows: backdrop (opaque, hides the relocated real target)
+    // and the proxy (animated) above it. Both are ordered in with `orderFront`
+    // (background-app ordering keeps them below the active app), and the proxy
+    // is stacked directly above the backdrop with `orderWindow:relativeTo:`.
     let backdrop =
-        ProxyWindow::new(cid, backdrop_bounds, backdrop_img, level, true, wid).without_shadow();
-    let proxy = ProxyWindow::new(cid, origin, proxy_img, level, false, backdrop.id);
-    unsafe { SLSReenableUpdate(cid) };
+        ProxyWindow::new(mtm, backdrop_bounds, backdrop_img, level, true).without_shadow();
+    let proxy = ProxyWindow::new(mtm, origin, proxy_img, level, false);
+    proxy.order_above(&backdrop);
 
     if debug {
-        // Read back the level/sublevel the window server actually assigned, to
-        // see whether our proxy/backdrop really landed in the target's band or
-        // in a higher one (which a manual click could never climb above).
         dump_level(cid, "target  ", wid);
-        dump_level(cid, "backdrop", backdrop.id);
-        dump_level(cid, "proxy   ", proxy.id);
+        dump_level(cid, "backdrop", backdrop.id());
+        dump_level(cid, "proxy   ", proxy.id());
         dump_z_order(target.wsid);
-    }
-
-    // Keep the window the user is working in on top: creating our windows put
-    // them at the front, so re-activate the app that was focused when we
-    // started. Its key window returns above our proxy and stays live (no
-    // overlay needed). Skipped when that app owns the target itself (e.g. the
-    // self-spawned demo), since there we *want* our window animated.
-    // Test override: force-reactivate a specific pid (e.g. a same-space terminal)
-    // to see whether an app-window raise can climb above our server window.
-    let reactivate_pid = std::env::var("GLIDE_REACTIVATE_PID")
-        .ok()
-        .and_then(|s| s.parse::<i32>().ok())
-        .or(focused_pid);
-    if let Some(fpid) = reactivate_pid
-        && fpid != target.pid
-    {
-        println!("reactivating focused pid={fpid}");
-        reactivate_app(fpid);
-        pump_runloop(0.05);
-        if debug {
-            // Did the reactivated app's window actually climb above our backdrop?
-            // If its wid is still below ours here, an app-window raise can't cross
-            // a privately-created server window on the same display.
-            dump_z_order(target.wsid);
-        }
     }
 
     // Live content: a background thread captures the target window on its *own*
@@ -737,34 +621,31 @@ fn animate(target: &Target, dest: CGRect) {
     // 4 + forward animation: move the real window to its destination (occluded
     // by the backdrop), then animate the proxy origin -> dest.
     move_real_window(&target.elem, dest);
-    run_spring(&proxy, &live, origin, origin, dest, sem);
+    run_spring(&proxy, &live, origin, dest, sem);
 
     // Pause for a second to show the window at its destination.
-    backdrop.hide(cid);
-    proxy.hide(cid);
+    backdrop.hide();
+    proxy.hide();
     pump_runloop(1.0);
-    backdrop.show(cid);
-    proxy.show(cid);
+    backdrop.show();
+    proxy.show();
+    proxy.order_above(&backdrop);
 
     // QoL: animate back. Move the real window home, then animate dest -> origin.
     move_real_window(&target.elem, origin);
-    run_spring(&proxy, &live, origin, dest, origin, sem);
+    run_spring(&proxy, &live, dest, origin, sem);
 
-    // 6: stop the capture thread and link, then tear the proxies down atomically.
+    // 6: stop the capture thread and link, then tear the proxy windows down.
     stop.store(true, Ordering::Relaxed);
     let _ = capture_thread.join();
     unsafe {
         CVDisplayLinkStop(link);
         CVDisplayLinkRelease(link);
         dispatch_release(sem);
-        SLSDisableUpdate(cid);
     }
     drop(proxy);
     drop(backdrop);
-    unsafe {
-        SLSReenableUpdate(cid);
-        SLSReleaseConnection(cid);
-    }
+    unsafe { SLSReleaseConnection(cid) };
     println!("animation complete");
 }
 
@@ -801,14 +682,12 @@ fn move_real_window(elem: &AXUIElement, frame: CGRect) {
 }
 
 /// Drive the proxy from `from` to `to` with a spring, one update per vsync tick
-/// (the semaphore is signalled by the display-link callback). `capture` is the
-/// frame the proxy bitmap was captured at — the transform scales relative to it.
-/// Each frame the proxy is redrawn from the latest frame in `live`, so the
-/// animating window shows live content (e.g. text typed in another app).
+/// (the semaphore is signalled by the display-link callback). Each frame the
+/// proxy is redrawn from the latest frame in `live`, so the animating window
+/// shows live content (e.g. text typed in another app).
 fn run_spring(
     proxy: &ProxyWindow,
     live: &Mutex<Option<SendImage>>,
-    capture: CGRect,
     from: CGRect,
     to: CGRect,
     sem: DispatchSemaphore,
@@ -827,19 +706,20 @@ fn run_spring(
         let v = spring.velocity_at(now);
         frames += 1;
 
-        // Swap in the latest captured frame, then position+scale it.
+        // Swap in the latest captured frame, then move+resize the window to it.
         if let Some(img) = live.lock().unwrap().as_ref() {
             proxy.redraw(img.0);
         }
         let cur = lerp_rect(from, to, s);
-        set_proxy_transform(proxy.cid, proxy.id, capture, cur);
-        // SLS changes only become visible when the run loop turns. A zero-length
-        // run avoids the ~20ms block of a timed one, keeping us near vsync.
+        proxy.set_frame(cur);
+        // Turn the run loop so AppKit/Core Animation commit this frame. A
+        // zero-length run avoids the ~20ms block of a timed one, keeping us near
+        // vsync.
         unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, false) };
 
         let elapsed = now.duration_since(start);
         if ((s - 1.0).abs() < 0.002 && v.abs() < 0.05) || elapsed > Duration::from_secs(8) {
-            set_proxy_transform(proxy.cid, proxy.id, capture, to);
+            proxy.set_frame(to);
             unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, false) };
             let secs = now.duration_since(start).as_secs_f64();
             println!(
@@ -1050,7 +930,6 @@ fn main() {
     let target = Target {
         wsid,
         elem: elem.expect("AX window not found"),
-        pid,
     };
 
     // Move the window onto the builtin display so the 120Hz path is exercised
