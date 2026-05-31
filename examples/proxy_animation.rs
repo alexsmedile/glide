@@ -72,9 +72,7 @@ use glide_wm::sys::window_server::{self, WindowServerId};
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
-    NSBackingStoreType, NSColor, NSFont, NSRunningApplication, NSScreen, NSTextAlignment,
-    NSTextField, NSWindow, NSWindowStyleMask, NSWorkspace,
+    NSApp, NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSFont, NSRunningApplication, NSScreen, NSTextAlignment, NSTextField, NSWindow, NSWindowStyleMask, NSWorkspace
 };
 use objc2_core_foundation::{CGAffineTransform, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGImage;
@@ -115,6 +113,7 @@ unsafe extern "C" {
 
     fn SLSGetWindowBounds(cid: SLSConnectionID, wid: CGWindowID, frame: *mut CGRect) -> i32;
     fn SLSGetWindowLevel(cid: SLSConnectionID, wid: CGWindowID, level: *mut c_int) -> i32;
+    fn SLSGetWindowSubLevel(cid: SLSConnectionID, wid: CGWindowID) -> c_int;
 
     fn SLSNewWindowWithOpaqueShapeAndContext(
         cid: SLSConnectionID,
@@ -593,6 +592,10 @@ fn reactivate_app(pid: i32) {
 /// Run the full proxy-window animation for `target`, moving it to `dest`.
 /// Blocks until the animation settles, then tears everything down.
 fn animate(target: &Target, dest: CGRect) {
+    if !NSApp(MainThreadMarker::new().unwrap()).setActivationPolicy(NSApplicationActivationPolicy::Regular) {
+        println!("WARN: Failed to set activation policy");
+    }
+
     let wid = target.wsid.as_u32();
 
     // Remember which app is focused before we create any windows, so we can
@@ -646,16 +649,39 @@ fn animate(target: &Target, dest: CGRect) {
     let proxy = ProxyWindow::new(cid, origin, proxy_img, level, false, backdrop.id);
     unsafe { SLSReenableUpdate(cid) };
 
+    if debug {
+        // Read back the level/sublevel the window server actually assigned, to
+        // see whether our proxy/backdrop really landed in the target's band or
+        // in a higher one (which a manual click could never climb above).
+        dump_level(cid, "target  ", wid);
+        dump_level(cid, "backdrop", backdrop.id);
+        dump_level(cid, "proxy   ", proxy.id);
+        dump_z_order(target.wsid);
+    }
+
     // Keep the window the user is working in on top: creating our windows put
     // them at the front, so re-activate the app that was focused when we
     // started. Its key window returns above our proxy and stays live (no
     // overlay needed). Skipped when that app owns the target itself (e.g. the
     // self-spawned demo), since there we *want* our window animated.
-    if let Some(fpid) = focused_pid
+    // Test override: force-reactivate a specific pid (e.g. a same-space terminal)
+    // to see whether an app-window raise can climb above our server window.
+    let reactivate_pid = std::env::var("GLIDE_REACTIVATE_PID")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .or(focused_pid);
+    if let Some(fpid) = reactivate_pid
         && fpid != target.pid
     {
+        println!("reactivating focused pid={fpid}");
         reactivate_app(fpid);
         pump_runloop(0.05);
+        if debug {
+            // Did the reactivated app's window actually climb above our backdrop?
+            // If its wid is still below ours here, an app-window raise can't cross
+            // a privately-created server window on the same display.
+            dump_z_order(target.wsid);
+        }
     }
 
     // Live content: a background thread captures the target window on its *own*
@@ -823,6 +849,16 @@ fn run_spring(
             return;
         }
     }
+}
+
+/// Print the window-server level and sub-level the server assigned to `wid`.
+/// Used to check whether our proxy/backdrop actually share the target window's
+/// band, or sit in a higher one that no click could put another window above.
+fn dump_level(cid: SLSConnectionID, label: &str, wid: CGWindowID) {
+    let mut level: c_int = 0;
+    unsafe { SLSGetWindowLevel(cid, wid, &mut level) };
+    let sub_level = unsafe { SLSGetWindowSubLevel(cid, wid) };
+    println!("level {label}: wid={wid:<7} level={level:<4} sublevel={sub_level}");
 }
 
 /// Print the windows around `target` in z-order (frontmost first) with owner
