@@ -349,6 +349,15 @@ impl ProxyWindow {
             CGContextFlush(self.context);
         }
     }
+
+    fn hide(&self, cid: SLSConnectionID) {
+        unsafe { SLSOrderWindow(cid, self.id, 0, 0) };
+    }
+
+    fn show(&self, cid: SLSConnectionID) {
+        // Order it in above everything at its level.
+        unsafe { SLSOrderWindow(cid, self.id, 1, 0) };
+    }
 }
 
 /// A `CGImageRef` that can be sent between threads and releases on drop. Used to
@@ -660,6 +669,13 @@ fn animate(target: &Target, dest: CGRect) {
     // by the backdrop), then animate the proxy origin -> dest.
     move_real_window(&target.elem, dest);
     run_spring(&proxy, &live, origin, origin, dest, sem);
+
+    // Pause for a second to show the window at its destination.
+    backdrop.hide(cid);
+    proxy.hide(cid);
+    pump_runloop(1.0);
+    backdrop.show(cid);
+    proxy.show(cid);
 
     // QoL: animate back. Move the real window home, then animate dest -> origin.
     move_real_window(&target.elem, origin);
