@@ -149,15 +149,9 @@ unsafe extern "C" {
         options: u32,
     ) -> CFArrayRef;
 
-    // Transactions: a synchronous commit flushes to the window server without
-    // needing a run-loop turn, which is what lets us hit full refresh rate.
-    fn SLSTransactionCreate(cid: SLSConnectionID) -> CFTypeRef;
-    fn SLSTransactionCommit(transaction: CFTypeRef, synchronous: c_int) -> i32;
-    fn SLSTransactionSetWindowTransform(
-        transaction: CFTypeRef,
+    fn SLSSetWindowTransform(
+        cid: SLSConnectionID,
         wid: CGWindowID,
-        unknown: c_int,
-        unknown2: c_int,
         transform: CGAffineTransform,
     ) -> i32;
 
@@ -400,12 +394,8 @@ extern "C" fn display_link_callback(
 /// The SLS window transform maps *screen → window* (the inverse of where the
 /// content should land), so to show the captured bitmap at `cur` we translate by
 /// the negated current position and scale by original/current. See
-/// `window_manager.c:580` in yabai.
-///
-/// We apply it inside a *synchronous* SLS transaction commit. That flushes the
-/// change to the window server immediately, so — unlike a bare
-/// `SLSSetWindowTransform` — it does not need a run-loop turn to become visible,
-/// which is what lets the loop run at full display refresh.
+/// `window_manager.c:580` in yabai. The change only becomes visible once the
+/// run loop turns (the caller flushes each frame).
 fn set_proxy_transform(cid: SLSConnectionID, proxy_id: CGWindowID, origin: CGRect, cur: CGRect) {
     let sx = origin.size.width / cur.size.width;
     let sy = origin.size.height / cur.size.height;
@@ -417,11 +407,9 @@ fn set_proxy_transform(cid: SLSConnectionID, proxy_id: CGWindowID, origin: CGRec
         tx: -cur.origin.x * sx,
         ty: -cur.origin.y * sy,
     };
-    unsafe {
-        let txn = SLSTransactionCreate(cid);
-        SLSTransactionSetWindowTransform(txn, proxy_id, 0, 0, transform);
-        SLSTransactionCommit(txn, 1);
-        CFRelease(txn);
+    let e = unsafe { SLSSetWindowTransform(cid, proxy_id, transform) };
+    if e != 0 {
+        eprintln!("SLSSetWindowTransform err={e}");
     }
 }
 
@@ -584,27 +572,30 @@ fn animate(target: &Target, dest: CGRect) {
         }
         return;
     };
-    // Foreground handling. By default we slide our proxy stack *below* the real
-    // windows in front of the target, so they stay live and on top (the key
-    // window keeps updating). GLIDE_FG_SNAPSHOT instead overlays a frozen
-    // snapshot of them on top of the proxy (the original approach).
-    let use_snapshot = std::env::var("GLIDE_FG_SNAPSHOT").is_ok();
-    let above = window_above(target.wsid);
-    println!("window above target: {above:?} (snapshot={use_snapshot})");
-    let foreground_img = if use_snapshot {
+    // Foreground handling (both opt-in; default does neither so the animation
+    // is always visible):
+    //   GLIDE_FG_SNAPSHOT — overlay a frozen snapshot of the windows in front
+    //     of the target on top of the proxy (visible, but the key window is
+    //     frozen during the animation).
+    //   GLIDE_FG_ORDER — order the proxy stack *below* the real windows in
+    //     front of the target so they stay live and on top. Experimental:
+    //     cross-connection ordering relative to an external window is
+    //     unreliable and can hide the proxy, so it is not the default.
+    let fg_snapshot = std::env::var("GLIDE_FG_SNAPSHOT").is_ok();
+    let fg_order = std::env::var("GLIDE_FG_ORDER").is_ok();
+    let foreground_img = if fg_snapshot {
         capture_foreground(backdrop_bounds, wid)
     } else {
         None
     };
 
-    // 3: create the layers, bottom to top: backdrop (opaque, hides the real
-    // target) → proxy (the animated window). Optionally a foreground snapshot.
+    // 3: create the layers. The core invariant is simply: proxy strictly above
+    // the backdrop, both ordered to the front. Everything else is opt-in.
     unsafe { SLSDisableUpdate(cid) };
     let backdrop = ProxyWindow::new(cid, backdrop_bounds, backdrop_img, level, true);
     let proxy = ProxyWindow::new(cid, origin, proxy_img, level, false);
     unsafe { SLSOrderWindow(cid, proxy.id, 1, backdrop.id) };
-    if !use_snapshot && let Some(neighbor) = above {
-        // Drop the whole stack just below the real foreground windows.
+    if fg_order && let Some(neighbor) = window_above(target.wsid) {
         unsafe {
             SLSOrderWindow(cid, backdrop.id, -1, neighbor);
             SLSOrderWindow(cid, proxy.id, 1, backdrop.id);
@@ -734,10 +725,14 @@ fn run_spring(
         }
         let cur = lerp_rect(from, to, s);
         set_proxy_transform(proxy.cid, proxy.id, capture, cur);
+        // SLS changes only become visible when the run loop turns. A zero-length
+        // run avoids the ~20ms block of a timed one, keeping us near vsync.
+        unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, false) };
 
         let elapsed = now.duration_since(start);
         if ((s - 1.0).abs() < 0.002 && v.abs() < 0.05) || elapsed > Duration::from_secs(8) {
             set_proxy_transform(proxy.cid, proxy.id, capture, to);
+            unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, false) };
             let secs = now.duration_since(start).as_secs_f64();
             println!(
                 "ran {frames} frames in {secs:.3}s ({:.0} fps)",
