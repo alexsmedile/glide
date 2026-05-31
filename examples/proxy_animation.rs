@@ -76,7 +76,6 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSFont, NSScreen, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowOrderingMode, NSWindowStyleMask
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::{CALayer, CATransaction};
 
@@ -242,15 +241,28 @@ fn pump_runloop(seconds: f64) {
 
 struct ProxyWindow {
     window: Retained<NSWindow>,
-    layer: Retained<CALayer>,
+    /// Sublayer holding the bitmap. We move/scale *this* — never the window or
+    /// its backing layer — so the only geometry changes are our own direct sets,
+    /// which obey `CATransaction` actions. Resizing the window instead would have
+    /// AppKit apply the backing-layer resize in a later layout pass, outside our
+    /// transaction, so it implicitly animates (lagging the window: corner noise,
+    /// wrong size for a few frames). See `set_content_rect`.
+    content: Retained<CALayer>,
+    /// The window's frame in CG global coords. Sublayer rects are positioned
+    /// relative to it.
+    container: CGRect,
 }
 
 impl ProxyWindow {
-    /// Create a borderless, non-activating window at `frame` (CG global coords)
-    /// showing `image`, at window level `level`.
+    /// Create a borderless, non-activating window covering `container` (CG global
+    /// coords), with `image` drawn into the sub-region `content_rect` (also CG
+    /// global). For a static backdrop pass `content_rect == container`; for the
+    /// animated proxy, `container` is the union of the origin and destination so
+    /// the bitmap can move within a window that never itself resizes.
     fn new(
         mtm: MainThreadMarker,
-        frame: CGRect,
+        container: CGRect,
+        content_rect: CGRect,
         image: CGImageRef,
         level: c_int,
         opaque: bool,
@@ -259,7 +271,7 @@ impl ProxyWindow {
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
-                cg_to_ns_rect(frame),
+                cg_to_ns_rect(container),
                 NSWindowStyleMask::Borderless,
                 NSBackingStoreType::Buffered,
                 false,
@@ -276,19 +288,26 @@ impl ProxyWindow {
         window.setIgnoresMouseEvents(true);
         unsafe { window.setReleasedWhenClosed(false) };
 
-        // Layer-backed content view; the bitmap lives in the layer and scales
-        // with the window (replacing yabai's per-frame SLSSetWindowTransform).
-        let content: Retained<NSView> = window.contentView().expect("content view");
-        content.setWantsLayer(true);
-        let layer = content.layer().expect("layer-backed view has a layer");
-        layer.setContentsGravity(&NSString::from_str("resize"));
-        set_layer_image(&layer, image);
+        // Layer-backed content view, plus a sublayer that holds the bitmap and
+        // that we reposition each frame (the backing layer stays full-window).
+        let view: Retained<NSView> = window.contentView().expect("content view");
+        view.setWantsLayer(true);
+        let backing = view.layer().expect("layer-backed view has a layer");
+        let content = CALayer::new();
+        content.setContentsGravity(&NSString::from_str("resize"));
+        backing.addSublayer(&content);
+
+        let this = ProxyWindow { window, content, container };
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        this.set_contents(image);
+        this.set_content_rect(content_rect);
+        CATransaction::commit();
 
         // Order in without activating glide (background app -> above other
         // inactive windows, below the active app).
-        window.orderFront(None);
-
-        ProxyWindow { window, layer }
+        this.window.orderFront(None);
+        this
     }
 
     /// Stack this window directly above `other` (must be one of *our* windows;
@@ -303,27 +322,25 @@ impl ProxyWindow {
         self
     }
 
-    /// Swap the layer's bitmap for a freshly captured frame. The caller must be
-    /// inside a no-actions `CATransaction` so the swap is presented atomically
-    /// with the frame change (see `run_spring`).
+    /// Swap the bitmap for a freshly captured frame. Caller must be inside a
+    /// no-actions `CATransaction` so the swap is atomic with the move/scale.
     fn set_contents(&self, image: CGImageRef) {
         if image.is_null() {
             return;
         }
         unsafe {
             let obj: &AnyObject = &*(image as *const AnyObject);
-            self.layer.setContents(Some(obj));
+            self.content.setContents(Some(obj));
         }
     }
 
-    /// Move and resize the window to `frame` (CG global coords). Replaces the
-    /// per-frame SLS transform; the layer's `resize` gravity scales the bitmap.
-    /// The caller must be inside a no-actions `CATransaction`: otherwise
-    /// resizing the window starts an implicit Core Animation on the backing
-    /// layer's bounds, which lags the window by a frame and scales the contents
-    /// wrong. Disabling actions keeps the layer locked to the window.
-    fn set_frame(&self, frame: CGRect) {
-        self.window.setFrame_display(cg_to_ns_rect(frame), false);
+    /// Position and scale the bitmap so it covers `r` (CG global coords) within
+    /// the fixed window. Replaces yabai's per-frame `SLSSetWindowTransform`.
+    /// Caller must be inside a no-actions `CATransaction` (see `run_spring`);
+    /// because this sets our own sublayer's frame directly there is no AppKit
+    /// layout pass to animate it, so the move is exact every frame.
+    fn set_content_rect(&self, r: CGRect) {
+        self.content.setFrame(local_rect(self.container, r));
     }
 
     /// The window-server id, for debug dumps.
@@ -340,16 +357,18 @@ impl ProxyWindow {
     }
 }
 
-/// Assign a `CGImageRef` as a layer's contents with implicit animations off, so
-/// per-frame swaps don't cross-fade. The layer retains the image itself.
-fn set_layer_image(layer: &CALayer, image: CGImageRef) {
-    unsafe {
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        let obj: &AnyObject = &*(image as *const AnyObject);
-        layer.setContents(Some(obj));
-        CATransaction::commit();
-    }
+/// Map a CG global rect `r` to layer coords inside a window whose frame is
+/// `container` (CG global). The backing layer of a non-flipped `NSView` is
+/// y-up with its origin at the window's bottom-left, so we flip y within the
+/// container height.
+fn local_rect(container: CGRect, r: CGRect) -> CGRect {
+    CGRect::new(
+        CGPoint::new(
+            r.origin.x - container.origin.x,
+            container.size.height - (r.origin.y - container.origin.y) - r.size.height,
+        ),
+        r.size,
+    )
 }
 
 /// Convert a CG global rect (top-left origin, y down) to an AppKit screen rect
@@ -364,17 +383,12 @@ fn cg_to_ns_rect(r: CGRect) -> NSRect {
 
 /// A `CGImageRef` that can be sent between threads and releases on drop. Used to
 /// hand freshly captured frames from the capture thread to the animation loop.
-/// Carries the captured pixel size so the loop can reject frames grabbed while
-/// the real window was mid-resize (which render partly blank).
-struct SendImage {
-    img: CGImageRef,
-    px: (usize, usize),
-}
+struct SendImage(CGImageRef);
 unsafe impl Send for SendImage {}
 impl Drop for SendImage {
     fn drop(&mut self) {
-        if !self.img.is_null() {
-            unsafe { CFRelease(self.img) };
+        if !self.0.is_null() {
+            unsafe { CFRelease(self.0) };
         }
     }
 }
@@ -496,6 +510,14 @@ fn capture_relative_to_window(
     if image.is_null() { None } else { Some(image) }
 }
 
+// Public CoreGraphics accessors for a capture's pixel dimensions, used to
+// detect mid-resize captures (see the capture thread in `animate`).
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn CGImageGetWidth(image: CGImageRef) -> usize;
+    fn CGImageGetHeight(image: CGImageRef) -> usize;
+}
+
 // ---------------------------------------------------------------------------
 // The animation itself.
 // ---------------------------------------------------------------------------
@@ -565,28 +587,24 @@ fn animate(target: &Target, dest: CGRect) {
         dump_z_order(target.wsid);
     }
 
-    // Pixels-per-point of the capture (≈2 on Retina). Used to predict the pixel
-    // size a *settled* live capture should have at each end of the animation, so
-    // the loop can drop mid-resize captures (which come back a wrong size and
-    // render partly blank — the black flash).
-    let px_scale = {
-        let c = unsafe { &*(proxy_img as *const CGImage) };
-        CGImage::width(Some(c)) as f64 / origin.size.width
-    };
-    let expected_px = |r: CGRect| {
-        (
-            (r.size.width * px_scale).round() as usize,
-            (r.size.height * px_scale).round() as usize,
-        )
+    // Capture pixels-per-point, measured now while the window is settled at the
+    // origin. The capture thread uses it to drop mid-resize captures (whose
+    // pixel size lags the reported window size).
+    let scale = {
+        let w = unsafe { CGImageGetWidth(proxy_img) } as f64;
+        if origin.size.width > 1.0 { w / origin.size.width } else { 2.0 }
     };
 
     // 3: create the windows: backdrop (opaque, hides the relocated real target)
     // and the proxy (animated) above it. Both are ordered in with `orderFront`
     // (background-app ordering keeps them below the active app), and the proxy
     // is stacked directly above the backdrop with `orderWindow:relativeTo:`.
-    let backdrop =
-        ProxyWindow::new(mtm, backdrop_bounds, backdrop_img, level, true).without_shadow();
-    let proxy = ProxyWindow::new(mtm, origin, proxy_img, level, false);
+    // The proxy window spans origin∪dest so its bitmap can move within a window
+    // that never resizes (see `ProxyWindow`); the backdrop is static.
+    let backdrop = ProxyWindow::new(mtm, backdrop_bounds, backdrop_bounds, backdrop_img, level, true)
+        .without_shadow();
+    let proxy_container = union_rect(origin, dest);
+    let proxy = ProxyWindow::new(mtm, proxy_container, origin, proxy_img, level, false);
     proxy.order_above(&backdrop);
 
     if debug {
@@ -601,25 +619,46 @@ fn animate(target: &Target, dest: CGRect) {
     // latest frame into `live`; the animation loop redraws the proxy from it.
     let live: Arc<Mutex<Option<SendImage>>> = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
+    // The size (CG points) the real window is currently being moved toward. The
+    // capture thread only trusts a capture once the window has actually reached
+    // this size — both its reported bounds and its backing-store pixels. That
+    // rejects the mid-resize blank captures regardless of which of the two lags.
+    let target_size = Arc::new(Mutex::new((origin.size.width, origin.size.height)));
     let capture_thread = {
         let live = live.clone();
         let stop = stop.clone();
+        let target_size = target_size.clone();
         std::thread::spawn(move || {
             let mut cap_cid: SLSConnectionID = 0;
             unsafe { SLSNewConnection(0, &mut cap_cid) };
-            let mut last_frame = None;
             while !stop.load(Ordering::Relaxed) {
                 if let Some(img) = capture_window(cap_cid, wid) {
-                    // Record the captured pixel size so the animation loop can
-                    // skip mid-resize frames (see `run_spring`).
-                    let cap = unsafe { Retained::retain(img as *mut CGImage) }.unwrap();
-                    let px = (CGImage::width(Some(&cap)), CGImage::height(Some(&cap)));
-                    if last_frame != Some(px) {
-                        dbg!(px);
-                    }
-                    last_frame.replace(px);
+                    let si = SendImage(img);
 
-                    *live.lock().unwrap() = Some(SendImage { img, px });
+                    // Trust a capture only once the window has fully reached the
+                    // size we're animating toward: its reported bounds equal the
+                    // target AND its backing-store pixels equal reported×scale.
+                    // During a resize those two settle a frame or two apart, and a
+                    // capture taken in that gap comes back mostly blank, causing an
+                    // intermittent see-through flash and corner artifacts.
+                    // Gating on both keeps `live` to fully painted frames.
+                    let (pw, ph) =
+                        unsafe { (CGImageGetWidth(si.0) as f64, CGImageGetHeight(si.0) as f64) };
+                    let mut rb = CGRect::default();
+                    unsafe { SLSGetWindowBounds(cap_cid, wid, &mut rb) };
+                    let (tw, th) = *target_size.lock().unwrap();
+                    let pt_tol = 1.5;
+                    let px_tol = 2.0 * scale + 1.0;
+                    let reported_ok = (rb.size.width - tw).abs() <= pt_tol
+                        && (rb.size.height - th).abs() <= pt_tol;
+                    let px_ok = (pw - rb.size.width * scale).abs() <= px_tol
+                        && (ph - rb.size.height * scale).abs() <= px_tol;
+
+                    if reported_ok && px_ok {
+                        *live.lock().unwrap() = Some(si);
+                    }
+                    // else: `si` drops here, releasing the mid-resize capture.
+                    // FIXME: (actually we leak it). Retain::from_raw, CGImage::width
                 }
                 std::thread::sleep(Duration::from_millis(6));
             }
@@ -647,9 +686,12 @@ fn animate(target: &Target, dest: CGRect) {
     }
 
     // 4 + forward animation: move the real window to its destination (occluded
-    // by the backdrop), then animate the proxy origin -> dest.
+    // by the backdrop), then animate the proxy origin -> dest. The capture
+    // thread's size-match filter (above) keeps mid-resize blank captures out of
+    // `live`, so no settle delay is needed here.
+    *target_size.lock().unwrap() = (dest.size.width, dest.size.height);
     move_real_window(&target.elem, dest);
-    run_spring(&proxy, &live, origin, dest, expected_px(dest), sem);
+    run_spring(&proxy, &live, origin, dest, sem);
 
     // Pause for a second to show the window at its destination.
     backdrop.hide();
@@ -660,8 +702,9 @@ fn animate(target: &Target, dest: CGRect) {
     proxy.order_above(&backdrop);
 
     // QoL: animate back. Move the real window home, then animate dest -> origin.
+    *target_size.lock().unwrap() = (origin.size.width, origin.size.height);
     move_real_window(&target.elem, origin);
-    run_spring(&proxy, &live, dest, origin, expected_px(origin), sem);
+    run_spring(&proxy, &live, dest, origin, sem);
 
     // 6: stop the capture thread and link, then tear the proxy windows down.
     stop.store(true, Ordering::Relaxed);
@@ -712,16 +755,12 @@ fn move_real_window(elem: &AXUIElement, frame: CGRect) {
 /// Drive the proxy from `from` to `to` with a spring, one update per vsync tick
 /// (the semaphore is signalled by the display-link callback). Each frame the
 /// proxy is redrawn from the latest frame in `live`, so the animating window
-/// shows live content (e.g. text typed in another app). `expected_px` is the
-/// pixel size a settled capture of the (already relocated) real window should
-/// have; captures of a different size are mid-resize and rendered partly blank,
-/// so we skip them and keep showing the last good bitmap.
+/// shows live content (e.g. text typed in another app).
 fn run_spring(
     proxy: &ProxyWindow,
     live: &Mutex<Option<SendImage>>,
     from: CGRect,
     to: CGRect,
-    expected_px: (usize, usize),
     sem: DispatchSemaphore,
 ) {
     // Drain vsync ticks that piled up since the last run (the display link keeps
@@ -745,23 +784,18 @@ fn run_spring(
         let v = spring.velocity_at(now);
         frames += 1;
 
-        // Swap in the latest captured frame and move+resize the window to it in
-        // ONE no-actions transaction, so the new bitmap and the new window size
-        // are presented together. With two separate commits a vsync can land
-        // between them, showing the new contents at the old size for a frame —
-        // which flashes and reveals the backdrop (worst on the shrinking return).
+        // Swap in the latest captured frame and reposition the bitmap in ONE
+        // no-actions transaction, so contents and geometry are presented
+        // together and neither implicitly animates. `live` only holds captures
+        // whose size matches the window (see the capture thread), so there's no
+        // mid-resize blank frame to guard against here.
         let cur = lerp_rect(from, to, s);
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         if let Some(img) = live.lock().unwrap().as_ref() {
-            // Skip mid-resize captures: they come back a wrong size and render
-            // partly blank, which flashes as a black block in the proxy.
-            let (w, h) = img.px;
-            if w.abs_diff(expected_px.0) <= 2 && h.abs_diff(expected_px.1) <= 2 {
-                proxy.set_contents(img.img);
-            }
+            proxy.set_contents(img.0);
         }
-        proxy.set_frame(cur);
+        proxy.set_content_rect(cur);
         CATransaction::commit();
         // Turn the run loop so AppKit/Core Animation commit this frame. A
         // zero-length run avoids the ~20ms block of a timed one, keeping us near
@@ -772,7 +806,7 @@ fn run_spring(
         if ((s - 1.0).abs() < 0.002 && v.abs() < 0.05) || elapsed > Duration::from_secs(8) {
             CATransaction::begin();
             CATransaction::setDisableActions(true);
-            proxy.set_frame(to);
+            proxy.set_content_rect(to);
             CATransaction::commit();
             unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, false) };
             let secs = now.duration_since(start).as_secs_f64();
