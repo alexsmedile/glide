@@ -56,6 +56,8 @@
 //! and prompts for it on launch.
 
 use std::ffi::{c_int, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use accessibility::{AXUIElement, AXUIElementAttributes};
@@ -271,6 +273,7 @@ struct ProxyWindow {
     id: CGWindowID,
     context: CGContextRef,
     image: CGImageRef,
+    frame: CGRect,
 }
 
 impl ProxyWindow {
@@ -324,7 +327,34 @@ impl ProxyWindow {
             // Order it in above everything at its level.
             SLSOrderWindow(cid, id, 1, 0);
 
-            ProxyWindow { cid, id, context, image }
+            ProxyWindow { cid, id, context, image, frame }
+        }
+    }
+
+    /// Replace the proxy's content with a freshly captured frame. The window's
+    /// position/scale come from the transform, so we only redraw the bitmap into
+    /// the window-local rect. Cheap enough to do every frame for one window.
+    fn redraw(&self, image: CGImageRef) {
+        if image.is_null() {
+            return;
+        }
+        let local = CGRect::new(CGPoint::new(0.0, 0.0), self.frame.size);
+        unsafe {
+            CGContextClearRect(self.context, local);
+            CGContextDrawImage(self.context, local, image);
+            CGContextFlush(self.context);
+        }
+    }
+}
+
+/// A `CGImageRef` that can be sent between threads and releases on drop. Used to
+/// hand freshly captured frames from the capture thread to the animation loop.
+struct SendImage(CGImageRef);
+unsafe impl Send for SendImage {}
+impl Drop for SendImage {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CFRelease(self.0) };
         }
     }
 }
@@ -569,6 +599,27 @@ fn animate(target: &Target, dest: CGRect) {
     });
     unsafe { SLSReenableUpdate(cid) };
 
+    // Live content: a background thread captures the target window on its *own*
+    // SLS connection (connections are thread-affine) and atomically swaps the
+    // latest frame into `live`; the animation loop redraws the proxy from it.
+    let live: Arc<Mutex<Option<SendImage>>> = Arc::new(Mutex::new(None));
+    let stop = Arc::new(AtomicBool::new(false));
+    let capture_thread = {
+        let live = live.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut cap_cid: SLSConnectionID = 0;
+            unsafe { SLSNewConnection(0, &mut cap_cid) };
+            while !stop.load(Ordering::Relaxed) {
+                if let Some(img) = capture_window(cap_cid, wid) {
+                    *live.lock().unwrap() = Some(SendImage(img));
+                }
+                std::thread::sleep(Duration::from_millis(6));
+            }
+            unsafe { SLSReleaseConnection(cap_cid) };
+        })
+    };
+
     // 5: drive the proxy on the MAIN thread (which owns the SLS connection),
     // paced by a CVDisplayLink on the *window's* display, so a ProMotion
     // builtin ticks up to 120Hz instead of the active-displays default.
@@ -591,13 +642,15 @@ fn animate(target: &Target, dest: CGRect) {
     // 4 + forward animation: move the real window to its destination (occluded
     // by the backdrop), then animate the proxy origin -> dest.
     move_real_window(&target.elem, dest);
-    run_spring(cid, proxy.id, origin, origin, dest, sem);
+    run_spring(&proxy, &live, origin, origin, dest, sem);
 
     // QoL: animate back. Move the real window home, then animate dest -> origin.
     move_real_window(&target.elem, origin);
-    run_spring(cid, proxy.id, origin, dest, origin, sem);
+    run_spring(&proxy, &live, origin, dest, origin, sem);
 
-    // 6: stop the link, then tear the proxies down atomically.
+    // 6: stop the capture thread and link, then tear the proxies down atomically.
+    stop.store(true, Ordering::Relaxed);
+    let _ = capture_thread.join();
     unsafe {
         CVDisplayLinkStop(link);
         CVDisplayLinkRelease(link);
@@ -633,9 +686,11 @@ fn move_real_window(elem: &AXUIElement, frame: CGRect) {
 /// Drive the proxy from `from` to `to` with a spring, one update per vsync tick
 /// (the semaphore is signalled by the display-link callback). `capture` is the
 /// frame the proxy bitmap was captured at — the transform scales relative to it.
+/// Each frame the proxy is redrawn from the latest frame in `live`, so the
+/// animating window shows live content (e.g. text typed in another app).
 fn run_spring(
-    cid: SLSConnectionID,
-    proxy_id: CGWindowID,
+    proxy: &ProxyWindow,
+    live: &Mutex<Option<SendImage>>,
     capture: CGRect,
     from: CGRect,
     to: CGRect,
@@ -655,12 +710,16 @@ fn run_spring(
         let v = spring.velocity_at(now);
         frames += 1;
 
+        // Swap in the latest captured frame, then position+scale it.
+        if let Some(img) = live.lock().unwrap().as_ref() {
+            proxy.redraw(img.0);
+        }
         let cur = lerp_rect(from, to, s);
-        set_proxy_transform(cid, proxy_id, capture, cur);
+        set_proxy_transform(proxy.cid, proxy.id, capture, cur);
 
         let elapsed = now.duration_since(start);
         if ((s - 1.0).abs() < 0.002 && v.abs() < 0.05) || elapsed > Duration::from_secs(8) {
-            set_proxy_transform(cid, proxy_id, capture, to);
+            set_proxy_transform(proxy.cid, proxy.id, capture, to);
             let secs = now.duration_since(start).as_secs_f64();
             println!(
                 "ran {frames} frames in {secs:.3}s ({:.0} fps)",
