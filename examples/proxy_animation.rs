@@ -310,7 +310,6 @@ impl ProxyWindow {
                 &mut id,
                 std::ptr::null_mut(),
             );
-            disable_shadow(id);
             SLSSetWindowResolution(cid, id, 2.0);
             SLSSetWindowOpacity(cid, id, opaque);
             SLSSetWindowAlpha(cid, id, 1.0);
@@ -334,6 +333,11 @@ impl ProxyWindow {
 
             ProxyWindow { cid, id, context, image, frame }
         }
+    }
+
+    fn without_shadow(self) -> Self {
+        disable_shadow(self.id);
+        self
     }
 
     /// Replace the proxy's content with a freshly captured frame. The window's
@@ -623,7 +627,8 @@ fn animate(target: &Target, dest: CGRect) {
     // 3: create the layers: backdrop (opaque, hides the relocated real target)
     // and the proxy (animated) above it.
     unsafe { SLSDisableUpdate(cid) };
-    let backdrop = ProxyWindow::new(cid, backdrop_bounds, backdrop_img, level, true);
+    let backdrop =
+        ProxyWindow::new(cid, backdrop_bounds, backdrop_img, level, true).without_shadow();
     let proxy = ProxyWindow::new(cid, origin, proxy_img, level, false);
     unsafe { SLSOrderWindow(cid, proxy.id, 1, backdrop.id) };
     unsafe { SLSReenableUpdate(cid) };
