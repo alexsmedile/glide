@@ -275,6 +275,12 @@ struct ProxyWindow {
     context: CGContextRef,
     image: CGImageRef,
     frame: CGRect,
+    /// The window we order ourselves directly above. Ordering relative to a
+    /// specific window (rather than `0` = "above everything") is what lets
+    /// foreground windows stay on top: anything already above `order_above`
+    /// keeps its place above us. The backdrop sits above the target window; the
+    /// proxy sits above the backdrop.
+    order_above: CGWindowID,
 }
 
 impl ProxyWindow {
@@ -286,6 +292,7 @@ impl ProxyWindow {
         image: CGImageRef,
         level: c_int,
         opaque: bool,
+        order_above: CGWindowID,
     ) -> Self {
         assert!(!image.is_null(), "cannot build a proxy from a null image");
         unsafe {
@@ -328,10 +335,11 @@ impl ProxyWindow {
             CFRelease(region);
             CFRelease(empty);
 
-            // Order it in above everything at its level.
-            SLSOrderWindow(cid, id, 1, 0);
+            // Order it in directly above `order_above` (not above the whole
+            // level), so windows already above that reference stay on top.
+            SLSOrderWindow(cid, id, 1, order_above);
 
-            ProxyWindow { cid, id, context, image, frame }
+            ProxyWindow { cid, id, context, image, frame, order_above }
         }
     }
 
@@ -360,8 +368,9 @@ impl ProxyWindow {
     }
 
     fn show(&self, cid: SLSConnectionID) {
-        // Order it in above everything at its level.
-        unsafe { SLSOrderWindow(cid, self.id, 1, 0) };
+        // Order it back in directly above its reference (see `order_above`),
+        // not above the whole level, so foreground windows stay on top.
+        unsafe { SLSOrderWindow(cid, self.id, 1, self.order_above) };
     }
 }
 
@@ -626,11 +635,15 @@ fn animate(target: &Target, dest: CGRect) {
 
     // 3: create the layers: backdrop (opaque, hides the relocated real target)
     // and the proxy (animated) above it.
+    // Order the backdrop directly above the *target* window (not above the whole
+    // level), and the proxy directly above the backdrop. This keeps both above
+    // the relocated real window (so it stays hidden) while leaving any window
+    // the user has above the target — e.g. the terminal in the foreground — on
+    // top, instead of pinning our windows to the absolute front.
     unsafe { SLSDisableUpdate(cid) };
     let backdrop =
-        ProxyWindow::new(cid, backdrop_bounds, backdrop_img, level, true).without_shadow();
-    let proxy = ProxyWindow::new(cid, origin, proxy_img, level, false);
-    unsafe { SLSOrderWindow(cid, proxy.id, 1, backdrop.id) };
+        ProxyWindow::new(cid, backdrop_bounds, backdrop_img, level, true, wid).without_shadow();
+    let proxy = ProxyWindow::new(cid, origin, proxy_img, level, false, backdrop.id);
     unsafe { SLSReenableUpdate(cid) };
 
     // Keep the window the user is working in on top: creating our windows put
