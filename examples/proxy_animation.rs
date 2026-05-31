@@ -303,19 +303,27 @@ impl ProxyWindow {
         self
     }
 
-    /// Replace the bitmap with a freshly captured frame. The layer scales it to
-    /// the current window size, so we only swap contents here.
-    fn redraw(&self, image: CGImageRef) {
+    /// Swap the layer's bitmap for a freshly captured frame. The caller must be
+    /// inside a no-actions `CATransaction` so the swap is presented atomically
+    /// with the frame change (see `run_spring`).
+    fn set_contents(&self, image: CGImageRef) {
         if image.is_null() {
             return;
         }
-        set_layer_image(&self.layer, image);
+        unsafe {
+            let obj: &AnyObject = &*(image as *const AnyObject);
+            self.layer.setContents(Some(obj));
+        }
     }
 
     /// Move and resize the window to `frame` (CG global coords). Replaces the
     /// per-frame SLS transform; the layer's `resize` gravity scales the bitmap.
+    /// The caller must be inside a no-actions `CATransaction`: otherwise
+    /// resizing the window starts an implicit Core Animation on the backing
+    /// layer's bounds, which lags the window by a frame and scales the contents
+    /// wrong. Disabling actions keeps the layer locked to the window.
     fn set_frame(&self, frame: CGRect) {
-        self.window.setFrame_display(cg_to_ns_rect(frame), true);
+        self.window.setFrame_display(cg_to_ns_rect(frame), false);
     }
 
     /// The window-server id, for debug dumps.
@@ -356,12 +364,17 @@ fn cg_to_ns_rect(r: CGRect) -> NSRect {
 
 /// A `CGImageRef` that can be sent between threads and releases on drop. Used to
 /// hand freshly captured frames from the capture thread to the animation loop.
-struct SendImage(CGImageRef);
+/// Carries the captured pixel size so the loop can reject frames grabbed while
+/// the real window was mid-resize (which render partly blank).
+struct SendImage {
+    img: CGImageRef,
+    px: (usize, usize),
+}
 unsafe impl Send for SendImage {}
 impl Drop for SendImage {
     fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { CFRelease(self.0) };
+        if !self.img.is_null() {
+            unsafe { CFRelease(self.img) };
         }
     }
 }
@@ -552,6 +565,21 @@ fn animate(target: &Target, dest: CGRect) {
         dump_z_order(target.wsid);
     }
 
+    // Pixels-per-point of the capture (≈2 on Retina). Used to predict the pixel
+    // size a *settled* live capture should have at each end of the animation, so
+    // the loop can drop mid-resize captures (which come back a wrong size and
+    // render partly blank — the black flash).
+    let px_scale = {
+        let c = unsafe { &*(proxy_img as *const CGImage) };
+        CGImage::width(Some(c)) as f64 / origin.size.width
+    };
+    let expected_px = |r: CGRect| {
+        (
+            (r.size.width * px_scale).round() as usize,
+            (r.size.height * px_scale).round() as usize,
+        )
+    };
+
     // 3: create the windows: backdrop (opaque, hides the relocated real target)
     // and the proxy (animated) above it. Both are ordered in with `orderFront`
     // (background-app ordering keeps them below the active app), and the proxy
@@ -582,16 +610,16 @@ fn animate(target: &Target, dest: CGRect) {
             let mut last_frame = None;
             while !stop.load(Ordering::Relaxed) {
                 if let Some(img) = capture_window(cap_cid, wid) {
-                    // Get the captured frame for debugging purposes.
-                    let cap = Some(unsafe { Retained::retain(img as *mut CGImage) }.unwrap());
-                    let cap = cap.as_deref();
-                    let captured_frame = (CGImage::width(cap), CGImage::height(cap));
-                    if last_frame != Some(captured_frame) {
-                        dbg!(captured_frame);
+                    // Record the captured pixel size so the animation loop can
+                    // skip mid-resize frames (see `run_spring`).
+                    let cap = unsafe { Retained::retain(img as *mut CGImage) }.unwrap();
+                    let px = (CGImage::width(Some(&cap)), CGImage::height(Some(&cap)));
+                    if last_frame != Some(px) {
+                        dbg!(px);
                     }
-                    last_frame.replace(captured_frame);
+                    last_frame.replace(px);
 
-                    *live.lock().unwrap() = Some(SendImage(img));
+                    *live.lock().unwrap() = Some(SendImage { img, px });
                 }
                 std::thread::sleep(Duration::from_millis(6));
             }
@@ -621,7 +649,7 @@ fn animate(target: &Target, dest: CGRect) {
     // 4 + forward animation: move the real window to its destination (occluded
     // by the backdrop), then animate the proxy origin -> dest.
     move_real_window(&target.elem, dest);
-    run_spring(&proxy, &live, origin, dest, sem);
+    run_spring(&proxy, &live, origin, dest, expected_px(dest), sem);
 
     // Pause for a second to show the window at its destination.
     backdrop.hide();
@@ -633,7 +661,7 @@ fn animate(target: &Target, dest: CGRect) {
 
     // QoL: animate back. Move the real window home, then animate dest -> origin.
     move_real_window(&target.elem, origin);
-    run_spring(&proxy, &live, dest, origin, sem);
+    run_spring(&proxy, &live, dest, origin, expected_px(origin), sem);
 
     // 6: stop the capture thread and link, then tear the proxy windows down.
     stop.store(true, Ordering::Relaxed);
@@ -684,14 +712,25 @@ fn move_real_window(elem: &AXUIElement, frame: CGRect) {
 /// Drive the proxy from `from` to `to` with a spring, one update per vsync tick
 /// (the semaphore is signalled by the display-link callback). Each frame the
 /// proxy is redrawn from the latest frame in `live`, so the animating window
-/// shows live content (e.g. text typed in another app).
+/// shows live content (e.g. text typed in another app). `expected_px` is the
+/// pixel size a settled capture of the (already relocated) real window should
+/// have; captures of a different size are mid-resize and rendered partly blank,
+/// so we skip them and keep showing the last good bitmap.
 fn run_spring(
     proxy: &ProxyWindow,
     live: &Mutex<Option<SendImage>>,
     from: CGRect,
     to: CGRect,
+    expected_px: (usize, usize),
     sem: DispatchSemaphore,
 ) {
+    // Drain vsync ticks that piled up since the last run (the display link keeps
+    // firing during the pause between animations). Without this the semaphore
+    // starts with a backlog, the first frames don't block on vsync, and the run
+    // burns through them at CPU speed — inflating the reported fps and skipping
+    // the vsync pacing until the backlog drains.
+    while unsafe { dispatch_semaphore_wait(sem, DISPATCH_TIME_NOW) } == 0 {}
+
     let start = Instant::now();
     let spring = SpringAnimation::new(0.0, 1.0, 0.0, slow_response(), 1.0, start);
     let mut frames: u32 = 0;
@@ -706,12 +745,24 @@ fn run_spring(
         let v = spring.velocity_at(now);
         frames += 1;
 
-        // Swap in the latest captured frame, then move+resize the window to it.
-        if let Some(img) = live.lock().unwrap().as_ref() {
-            proxy.redraw(img.0);
-        }
+        // Swap in the latest captured frame and move+resize the window to it in
+        // ONE no-actions transaction, so the new bitmap and the new window size
+        // are presented together. With two separate commits a vsync can land
+        // between them, showing the new contents at the old size for a frame —
+        // which flashes and reveals the backdrop (worst on the shrinking return).
         let cur = lerp_rect(from, to, s);
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        if let Some(img) = live.lock().unwrap().as_ref() {
+            // Skip mid-resize captures: they come back a wrong size and render
+            // partly blank, which flashes as a black block in the proxy.
+            let (w, h) = img.px;
+            if w.abs_diff(expected_px.0) <= 2 && h.abs_diff(expected_px.1) <= 2 {
+                proxy.set_contents(img.img);
+            }
+        }
         proxy.set_frame(cur);
+        CATransaction::commit();
         // Turn the run loop so AppKit/Core Animation commit this frame. A
         // zero-length run avoids the ~20ms block of a timed one, keeping us near
         // vsync.
@@ -719,7 +770,10 @@ fn run_spring(
 
         let elapsed = now.duration_since(start);
         if ((s - 1.0).abs() < 0.002 && v.abs() < 0.05) || elapsed > Duration::from_secs(8) {
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
             proxy.set_frame(to);
+            CATransaction::commit();
             unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, false) };
             let secs = now.duration_since(start).as_secs_f64();
             println!(
