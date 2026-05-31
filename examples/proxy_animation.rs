@@ -77,6 +77,7 @@ use objc2_app_kit::{
     NSWindow, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_foundation::{CGAffineTransform, CGPoint, CGRect, CGSize};
+use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSPoint, NSRect, NSString};
 
 // ---------------------------------------------------------------------------
@@ -636,8 +637,18 @@ fn animate(target: &Target, dest: CGRect) {
         std::thread::spawn(move || {
             let mut cap_cid: SLSConnectionID = 0;
             unsafe { SLSNewConnection(0, &mut cap_cid) };
+            let mut last_frame = None;
             while !stop.load(Ordering::Relaxed) {
                 if let Some(img) = capture_window(cap_cid, wid) {
+                    // Get the captured frame for debugging purposes.
+                    let cap = Some(unsafe { Retained::retain(img as *mut CGImage) }.unwrap());
+                    let cap = cap.as_deref();
+                    let captured_frame = (CGImage::width(cap), CGImage::height(cap));
+                    if last_frame != Some(captured_frame) {
+                        dbg!(captured_frame);
+                    }
+                    last_frame.replace(captured_frame);
+
                     *live.lock().unwrap() = Some(SendImage(img));
                 }
                 std::thread::sleep(Duration::from_millis(6));
