@@ -53,7 +53,7 @@ use crate::sys::app::{AXUIElementExt, NSRunningApplicationExt, ProcessInfo};
 pub use crate::sys::app::{AppInfo, WindowInfo, pid_t};
 use crate::sys::event;
 use crate::sys::executor::Executor;
-use crate::sys::geometry::{ToCGType, ToICrate};
+use crate::sys::geometry::{SameAs, ToCGType, ToICrate};
 use crate::sys::observer::Observer;
 use crate::sys::window_server::WindowServerId;
 
@@ -193,6 +193,9 @@ struct WindowState {
     elem: AXUIElement,
     is_standard: bool,
     last_seen_txid: TransactionId,
+    /// The last frame requested via [`Request::SetWindowFrame`] during an animation.
+    /// Used to apply a deferred full-frame fixup in [`Request::EndWindowAnimation`].
+    last_animation_frame: Option<CGRect>,
 }
 
 const APP_NOTIFICATIONS: &[&str] = &[
@@ -491,13 +494,15 @@ impl State {
                 let app_elem = &self.app.clone();
                 let window = self.window_mut(wid)?;
                 window.last_seen_txid = txid;
+                if is_animating {
+                    window.last_animation_frame = Some(frame);
+                }
                 without_enhanced(is_animating, app_elem, || {
-                    trace("set_position", &window.elem, || {
-                        window.elem.set_position(frame.origin.to_cgtype())
-                    })?;
-                    trace("set_size", &window.elem, || {
-                        window.elem.set_size(frame.size.to_cgtype())
-                    })?;
+                    if is_animating {
+                        set_window_frame_once(&window.elem, frame)?;
+                    } else {
+                        set_window_frame_with_retries(&window.elem, frame)?;
+                    }
                     Ok(())
                 })?;
                 let frame = trace("frame", &window.elem, || window.elem.frame())?;
@@ -522,19 +527,32 @@ impl State {
                         self.app.set_enhanced_user_interface(false)
                     });
                 }
-                let window = self.window(wid)?;
-                self.stop_notifications_for_animation(&window.elem);
+                let window = self.window_mut(wid)?;
+                window.last_animation_frame = None;
+                let elem = window.elem.clone();
+                self.stop_notifications_for_animation(&elem);
                 self.is_animating = true;
             }
             &mut Request::EndWindowAnimation(wid) => {
+                let window = self.window_mut(wid)?;
+                let last_animation_frame = window.last_animation_frame.take();
+                let elem = window.elem.clone();
+                let last_seen_txid = window.last_seen_txid;
+                // Apply the deferred full-frame fixup while enhanced UI is still
+                // disabled and before restarting notifications, so retries don't
+                // fire spurious AX move/resize notifications.
+                if let Some(frame) = last_animation_frame {
+                    if let Err(e) = set_window_frame_with_retries(&elem, frame) {
+                        warn!("Failed to apply frame fixup after animation: {e}");
+                    }
+                }
                 if self.enable_enhanced_ui_after_animating {
                     _ = trace("set_enhanced_user_interface", &self.app, || {
                         self.app.set_enhanced_user_interface(true)
                     });
                 }
-                let &WindowState { ref elem, last_seen_txid, .. } = self.window(wid)?;
-                self.restart_notifications_after_animation(elem);
-                let frame = trace("frame", elem, || elem.frame())?;
+                self.restart_notifications_after_animation(&elem);
+                let frame = trace("frame", &elem, || elem.frame())?;
                 self.send_event(Event::WindowFrameChanged(
                     wid,
                     frame.to_icrate(),
@@ -966,6 +984,7 @@ impl State {
                 elem,
                 last_seen_txid: TransactionId::default(),
                 is_standard: info.is_standard,
+                last_animation_frame: None,
             },
         );
         assert!(old.is_none(), "Duplicate window id {wid:?}");
@@ -1115,6 +1134,57 @@ fn app_thread_main(
         raises_rx,
         startup,
     ));
+}
+
+const SET_WINDOW_FRAME_RETRIES: usize = 3;
+const SET_WINDOW_FRAME_RETRY_DELAY: Duration = Duration::from_millis(5);
+
+fn set_window_frame_once(window: &AXUIElement, frame: CGRect) -> Result<(), accessibility::Error> {
+    trace("set_size", window, || window.set_size(frame.size.to_cgtype()))?;
+    trace("set_position", window, || {
+        window.set_position(frame.origin.to_cgtype())
+    })?;
+    Ok(())
+}
+
+fn set_window_frame_with_retries(
+    window: &AXUIElement,
+    frame: CGRect,
+) -> Result<(), accessibility::Error> {
+    // macOS may reject a move or resize if not enough of the window is on the
+    // screen (relative to its size). There have also been race conditions
+    // observed. We just apply multiple retries to work around this.
+    // See https://github.com/tmandry/glide/issues/166.
+    //
+    // We could skip this retry logic if the window remains on the same screen.
+    let requested = frame;
+    let mut observed = requested;
+    for attempt in 1..=SET_WINDOW_FRAME_RETRIES {
+        set_window_frame_once(window, frame)?;
+        observed = trace("frame", window, || window.frame())?.to_icrate();
+        if observed.same_as(requested) {
+            return Ok(());
+        }
+
+        if attempt < SET_WINDOW_FRAME_RETRIES {
+            debug!(
+                attempt,
+                retries = SET_WINDOW_FRAME_RETRIES,
+                ?requested,
+                ?observed,
+                "Retrying window frame set because observed frame differs from requested frame"
+            );
+            thread::sleep(SET_WINDOW_FRAME_RETRY_DELAY);
+        }
+    }
+
+    warn!(
+        retries = SET_WINDOW_FRAME_RETRIES,
+        ?requested,
+        ?observed,
+        "Window frame still differs from requested frame after retries"
+    );
+    Ok(())
 }
 
 fn trace<T>(
