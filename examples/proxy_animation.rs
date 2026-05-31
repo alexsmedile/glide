@@ -371,10 +371,7 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 
 fn lerp_rect(a: CGRect, b: CGRect, t: f64) -> CGRect {
     CGRect::new(
-        CGPoint::new(
-            lerp(a.origin.x, b.origin.x, t),
-            lerp(a.origin.y, b.origin.y, t),
-        ),
+        CGPoint::new(lerp(a.origin.x, b.origin.x, t), lerp(a.origin.y, b.origin.y, t)),
         CGSize::new(
             lerp(a.size.width, b.size.width, t),
             lerp(a.size.height, b.size.height, t),
@@ -392,6 +389,21 @@ fn union_rect(a: CGRect, b: CGRect) -> CGRect {
         CGSize::new(max_x - min_x, max_y - min_y),
     )
 }
+
+fn inflate(r: CGRect, m: f64) -> CGRect {
+    CGRect::new(
+        CGPoint::new(r.origin.x - m, r.origin.y - m),
+        CGSize::new(r.size.width + 2.0 * m, r.size.height + 2.0 * m),
+    )
+}
+
+/// macOS window drop shadows extend well beyond the window frame. The real
+/// window is moved to its destination immediately (hidden behind the backdrop),
+/// but its shadow would otherwise spill past the backdrop edge at the new
+/// location before the proxy arrives. Pad the backdrop to swallow that halo.
+/// (The shadow is excluded from the below-window capture, so the padded
+/// backdrop just shows more of the desktop behind it.)
+const SHADOW_MARGIN: f64 = 64.0;
 
 // ---------------------------------------------------------------------------
 // Capture helpers.
@@ -468,7 +480,7 @@ fn animate(target: &Target, dest: CGRect) {
     println!("origin = {origin:?}");
     println!("dest   = {dest:?}");
 
-    let backdrop_bounds = union_rect(origin, dest);
+    let backdrop_bounds = inflate(union_rect(origin, dest), SHADOW_MARGIN);
 
     // 1 + 2: captures. Backdrop first, while the window is still at the origin.
     let Some(backdrop_img) = capture_backdrop(backdrop_bounds, wid) else {
@@ -494,12 +506,23 @@ fn animate(target: &Target, dest: CGRect) {
     unsafe { SLSReenableUpdate(cid) };
 
     // 4: move the real window to its destination *now*, while occluded.
-    let sz = cg::CGSize { width: dest.size.width, height: dest.size.height };
-    let pos = cg::CGPoint { x: dest.origin.x, y: dest.origin.y };
+    let sz = cg::CGSize {
+        width: dest.size.width,
+        height: dest.size.height,
+    };
+    let pos = cg::CGPoint {
+        x: dest.origin.x,
+        y: dest.origin.y,
+    };
     let r1 = target.elem.set_size(sz);
     let r2 = target.elem.set_position(pos);
     let r3 = target.elem.set_size(sz);
-    println!("AX move results: size={:?} pos={:?} size={:?}", r1.is_ok(), r2.is_ok(), r3.is_ok());
+    println!(
+        "AX move results: size={:?} pos={:?} size={:?}",
+        r1.is_ok(),
+        r2.is_ok(),
+        r3.is_ok()
+    );
 
     // 5: drive the proxy on the MAIN thread (which owns the SLS connection),
     // paced by a CVDisplayLink that ticks us once per vsync via a semaphore.
@@ -667,9 +690,8 @@ fn spawn_window(mtm: MainThreadMarker) -> WindowServerId {
         origin: NSPoint { x: 200.0, y: 400.0 },
         size: objc2_foundation::NSSize { width: 360.0, height: 260.0 },
     };
-    let style = NSWindowStyleMask::Titled
-        | NSWindowStyleMask::Closable
-        | NSWindowStyleMask::Resizable;
+    let style =
+        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Resizable;
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
