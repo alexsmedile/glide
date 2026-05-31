@@ -572,30 +572,41 @@ fn animate(target: &Target, dest: CGRect) {
         }
         return;
     };
-    // Foreground handling (both opt-in; default does neither so the animation
-    // is always visible):
-    //   GLIDE_FG_SNAPSHOT — overlay a frozen snapshot of the windows in front
-    //     of the target on top of the proxy (visible, but the key window is
-    //     frozen during the animation).
-    //   GLIDE_FG_ORDER — order the proxy stack *below* the real windows in
-    //     front of the target so they stay live and on top. Experimental:
-    //     cross-connection ordering relative to an external window is
-    //     unreliable and can hide the proxy, so it is not the default.
+    // Foreground handling. The windows in front of the target must stay on top
+    // of the animating proxy. Default ("order"): order the proxy stack *below*
+    // the real window above the target, so those windows stay live and on top
+    // (cross-process ordering works). Alternatives:
+    //   GLIDE_FG_SNAPSHOT — overlay a frozen snapshot of them on top instead.
+    //   GLIDE_FG_NONE     — do nothing; proxy on top (foreground gets covered).
     let fg_snapshot = std::env::var("GLIDE_FG_SNAPSHOT").is_ok();
-    let fg_order = std::env::var("GLIDE_FG_ORDER").is_ok();
+    let fg_none = std::env::var("GLIDE_FG_NONE").is_ok();
+    let fg_order = !fg_snapshot && !fg_none;
+    let debug = std::env::var("GLIDE_DEBUG").is_ok();
+
     let foreground_img = if fg_snapshot {
         capture_foreground(backdrop_bounds, wid)
     } else {
         None
     };
+    // Compute the neighbor BEFORE creating our own windows, or window_above
+    // would return one of them.
+    let neighbor = if fg_order {
+        if debug {
+            dump_z_order(target.wsid);
+        }
+        window_above(target.wsid)
+    } else {
+        None
+    };
 
-    // 3: create the layers. The core invariant is simply: proxy strictly above
-    // the backdrop, both ordered to the front. Everything else is opt-in.
+    // 3: create the layers. Core invariant: proxy strictly above the backdrop.
     unsafe { SLSDisableUpdate(cid) };
     let backdrop = ProxyWindow::new(cid, backdrop_bounds, backdrop_img, level, true);
     let proxy = ProxyWindow::new(cid, origin, proxy_img, level, false);
     unsafe { SLSOrderWindow(cid, proxy.id, 1, backdrop.id) };
-    if fg_order && let Some(neighbor) = window_above(target.wsid) {
+    if let Some(neighbor) = neighbor {
+        // Drop the whole stack just below the real windows in front of the
+        // target so they stay live and on top.
         unsafe {
             SLSOrderWindow(cid, backdrop.id, -1, neighbor);
             SLSOrderWindow(cid, proxy.id, 1, backdrop.id);
@@ -740,6 +751,25 @@ fn run_spring(
             );
             return;
         }
+    }
+}
+
+/// Print the windows around `target` in z-order (frontmost first) with owner
+/// pids, so we can see whether the foreground windows are actually above the
+/// target and which process owns them.
+fn dump_z_order(target: WindowServerId) {
+    let list = window_server::get_visible_windows_with_layer(None);
+    let our_pid = std::process::id() as i32;
+    println!("--- z-order (frontmost first), our pid={our_pid}, target={target:?} ---");
+    for (i, w) in list.iter().enumerate() {
+        let mark = if w.id == target { " <== TARGET" } else { "" };
+        println!(
+            "  [{i:2}] wid={:<7} pid={:<7} layer={:<3} frame={:?}{mark}",
+            w.id.as_u32(),
+            w.pid,
+            w.layer,
+            w.frame
+        );
     }
 }
 
