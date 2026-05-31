@@ -25,10 +25,12 @@
 //!      yabai does) → the proxy bitmap.
 //!   2. Capture the backdrop (everything below the window, in the union of the
 //!      origin and destination rects).
-//!   3. Create server-owned windows on a dedicated SLS connection, bottom to
-//!      top: the backdrop (static, opaque), the proxy (animated), and a
-//!      foreground snapshot of any windows that were in front of the target
-//!      (transparent elsewhere) so they aren't covered by the proxy.
+//!   3. Create server-owned windows on a dedicated SLS connection: the backdrop
+//!      (static, opaque) and the proxy (animated) above it. To keep windows
+//!      that sit in front of the target visible, order the proxy stack *below*
+//!      them (`SLSOrderWindow` relative to the real window above the target), so
+//!      they stay live and on top. (`GLIDE_FG_SNAPSHOT` instead overlays a
+//!      frozen snapshot of them — the original approach.)
 //!   4. Move the real window to its destination *instantly* via AX — invisible,
 //!      because the backdrop covers it.
 //!   5. Animate the proxy's position *and* size from
@@ -582,16 +584,32 @@ fn animate(target: &Target, dest: CGRect) {
         }
         return;
     };
-    // Snapshot of any windows in front of the target (may be empty).
-    let foreground_img = capture_foreground(backdrop_bounds, wid);
+    // Foreground handling. By default we slide our proxy stack *below* the real
+    // windows in front of the target, so they stay live and on top (the key
+    // window keeps updating). GLIDE_FG_SNAPSHOT instead overlays a frozen
+    // snapshot of them on top of the proxy (the original approach).
+    let use_snapshot = std::env::var("GLIDE_FG_SNAPSHOT").is_ok();
+    let above = window_above(target.wsid);
+    println!("window above target: {above:?} (snapshot={use_snapshot})");
+    let foreground_img = if use_snapshot {
+        capture_foreground(backdrop_bounds, wid)
+    } else {
+        None
+    };
 
     // 3: create the layers, bottom to top: backdrop (opaque, hides the real
-    // windows in the region) → proxy (the animated window) → foreground (the
-    // windows that were in front of the target, transparent elsewhere).
+    // target) → proxy (the animated window). Optionally a foreground snapshot.
     unsafe { SLSDisableUpdate(cid) };
     let backdrop = ProxyWindow::new(cid, backdrop_bounds, backdrop_img, level, true);
     let proxy = ProxyWindow::new(cid, origin, proxy_img, level, false);
     unsafe { SLSOrderWindow(cid, proxy.id, 1, backdrop.id) };
+    if !use_snapshot && let Some(neighbor) = above {
+        // Drop the whole stack just below the real foreground windows.
+        unsafe {
+            SLSOrderWindow(cid, backdrop.id, -1, neighbor);
+            SLSOrderWindow(cid, proxy.id, 1, backdrop.id);
+        }
+    }
     let foreground = foreground_img.map(|img| {
         let fg = ProxyWindow::new(cid, backdrop_bounds, img, level, false);
         unsafe { SLSOrderWindow(cid, fg.id, 1, proxy.id) };
@@ -730,6 +748,18 @@ fn run_spring(
     }
 }
 
+/// The window-server id of the window immediately *above* `target` in z-order,
+/// if any. We order our proxy stack just below it so the real foreground
+/// windows (including the key window the user is typing into) stay live and on
+/// top, rather than snapshotting them.
+fn window_above(target: WindowServerId) -> Option<CGWindowID> {
+    // get_visible_windows_with_layer returns windows frontmost-first, so the
+    // entry just before the target is the one directly above it.
+    let list = window_server::get_visible_windows_with_layer(None);
+    let idx = list.iter().position(|w| w.id == target)?;
+    idx.checked_sub(1).map(|i| list[i].id.as_u32())
+}
+
 /// The builtin display's bounds (CG global coords), if there is one.
 fn builtin_display_bounds() -> Option<CGRect> {
     let mut ids = [0u32; 16];
@@ -832,6 +862,8 @@ fn main() {
     app.activateIgnoringOtherApps(true);
     app.finishLaunching();
 
+    let fg_test = std::env::var("GLIDE_FG_TEST").is_ok();
+
     let wsid = spawn_window(
         mtm,
         NSPoint { x: 200.0, y: 400.0 },
@@ -840,9 +872,9 @@ fn main() {
     );
     println!("spawned window {wsid:?}");
 
-    // Test the foreground overlay: spawn a second window *in front of* the
+    // Test the foreground handling: spawn a second window *in front of* the
     // target, over the destination, so the animating proxy must pass behind it.
-    if std::env::var("GLIDE_FG_TEST").is_ok() {
+    if fg_test {
         spawn_window(
             mtm,
             NSPoint { x: 640.0, y: 120.0 },
@@ -851,22 +883,29 @@ fn main() {
         );
     }
 
-    // Let AppKit lay out and the window server composite the window.
-    pump_runloop(0.8);
-
+    // Let AppKit lay out and the window server composite the window. Retry the
+    // AX lookup briefly: the window may not be in the AX tree immediately.
     let pid = std::process::id() as i32;
-    let elem = AXUIElement::application(pid)
-        .windows()
-        .expect("no AX windows")
-        .iter()
-        .find(|w| WindowServerId::try_from(&**w).ok() == Some(wsid))
-        .map(|w| w.clone())
-        .expect("AX window not found");
-    let target = Target { wsid, elem };
+    let mut elem = None;
+    for _ in 0..40 {
+        pump_runloop(0.05);
+        elem = AXUIElement::application(pid).windows().ok().and_then(|ws| {
+            ws.iter()
+                .find(|w| WindowServerId::try_from(&**w).ok() == Some(wsid))
+                .map(|w| w.clone())
+        });
+        if elem.is_some() {
+            break;
+        }
+    }
+    let target = Target {
+        wsid,
+        elem: elem.expect("AX window not found"),
+    };
 
     // Move the window onto the builtin display so the 120Hz path is exercised
-    // (ProMotion). On a desktop / no builtin, this is a no-op.
-    if let Some(b) = builtin_display_bounds() {
+    // (ProMotion). Skip under fg_test so both windows stay co-located.
+    if let Some(b) = builtin_display_bounds().filter(|_| !fg_test) {
         move_real_window(
             &target.elem,
             CGRect::new(
