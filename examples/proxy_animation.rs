@@ -58,13 +58,16 @@
 //! and prompts for it on launch.
 
 use std::ffi::{c_int, c_void};
+use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use accessibility::{AXUIElement, AXUIElementAttributes};
+use accessibility_sys::pid_t;
 use core_graphics_types::geometry as cg;
 use glide_wm::model::spring::SpringAnimation;
+use glide_wm::sys::app::AXUIElementExt;
 use glide_wm::sys::window_server::{self, WindowServerId};
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly};
@@ -683,17 +686,33 @@ fn animate(target: &Target, dest: CGRect) {
 /// Move the real window via AX (size, position, size again to dodge macOS
 /// visible-area clamping). Must run on the main thread for an in-process window.
 fn move_real_window(elem: &AXUIElement, frame: CGRect) {
-    let sz = cg::CGSize {
-        width: frame.size.width,
-        height: frame.size.height,
+    let move_it = {
+        struct MakeItSend(AXUIElement);
+        let elem = MakeItSend(elem.clone());
+        unsafe impl Send for MakeItSend {}
+        move || {
+            let elem = elem; // capture MakeItSend
+            let elem = elem.0;
+            let sz = cg::CGSize {
+                width: frame.size.width,
+                height: frame.size.height,
+            };
+            let pos = cg::CGPoint {
+                x: frame.origin.x,
+                y: frame.origin.y,
+            };
+            _ = elem.set_size(sz);
+            _ = elem.set_position(pos);
+            _ = elem.set_size(sz);
+        }
     };
-    let pos = cg::CGPoint {
-        x: frame.origin.x,
-        y: frame.origin.y,
-    };
-    _ = elem.set_size(sz);
-    _ = elem.set_position(pos);
-    _ = elem.set_size(sz);
+    if let Ok(pid) = elem.process_id()
+        && pid == process::id() as pid_t
+    {
+        move_it();
+    } else {
+        std::thread::spawn(move_it);
+    }
 }
 
 /// Drive the proxy from `from` to `to` with a spring, one update per vsync tick
