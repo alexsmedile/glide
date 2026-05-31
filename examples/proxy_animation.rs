@@ -145,9 +145,15 @@ unsafe extern "C" {
         options: u32,
     ) -> CFArrayRef;
 
-    fn SLSSetWindowTransform(
-        cid: SLSConnectionID,
+    // Transactions: a synchronous commit flushes to the window server without
+    // needing a run-loop turn, which is what lets us hit full refresh rate.
+    fn SLSTransactionCreate(cid: SLSConnectionID) -> CFTypeRef;
+    fn SLSTransactionCommit(transaction: CFTypeRef, synchronous: c_int) -> i32;
+    fn SLSTransactionSetWindowTransform(
+        transaction: CFTypeRef,
         wid: CGWindowID,
+        unknown: c_int,
+        unknown2: c_int,
         transform: CGAffineTransform,
     ) -> i32;
 
@@ -169,10 +175,31 @@ unsafe extern "C" {
     fn CGContextRelease(ctx: CGContextRef);
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
+    fn CGMainDisplayID() -> CGDirectDisplayID;
+    fn CGGetDisplaysWithPoint(
+        point: CGPoint,
+        max_displays: u32,
+        displays: *mut CGDirectDisplayID,
+        matching_count: *mut u32,
+    ) -> i32;
+    fn CGGetActiveDisplayList(
+        max_displays: u32,
+        displays: *mut CGDirectDisplayID,
+        matching_count: *mut u32,
+    ) -> i32;
+    fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
+    fn CGDisplayIsBuiltin(display: CGDirectDisplayID) -> i32;
 }
+
+type CGDirectDisplayID = u32;
 
 #[link(name = "CoreVideo", kind = "framework")]
 unsafe extern "C" {
+    fn CVDisplayLinkCreateWithCGDisplay(
+        display: CGDirectDisplayID,
+        link: *mut CVDisplayLinkRef,
+    ) -> CVReturn;
+    #[allow(dead_code)]
     fn CVDisplayLinkCreateWithActiveCGDisplays(link: *mut CVDisplayLinkRef) -> CVReturn;
     fn CVDisplayLinkSetOutputCallback(
         link: CVDisplayLinkRef,
@@ -182,6 +209,14 @@ unsafe extern "C" {
     fn CVDisplayLinkStart(link: CVDisplayLinkRef) -> CVReturn;
     fn CVDisplayLinkStop(link: CVDisplayLinkRef) -> CVReturn;
     fn CVDisplayLinkRelease(link: CVDisplayLinkRef);
+    fn CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link: CVDisplayLinkRef) -> CVTime;
+}
+
+#[repr(C)]
+struct CVTime {
+    time_value: i64,
+    time_scale: i32,
+    flags: i32,
 }
 
 // libdispatch (in libSystem, linked by default) — used to tick the main thread
@@ -333,8 +368,12 @@ extern "C" fn display_link_callback(
 /// The SLS window transform maps *screen → window* (the inverse of where the
 /// content should land), so to show the captured bitmap at `cur` we translate by
 /// the negated current position and scale by original/current. See
-/// `window_manager.c:580` in yabai. Like every SLS call here it must run on the
-/// main thread and is flushed by the per-frame run-loop turn in the caller.
+/// `window_manager.c:580` in yabai.
+///
+/// We apply it inside a *synchronous* SLS transaction commit. That flushes the
+/// change to the window server immediately, so — unlike a bare
+/// `SLSSetWindowTransform` — it does not need a run-loop turn to become visible,
+/// which is what lets the loop run at full display refresh.
 fn set_proxy_transform(cid: SLSConnectionID, proxy_id: CGWindowID, origin: CGRect, cur: CGRect) {
     let sx = origin.size.width / cur.size.width;
     let sy = origin.size.height / cur.size.height;
@@ -346,9 +385,11 @@ fn set_proxy_transform(cid: SLSConnectionID, proxy_id: CGWindowID, origin: CGRec
         tx: -cur.origin.x * sx,
         ty: -cur.origin.y * sy,
     };
-    let e = unsafe { SLSSetWindowTransform(cid, proxy_id, transform) };
-    if e != 0 {
-        eprintln!("SLSSetWindowTransform err={e}");
+    unsafe {
+        let txn = SLSTransactionCreate(cid);
+        SLSTransactionSetWindowTransform(txn, proxy_id, 0, 0, transform);
+        SLSTransactionCommit(txn, 1);
+        CFRelease(txn);
     }
 }
 
@@ -528,67 +569,33 @@ fn animate(target: &Target, dest: CGRect) {
     });
     unsafe { SLSReenableUpdate(cid) };
 
-    // 4: move the real window to its destination *now*, while occluded.
-    let sz = cg::CGSize {
-        width: dest.size.width,
-        height: dest.size.height,
-    };
-    let pos = cg::CGPoint {
-        x: dest.origin.x,
-        y: dest.origin.y,
-    };
-    let r1 = target.elem.set_size(sz);
-    let r2 = target.elem.set_position(pos);
-    let r3 = target.elem.set_size(sz);
-    println!(
-        "AX move results: size={:?} pos={:?} size={:?}",
-        r1.is_ok(),
-        r2.is_ok(),
-        r3.is_ok()
-    );
-
     // 5: drive the proxy on the MAIN thread (which owns the SLS connection),
-    // paced by a CVDisplayLink that ticks us once per vsync via a semaphore.
+    // paced by a CVDisplayLink on the *window's* display, so a ProMotion
+    // builtin ticks up to 120Hz instead of the active-displays default.
     let sem = unsafe { dispatch_semaphore_create(0) };
+    let display = display_for(origin);
     let mut link: CVDisplayLinkRef = std::ptr::null_mut();
     unsafe {
-        CVDisplayLinkCreateWithActiveCGDisplays(&mut link);
+        CVDisplayLinkCreateWithCGDisplay(display, &mut link);
         CVDisplayLinkSetOutputCallback(link, display_link_callback, sem as *mut c_void);
+        let p = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link);
+        let hz = if p.time_value != 0 {
+            p.time_scale as f64 / p.time_value as f64
+        } else {
+            0.0
+        };
+        println!("display {display}: link nominal refresh = {hz:.1} Hz");
         CVDisplayLinkStart(link);
     }
 
-    // Slow response is overridable via GLIDE_RESPONSE so the motion is easy to
-    // watch while developing.
-    let start = Instant::now();
-    let spring = SpringAnimation::new(0.0, 1.0, 0.0, slow_response(), 1.0, start);
-    let mut frames: u32 = 0;
-    let (mut s_min, mut s_max) = (f64::INFINITY, f64::NEG_INFINITY);
-    loop {
-        // Wait for the next vsync tick (cap the wait so we never hang if the
-        // link stops delivering).
-        let timeout = unsafe { dispatch_time(DISPATCH_TIME_NOW, 100_000_000) };
-        unsafe { dispatch_semaphore_wait(sem, timeout) };
+    // 4 + forward animation: move the real window to its destination (occluded
+    // by the backdrop), then animate the proxy origin -> dest.
+    move_real_window(&target.elem, dest);
+    run_spring(cid, proxy.id, origin, origin, dest, sem);
 
-        let now = Instant::now();
-        let s = spring.value_at(now);
-        let v = spring.velocity_at(now);
-        frames += 1;
-        s_min = s_min.min(s);
-        s_max = s_max.max(s);
-
-        let cur = lerp_rect(origin, dest, s);
-        set_proxy_transform(cid, proxy.id, origin, cur);
-        // SLS calls from the main thread are only flushed to the window server
-        // when the run loop turns, so spin it briefly each frame.
-        pump_runloop(0.001);
-
-        let elapsed = now.duration_since(start);
-        if ((s - 1.0).abs() < 0.002 && v.abs() < 0.05) || elapsed > Duration::from_secs(8) {
-            set_proxy_transform(cid, proxy.id, origin, dest);
-            break;
-        }
-    }
-    println!("drove {frames} frames, spring s in [{s_min:.3}, {s_max:.3}]");
+    // QoL: animate back. Move the real window home, then animate dest -> origin.
+    move_real_window(&target.elem, origin);
+    run_spring(cid, proxy.id, origin, dest, origin, sem);
 
     // 6: stop the link, then tear the proxies down atomically.
     unsafe {
@@ -605,6 +612,90 @@ fn animate(target: &Target, dest: CGRect) {
         SLSReleaseConnection(cid);
     }
     println!("animation complete");
+}
+
+/// Move the real window via AX (size, position, size again to dodge macOS
+/// visible-area clamping). Must run on the main thread for an in-process window.
+fn move_real_window(elem: &AXUIElement, frame: CGRect) {
+    let sz = cg::CGSize {
+        width: frame.size.width,
+        height: frame.size.height,
+    };
+    let pos = cg::CGPoint {
+        x: frame.origin.x,
+        y: frame.origin.y,
+    };
+    _ = elem.set_size(sz);
+    _ = elem.set_position(pos);
+    _ = elem.set_size(sz);
+}
+
+/// Drive the proxy from `from` to `to` with a spring, one update per vsync tick
+/// (the semaphore is signalled by the display-link callback). `capture` is the
+/// frame the proxy bitmap was captured at — the transform scales relative to it.
+fn run_spring(
+    cid: SLSConnectionID,
+    proxy_id: CGWindowID,
+    capture: CGRect,
+    from: CGRect,
+    to: CGRect,
+    sem: DispatchSemaphore,
+) {
+    let start = Instant::now();
+    let spring = SpringAnimation::new(0.0, 1.0, 0.0, slow_response(), 1.0, start);
+    let mut frames: u32 = 0;
+    loop {
+        // Wait for the next vsync tick (cap the wait so we never hang if the
+        // link stops delivering).
+        let timeout = unsafe { dispatch_time(DISPATCH_TIME_NOW, 100_000_000) };
+        unsafe { dispatch_semaphore_wait(sem, timeout) };
+
+        let now = Instant::now();
+        let s = spring.value_at(now);
+        let v = spring.velocity_at(now);
+        frames += 1;
+
+        let cur = lerp_rect(from, to, s);
+        set_proxy_transform(cid, proxy_id, capture, cur);
+
+        let elapsed = now.duration_since(start);
+        if ((s - 1.0).abs() < 0.002 && v.abs() < 0.05) || elapsed > Duration::from_secs(8) {
+            set_proxy_transform(cid, proxy_id, capture, to);
+            let secs = now.duration_since(start).as_secs_f64();
+            println!(
+                "ran {frames} frames in {secs:.3}s ({:.0} fps)",
+                frames as f64 / secs
+            );
+            return;
+        }
+    }
+}
+
+/// The builtin display's bounds (CG global coords), if there is one.
+fn builtin_display_bounds() -> Option<CGRect> {
+    let mut ids = [0u32; 16];
+    let mut count: u32 = 0;
+    unsafe {
+        CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count);
+        ids.iter()
+            .take(count as usize)
+            .find(|&&id| CGDisplayIsBuiltin(id) != 0)
+            .map(|&id| CGDisplayBounds(id))
+    }
+}
+
+/// The display whose bounds contain the center of `rect`, else the main display.
+fn display_for(rect: CGRect) -> CGDirectDisplayID {
+    let center = CGPoint::new(
+        rect.origin.x + rect.size.width / 2.0,
+        rect.origin.y + rect.size.height / 2.0,
+    );
+    let mut id: CGDirectDisplayID = 0;
+    let mut count: u32 = 0;
+    unsafe {
+        CGGetDisplaysWithPoint(center, 1, &mut id, &mut count);
+        if count == 0 { CGMainDisplayID() } else { id }
+    }
 }
 
 fn slow_response() -> f64 {
@@ -713,6 +804,19 @@ fn main() {
         .map(|w| w.clone())
         .expect("AX window not found");
     let target = Target { wsid, elem };
+
+    // Move the window onto the builtin display so the 120Hz path is exercised
+    // (ProMotion). On a desktop / no builtin, this is a no-op.
+    if let Some(b) = builtin_display_bounds() {
+        move_real_window(
+            &target.elem,
+            CGRect::new(
+                CGPoint::new(b.origin.x + 200.0, b.origin.y + 200.0),
+                CGSize::new(360.0, 292.0),
+            ),
+        );
+        pump_runloop(0.2);
+    }
 
     let mut origin = CGRect::default();
     let mut cid: SLSConnectionID = 0;
