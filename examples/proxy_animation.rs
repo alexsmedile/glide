@@ -73,8 +73,8 @@ use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
-    NSBackingStoreType, NSColor, NSFont, NSRunningApplication, NSTextAlignment, NSTextField,
-    NSWindow, NSWindowStyleMask, NSWorkspace,
+    NSBackingStoreType, NSColor, NSFont, NSRunningApplication, NSScreen, NSTextAlignment,
+    NSTextField, NSWindow, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_foundation::{CGAffineTransform, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGImage;
@@ -844,6 +844,30 @@ fn builtin_display_bounds() -> Option<CGRect> {
     }
 }
 
+/// The *visible* frame of `display` (excludes the menu bar and Dock), in CG
+/// global coords (top-left origin). This is the region the real window can
+/// actually be moved into via AX — macOS clamps an AX window to stay below the
+/// menu bar. Returns `None` if we can't match an `NSScreen` to the display.
+fn visible_frame(display: CGDirectDisplayID) -> Option<CGRect> {
+    // `NSScreen` frames are in AppKit coords (bottom-left origin, y up), so we
+    // flip the y axis through the primary display's height to reach CG coords.
+    let mtm = MainThreadMarker::new()?;
+    let db = unsafe { CGDisplayBounds(display) };
+    let primary_h = unsafe { CGDisplayBounds(CGMainDisplayID()) }.size.height;
+    let to_cg = |r: NSRect| {
+        CGRect::new(
+            CGPoint::new(r.origin.x, primary_h - (r.origin.y + r.size.height)),
+            CGSize::new(r.size.width, r.size.height),
+        )
+    };
+    NSScreen::screens(mtm).iter().find_map(|s| {
+        let full = to_cg(s.frame());
+        let same = (full.origin.x - db.origin.x).abs() < 1.0
+            && (full.origin.y - db.origin.y).abs() < 1.0;
+        same.then(|| to_cg(s.visibleFrame()))
+    })
+}
+
 /// The display whose bounds contain the center of `rect`, else the main display.
 fn display_for(rect: CGRect) -> CGDirectDisplayID {
     let center = CGPoint::new(
@@ -869,9 +893,10 @@ fn destination_for(origin: CGRect) -> CGRect {
         CGPoint::new(origin.origin.x + 460.0, origin.origin.y + 280.0),
         CGSize::new(origin.size.width * 1.5, origin.size.height * 1.5),
     );
-    // Keep the destination fully on the window's display; off-screen area would
-    // capture as blank and distort the proxy animation.
-    let bounds = unsafe { CGDisplayBounds(display_for(origin)) };
+    // Keep the destination within the visible frame (below the menu bar, clear
+    // of the Dock). Off-screen area would not be captured.
+    let display = display_for(origin);
+    let bounds = visible_frame(display).unwrap_or_else(|| unsafe { CGDisplayBounds(display) });
     clamp_to_rect(dest, bounds)
 }
 
