@@ -723,9 +723,16 @@ fn start_streams(
         backdrop: None,
         foreground: None,
     };
+    let t_content = Instant::now();
     let Some(content) = shareable_content() else {
         return empty;
     };
+    if std::env::var("GLIDE_DEBUG").is_ok() {
+        println!(
+            "  shareable_content fetch={:.0}ms",
+            t_content.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let Some(display) = find_scdisplay(&content, display_id) else {
         return empty;
     };
@@ -794,7 +801,11 @@ fn start_streams(
 
     // Foreground: only the front windows we want re-drawn on top (include-filters
     // drop the desktop/dock → transparent where there is no front window).
-    let foreground = if front.is_empty() {
+    // DISABLED: the include-filter delivers black frames (see the latch site), and
+    // building/starting it added startup latency for no visible benefit. The
+    // `front` list is still computed above so this is a one-line re-enable.
+    const FOREGROUND_ENABLED: bool = false;
+    let foreground = if !FOREGROUND_ENABLED || front.is_empty() {
         None
     } else {
         let windows = scwindows_for(&content, &front);
@@ -835,6 +846,7 @@ fn resolve_existing(wsid: WindowServerId) -> Option<Target> {
 /// Run the full proxy-window animation for `target`, moving it to `dest`.
 /// Blocks until the animation settles, then tears everything down.
 fn animate(target: &Target, dest: CGRect) {
+    let t_start = Instant::now();
     let mtm = MainThreadMarker::new().expect("animate must run on the main thread");
 
     // Run as an accessory (background) app and never activate. That is what lets
@@ -955,6 +967,7 @@ fn animate(target: &Target, dest: CGRect) {
         (dest.size.height * scale) as usize,
     );
     let own_windows = [backdrop.id(), proxy.id(), foreground.id()];
+    let t_streams = Instant::now();
     let streams = start_streams(
         target.wsid,
         display,
@@ -964,6 +977,7 @@ fn animate(target: &Target, dest: CGRect) {
         live_above_pid,
         &own_windows,
     );
+    let streams_ms = t_streams.elapsed().as_secs_f64() * 1000.0;
     let slot_of = |s: &Option<WindowStream>| -> SurfaceSlot {
         s.as_ref().map(|s| s.slot.clone()).unwrap_or_default()
     };
@@ -1008,18 +1022,17 @@ fn animate(target: &Target, dest: CGRect) {
     // to the destination would be visible, for the frame or two before SCK
     // delivers. The stream delegates run on a background queue, so the slots fill
     // while we pump.
+    let t_wait = Instant::now();
     let deadline = Instant::now() + Duration::from_millis(800);
     let ready = |slot: &SurfaceSlot| slot.lock().unwrap().is_some();
-    while Instant::now() < deadline
-        && (!ready(&proxy_slot)
-            || !ready(&backdrop_slot)
-            || (has_foreground && !ready(&foreground_slot)))
-    {
+    // Only the proxy and backdrop are shown at the start, so only wait for those.
+    // (The foreground is currently disabled; waiting for its first frame added
+    // ~hundreds of ms to startup for no visible benefit.)
+    let _ = has_foreground;
+    while Instant::now() < deadline && (!ready(&proxy_slot) || !ready(&backdrop_slot)) {
         pump_runloop(0.01);
     }
-    // A couple more frames so SCK's warm-up (initial black/partial frames) is past
-    // before we latch the static snapshots.
-    pump_runloop(0.05);
+    let first_frame_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
 
     if debug {
         println!(
@@ -1028,6 +1041,11 @@ fn animate(target: &Target, dest: CGRect) {
             ready(&backdrop_slot),
             ready(&foreground_slot),
             SCK_FRAMES.load(Ordering::Relaxed),
+        );
+        println!(
+            "startup timing: start_streams={streams_ms:.0}ms (incl. shareable_content), \
+             first_frame_wait={first_frame_ms:.0}ms, total_to_animate={:.0}ms",
+            t_start.elapsed().as_secs_f64() * 1000.0,
         );
     }
 
