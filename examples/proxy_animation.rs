@@ -73,7 +73,9 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSFont, NSScreen, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowOrderingMode, NSWindowStyleMask
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSFont, NSScreen,
+    NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowAnimationBehavior,
+    NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -98,7 +100,13 @@ type CVReturn = i32;
 type CVOptionFlags = u64;
 
 const KCG_WINDOW_LIST_OPTION_ON_SCREEN_BELOW_WINDOW: CGWindowListOption = 1 << 2;
+const KCG_WINDOW_LIST_OPTION_ON_SCREEN_ABOVE_WINDOW: CGWindowListOption = 1 << 1;
 const KCG_WINDOW_IMAGE_DEFAULT: CGWindowImageOption = 0;
+// Capture the window content without its drop shadow. Used for the foreground
+// snapshot: a focused front window keeps rendering live *above* the snapshot, so
+// re-drawing its shadow underneath would double it (a darker halo over the proxy
+// area). Dropping the shadow from the snapshot avoids that.
+const KCG_WINDOW_IMAGE_BOUNDS_IGNORE_FRAMING: CGWindowImageOption = 1 << 0;
 const KCV_RETURN_SUCCESS: CVReturn = 0;
 
 // SLSHWCaptureWindowList flags used by yabai.
@@ -279,7 +287,7 @@ impl ProxyWindow {
         };
         window.setLevel(level as isize);
         window.setOpaque(opaque);
-        window.setHasShadow(false);
+        window.setHasShadow(true);
         // Disable AppKit's automatic open/close scale+fade. Without this the
         // proxy/backdrop "zoom" in and out, and during the fade-in the backdrop
         // is briefly translucent, revealing the relocated real window's edge.
@@ -318,7 +326,7 @@ impl ProxyWindow {
     }
 
     fn without_shadow(self) -> Self {
-        // Shadow is already disabled in `new`; retained for call-site parity.
+        self.window.setHasShadow(false);
         self
     }
 
@@ -498,15 +506,38 @@ fn capture_window(cid: SLSConnectionID, wid: CGWindowID) -> Option<CGImageRef> {
 /// Capture everything *behind* the window in `bounds` (window excluded), to use
 /// as the occluding backdrop. Returns a +1-retained `CGImageRef`.
 fn capture_backdrop(bounds: CGRect, wid: CGWindowID) -> Option<CGImageRef> {
-    capture_relative_to_window(bounds, wid, KCG_WINDOW_LIST_OPTION_ON_SCREEN_BELOW_WINDOW)
+    capture_relative_to_window(
+        bounds,
+        wid,
+        KCG_WINDOW_LIST_OPTION_ON_SCREEN_BELOW_WINDOW,
+        KCG_WINDOW_IMAGE_DEFAULT,
+    )
+}
+
+/// Capture everything *above* the window in `bounds` (window excluded), to lay
+/// back over the proxy. The backdrop occludes the relocated real window by
+/// covering "everything below the target", but it is ordered above all other
+/// inactive windows, so it also hides any window that was *in front* of the
+/// target. Re-stacking this above-the-target snapshot on top of the proxy
+/// restores those front windows. Areas with nothing above the target come back
+/// transparent, so the proxy shows through. Returns a +1-retained `CGImageRef`
+/// (null if nothing is above the target).
+fn capture_foreground(bounds: CGRect, wid: CGWindowID) -> Option<CGImageRef> {
+    capture_relative_to_window(
+        bounds,
+        wid,
+        KCG_WINDOW_LIST_OPTION_ON_SCREEN_ABOVE_WINDOW,
+        KCG_WINDOW_IMAGE_BOUNDS_IGNORE_FRAMING,
+    )
 }
 
 fn capture_relative_to_window(
     bounds: CGRect,
     wid: CGWindowID,
-    option: CGWindowListOption,
+    list_option: CGWindowListOption,
+    image_option: CGWindowImageOption,
 ) -> Option<CGImageRef> {
-    let image = unsafe { CGWindowListCreateImage(bounds, option, wid, KCG_WINDOW_IMAGE_DEFAULT) };
+    let image = unsafe { CGWindowListCreateImage(bounds, list_option, wid, image_option) };
     if image.is_null() { None } else { Some(image) }
 }
 
@@ -582,6 +613,10 @@ fn animate(target: &Target, dest: CGRect) {
         }
         return;
     };
+    // Snapshot everything *above* the target now, while it's at the origin, so we
+    // can restore windows that sit in front of it (the backdrop would otherwise
+    // hide them). Null when nothing is above the target — then we skip it.
+    let foreground_img = capture_foreground(backdrop_bounds, wid);
     let debug = std::env::var("GLIDE_DEBUG").is_ok();
     if debug {
         dump_z_order(target.wsid);
@@ -592,7 +627,11 @@ fn animate(target: &Target, dest: CGRect) {
     // pixel size lags the reported window size).
     let scale = {
         let w = unsafe { CGImageGetWidth(proxy_img) } as f64;
-        if origin.size.width > 1.0 { w / origin.size.width } else { 2.0 }
+        if origin.size.width > 1.0 {
+            w / origin.size.width
+        } else {
+            2.0
+        }
     };
 
     // 3: create the windows: backdrop (opaque, hides the relocated real target)
@@ -601,13 +640,62 @@ fn animate(target: &Target, dest: CGRect) {
     // is stacked directly above the backdrop with `orderWindow:relativeTo:`.
     // The proxy window spans origin∪dest so its bitmap can move within a window
     // that never resizes (see `ProxyWindow`); the backdrop is static.
-    let backdrop = ProxyWindow::new(mtm, backdrop_bounds, backdrop_bounds, backdrop_img, level, true)
-        .without_shadow();
+    // If the target belongs to the active app, glide (a non-activating accessory)
+    // can't order its windows above it the normal way — `orderFront` would land
+    // them below the whole active app, so the proxy/backdrop couldn't occlude the
+    // focused window. (Sub-level ordering via `SLSSetWindowSubLevel` was tried and
+    // had no effect on our AppKit windows.) Instead raise our window *level* one
+    // above the target's: a higher level always composites in front, regardless of
+    // activation. That also lifts us above every other window in the target's
+    // level, but the foreground snapshot below restores those.
+    // The window's owning pid, from the window server (the AX element's
+    // `process_id()` is unreliable for a cross-process window — it returns Err).
+    let target_pid = window_server::get_window(target.wsid).map(|w| w.pid).unwrap_or(0);
+    let front_pid = frontmost_pid();
+    let focused = std::env::var("GLIDE_FORCE_FOCUSED").is_ok()
+        || (target_pid != 0 && front_pid == target_pid);
+    if debug {
+        println!(
+            "focus check: target_pid={target_pid} frontmost_pid={front_pid} focused={focused}"
+        );
+    }
+    let win_level = if focused { level + 1 } else { level };
+
+    let backdrop = ProxyWindow::new(
+        mtm,
+        backdrop_bounds,
+        backdrop_bounds,
+        backdrop_img,
+        win_level,
+        true,
+    )
+    .without_shadow();
     let proxy_container = union_rect(origin, dest);
-    let proxy = ProxyWindow::new(mtm, proxy_container, origin, proxy_img, level, false);
-    proxy.order_above(&backdrop);
+    let proxy = ProxyWindow::new(mtm, proxy_container, origin, proxy_img, win_level, false);
+    // Foreground: a static snapshot of whatever was in front of the target,
+    // covering the same area as the backdrop and stacked above the proxy. The
+    // backdrop hides everything below the target (including front windows); this
+    // lays the front windows back on top. It's transparent wherever nothing was
+    // above the target, so the proxy shows through there. Static for the
+    // animation (the front windows don't move while we animate the target).
+    let foreground = foreground_img
+        .map(|img| ProxyWindow::new(mtm, backdrop_bounds, backdrop_bounds, img, win_level, false).without_shadow());
+
+    // Establish the stack: backdrop < proxy < foreground. The window *level* set
+    // above persists across `orderFront`, but the relative order among same-level
+    // windows does not, so we re-run this after re-showing past the pause below.
+    let restack = || {
+        proxy.order_above(&backdrop);
+        if let Some(fg) = &foreground {
+            fg.order_above(&proxy);
+        }
+    };
+    restack();
 
     if debug {
+        if focused {
+            println!("target is frontmost: raised windows to level {win_level}");
+        }
         dump_level(cid, "target  ", wid);
         dump_level(cid, "backdrop", backdrop.id());
         dump_level(cid, "proxy   ", proxy.id());
@@ -696,10 +784,16 @@ fn animate(target: &Target, dest: CGRect) {
     // Pause for a second to show the window at its destination.
     backdrop.hide();
     proxy.hide();
+    if let Some(fg) = &foreground {
+        fg.hide();
+    }
     pump_runloop(1.0);
     backdrop.show();
     proxy.show();
-    proxy.order_above(&backdrop);
+    if let Some(fg) = &foreground {
+        fg.show();
+    }
+    restack();
 
     // QoL: animate back. Move the real window home, then animate dest -> origin.
     *target_size.lock().unwrap() = (origin.size.width, origin.size.height);
@@ -714,6 +808,7 @@ fn animate(target: &Target, dest: CGRect) {
         CVDisplayLinkRelease(link);
         dispatch_release(sem);
     }
+    drop(foreground);
     drop(proxy);
     drop(backdrop);
     unsafe { SLSReleaseConnection(cid) };
@@ -819,6 +914,18 @@ fn run_spring(
     }
 }
 
+/// Pid of the frontmost (active) application, or 0 if none. When the target
+/// belongs to the active app, glide — a non-activating accessory — cannot order
+/// its proxy/backdrop above it (background-app `orderFront` lands *below* the
+/// active app), so the proxy can't occlude the window. We detect that case (the
+/// target's pid is frontmost) to raise our windows' level instead.
+fn frontmost_pid() -> pid_t {
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .map(|app| app.processIdentifier())
+        .unwrap_or(0)
+}
+
 /// Print the window-server level and sub-level the server assigned to `wid`.
 /// Used to check whether our proxy/backdrop actually share the target window's
 /// band, or sit in a higher one that no click could put another window above.
@@ -879,8 +986,8 @@ fn visible_frame(display: CGDirectDisplayID) -> Option<CGRect> {
     };
     NSScreen::screens(mtm).iter().find_map(|s| {
         let full = to_cg(s.frame());
-        let same = (full.origin.x - db.origin.x).abs() < 1.0
-            && (full.origin.y - db.origin.y).abs() < 1.0;
+        let same =
+            (full.origin.x - db.origin.x).abs() < 1.0 && (full.origin.y - db.origin.y).abs() < 1.0;
         same.then(|| to_cg(s.visibleFrame()))
     })
 }
@@ -955,6 +1062,13 @@ fn main() {
             eprintln!("could not resolve an AX window for {wsid:?}");
             std::process::exit(1);
         };
+        // Optional startup delay (seconds) before sampling state and animating.
+        // Lets a tester focus the target's app first, so the focused-target path
+        // (raised window level) is exercised — launching from a terminal would
+        // otherwise leave the terminal frontmost.
+        if let Some(secs) = std::env::var("GLIDE_START_DELAY").ok().and_then(|s| s.parse().ok()) {
+            pump_runloop(secs);
+        }
         let mut origin = CGRect::default();
         let mut cid: SLSConnectionID = 0;
         unsafe {
