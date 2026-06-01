@@ -102,7 +102,7 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
     "CFString",
 ] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
-    "CGDirectDisplay", "CGRemoteOperation", "CGError"
+    "CGColor", "CGDirectDisplay", "CGRemoteOperation", "CGError"
 ] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSArray",
@@ -152,7 +152,9 @@ objc2-screen-capture-kit = { version = "0.3.2", default-features = false, featur
 ] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = [
     "CMSampleBuffer",
+    "objc2-core-video",
 ] }
+block2 = "0.6.1"
 objc2-core-video = { version = "0.3.2", default-features = false, features = [
     "CVPixelBuffer",
     "CVPixelBufferIOSurface",
