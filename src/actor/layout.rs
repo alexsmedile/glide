@@ -95,7 +95,7 @@ pub struct LayoutWindowInfo {
 }
 
 #[must_use]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EventResponse {
     /// Windows to raise quietly. No WindowFocused events will be created for
     /// these.

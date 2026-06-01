@@ -949,7 +949,7 @@ impl Reactor {
     fn send_layout_event_with_visible_window_order(
         &mut self,
         event: LayoutEvent,
-        visible_window_order: &[WindowServerId],
+        visible_window_order: &[WindowId],
     ) {
         self.send_layout_event_with_visible_window_order_from_mouse(
             event,
@@ -965,7 +965,7 @@ impl Reactor {
     fn send_layout_event_with_visible_window_order_from_mouse(
         &mut self,
         event: LayoutEvent,
-        visible_window_order: &[WindowServerId],
+        visible_window_order: &[WindowId],
         from_mouse: bool,
     ) {
         debug!(?event, ?from_mouse, "send_layout_event");
@@ -995,7 +995,7 @@ impl Reactor {
     fn handle_layout_response_with_visible_window_order(
         &mut self,
         mut response: layout::EventResponse,
-        visible_window_order: Option<&[WindowServerId]>,
+        visible_window_order: Option<&[WindowId]>,
         from_mouse: bool,
     ) {
         if let Some(visible_window_order) = visible_window_order {
@@ -1046,13 +1046,11 @@ impl Reactor {
     fn filter_response(
         &self,
         mut response: layout::EventResponse,
-        mut visible_window_order: &[WindowServerId],
+        mut visible_window_order: &[WindowId],
     ) -> layout::EventResponse {
         // For now, just optimize the case where the response is a no-op.
         if let Some(focus) = response.focus_window {
-            if let Some(&first) = visible_window_order.first()
-                && focus.wsid() == Some(first)
-            {
+            if Some(focus) == visible_window_order.first().copied() {
                 // Note that we keep the focus window in the request unless
                 // there are no raise windows.
                 visible_window_order = &visible_window_order[1..];
@@ -1074,6 +1072,7 @@ impl Reactor {
         let current_top_wsids = visible_window_order
             .iter()
             .copied()
+            .flat_map(|wid| wid.wsid())
             .filter(|wsid| self.should_compare_visible_window(*wsid))
             .take(desired_visible_wsids.len())
             .collect::<HashSet<_>>();
@@ -1575,11 +1574,9 @@ pub mod tests {
                 raise_windows: vec![w2],
                 focus_window: Some(w1),
             },
-            &[WindowServerId::new(1), WindowServerId::new(2)],
+            &[w1, w2],
         );
-
-        assert!(response.raise_windows.is_empty());
-        assert!(response.focus_window.is_none());
+        assert_eq!(response, layout::EventResponse::default());
     }
 
     #[test]
@@ -1593,7 +1590,7 @@ pub mod tests {
                 raise_windows: vec![w2],
                 focus_window: Some(w1),
             },
-            &[WindowServerId::new(2), WindowServerId::new(1)],
+            &[w2, w1],
         );
 
         assert_eq!(response.raise_windows, vec![w2]);
