@@ -139,6 +139,32 @@ thiserror = "2.0.17"
 itertools = "0.14.0"
 
 [dev-dependencies]
+objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
+    "SCStream",
+    "SCShareableContent",
+    "SCError",
+    "alloc",
+    "block2",
+    "dispatch2",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "objc2-core-media",
+] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = [
+    "CMSampleBuffer",
+] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = [
+    "CVPixelBuffer",
+    "CVPixelBufferIOSurface",
+    "CVImageBuffer",
+    "CVBuffer",
+    "objc2-io-surface",
+] }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = [
+    "IOSurfaceRef",
+    "IOSurfaceTypes",
+    "objc2-core-foundation",
+] }
 pretty_assertions = "1.4.0"
 tokio = { version = "1.35.1", features = ["rt", "sync", "macros"] }
 test-log = { version = "0.2.16", default-features = false, features = [
