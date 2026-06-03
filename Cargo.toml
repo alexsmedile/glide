@@ -142,6 +142,7 @@ itertools = "0.14.0"
 objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
     "SCStream",
     "SCShareableContent",
+    "SCScreenshotManager",
     "SCError",
     "alloc",
     "block2",
@@ -152,6 +153,8 @@ objc2-screen-capture-kit = { version = "0.3.2", default-features = false, featur
 ] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = [
     "CMSampleBuffer",
+    "CMTime",
+    "CMSync",
     "objc2-core-video",
 ] }
 block2 = "0.6.1"
