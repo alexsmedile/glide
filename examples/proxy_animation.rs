@@ -15,10 +15,13 @@
 //! payload injected into Dock.app). We avoid that entirely. Instead we lay an
 //! opaque **backdrop** snapshot of *everything behind the window* over the area
 //! the animation touches, so the real window is occluded without any privileged
-//! call. The backdrop is captured with `CGWindowListCreateImage` using
-//! `kCGWindowListOptionOnScreenBelowWindow`, which composites the desktop and
-//! other windows *excluding the target window itself* — exactly the "desktop
-//! behind the window" image we need.
+//! call. The backdrop used to be one `CGWindowListCreateImage` region capture,
+//! but that API is gone from the macOS 26 SDK and, being a screen-recording API,
+//! is TCC-gated (it raises the consent dialog). Instead we list the windows below
+//! the target (`CGWindowListCopyWindowInfo`, info only, not TCC-gated), capture
+//! each through the private SLS hardware path, and composite them into one image
+//! covering the animation's bounds (see `composite_windows`). No screen-recording
+//! consent dialog is raised.
 //!
 //! Pipeline:
 //!   1. Capture the target window image (private `SLSHWCaptureWindowList`, as
@@ -54,43 +57,33 @@
 //!   cargo run --example proxy_animation                 # spawns its own window
 //!   cargo run --example proxy_animation -- --wid 12345  # animates an existing window
 //!
-//! Requires **Screen Recording** permission (for the captures). The demo checks
-//! and prompts for it on launch.
+//! All capture is via the private SLS hardware path, which is *not* TCC-gated, so
+//! no screen-recording consent dialog is raised. The demo still preflights the
+//! Screen Recording permission for diagnostics, but does not depend on it.
 
 use std::ffi::{c_int, c_void};
 use std::process;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use accessibility::{AXUIElement, AXUIElementAttributes};
 use accessibility_sys::pid_t;
-use block2::RcBlock;
 use core_graphics_types::geometry as cg;
 use glide_wm::model::spring::SpringAnimation;
 use glide_wm::sys::app::AXUIElementExt;
 use glide_wm::sys::window_server::{self, WindowServerId};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::runtime::AnyObject;
+use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSFont, NSScreen,
     NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowAnimationBehavior,
     NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
 };
-use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
-use objc2_core_graphics::CGColor;
-use objc2_core_media::CMSampleBuffer;
-use objc2_core_video::{CVImageBuffer, CVPixelBufferGetIOSurface};
-use objc2_foundation::{
-    NSArray, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
-};
-use objc2_io_surface::IOSurfaceRef;
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::{CALayer, CATransaction};
-use objc2_screen_capture_kit::{
-    SCContentFilter, SCDisplay, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
-    SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType, SCWindow,
-};
 
 // ---------------------------------------------------------------------------
 // Private/undocumented FFI. These mirror the declarations yabai uses
@@ -100,7 +93,13 @@ use objc2_screen_capture_kit::{
 
 type SLSConnectionID = c_int;
 type CGWindowID = u32;
+type CFTypeRef = *const c_void;
+type CFArrayRef = *const c_void;
+type CFDictionaryRef = *const c_void;
+type CFStringRef = *const c_void;
 type CGImageRef = *const c_void;
+type CGContextRef = *mut c_void;
+type CGColorSpaceRef = *mut c_void;
 
 type CVDisplayLinkRef = *mut c_void;
 type CVReturn = i32;
@@ -108,9 +107,18 @@ type CVOptionFlags = u64;
 
 const KCV_RETURN_SUCCESS: CVReturn = 0;
 
-// The only remaining private SkyLight calls are read-only window queries (window
-// bounds/level for geometry). All image capture is now via ScreenCaptureKit, and
-// window creation/ordering/levels via public AppKit/Core Animation (`ProxyWindow`).
+// SLSHWCaptureWindowList flags used by yabai.
+const SLS_CAPTURE_FLAGS: u32 = (1 << 11) | (1 << 8);
+
+// `CGWindowListCreateImage` and `CGWindowListCreateImageFromArray` are gone in the
+// macOS 26 SDK and, being screen-recording APIs, are TCC-gated (they raise the
+// consent dialog). All image capture is therefore done through the private SLS
+// hardware path (`SLSHWCaptureWindowList`), which is not TCC-gated. The backdrop
+// and foreground, which used to be one `CGWindowList*` region capture, are now
+// composited from per-window SLS captures (see `composite_windows`).
+//
+// Window *creation*, ordering, levels, shadow, and the per-frame transform are
+// done with public AppKit/Core Animation APIs (see `ProxyWindow`).
 #[link(name = "SkyLight", kind = "framework")]
 unsafe extern "C" {
     fn SLSNewConnection(zero: c_int, cid: *mut SLSConnectionID) -> i32;
@@ -119,10 +127,51 @@ unsafe extern "C" {
     fn SLSGetWindowBounds(cid: SLSConnectionID, wid: CGWindowID, frame: *mut CGRect) -> i32;
     fn SLSGetWindowLevel(cid: SLSConnectionID, wid: CGWindowID, level: *mut c_int) -> i32;
     fn SLSGetWindowSubLevel(cid: SLSConnectionID, wid: CGWindowID) -> c_int;
+
+    fn SLSHWCaptureWindowList(
+        cid: SLSConnectionID,
+        window_list: *const CGWindowID,
+        window_count: c_int,
+        options: u32,
+    ) -> CFArrayRef;
 }
+
+// Window-info query (no image, so not TCC-gated) and the CoreGraphics bitmap
+// context used to composite the per-window SLS captures into one backdrop image.
+const KCG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
+const KCG_WINDOW_LIST_OPTION_ON_SCREEN_BELOW_WINDOW: u32 = 1 << 2;
+// kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little — BGRA, what the
+// window server's surfaces use and what CALayer expects.
+const KCG_BITMAP_INFO_BGRA: u32 = 2 | (2 << 12);
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: CGWindowID) -> CFArrayRef;
+    static kCGWindowNumber: CFStringRef;
+    static kCGWindowBounds: CFStringRef;
+
+    fn CGImageGetWidth(image: CGImageRef) -> usize;
+    fn CGImageGetHeight(image: CGImageRef) -> usize;
+
+    fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
+    fn CGColorSpaceRelease(space: CGColorSpaceRef);
+    fn CGBitmapContextCreate(
+        data: *mut c_void,
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bytes_per_row: usize,
+        space: CGColorSpaceRef,
+        bitmap_info: u32,
+    ) -> CGContextRef;
+    fn CGBitmapContextCreateImage(context: CGContextRef) -> CGImageRef;
+    fn CGContextRelease(context: CGContextRef);
+    fn CGContextDrawImage(context: CGContextRef, rect: CGRect, image: CGImageRef);
+    fn CGContextScaleCTM(context: CGContextRef, sx: f64, sy: f64);
+    fn CGContextTranslateCTM(context: CGContextRef, tx: f64, ty: f64);
+
+    fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut CGRect) -> bool;
+
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
     fn CGMainDisplayID() -> CGDirectDisplayID;
@@ -191,20 +240,20 @@ type CVDisplayLinkOutputCallback = extern "C" fn(
     user_info: *mut c_void,
 ) -> CVReturn;
 
-type CFStringRef = *const c_void;
-
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
+    fn CFRelease(cf: CFTypeRef);
+    fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
+    fn CFArrayGetCount(array: CFArrayRef) -> isize;
+    fn CFArrayGetValueAtIndex(array: CFArrayRef, idx: isize) -> *const c_void;
+    fn CFDictionaryGetValue(dict: CFDictionaryRef, key: *const c_void) -> *const c_void;
+    fn CFNumberGetValue(number: *const c_void, the_type: isize, value: *mut c_void) -> bool;
     fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_handled: bool) -> i32;
     static kCFRunLoopDefaultMode: CFStringRef;
-    // Read the SCK frame-status attachment off a sample buffer (see `frame_status`).
-    fn CFArrayGetValueAtIndex(array: *const c_void, idx: isize) -> *const c_void;
-    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
-    fn CFNumberGetValue(number: *const c_void, the_type: isize, value: *mut c_void) -> bool;
 }
 
-// kCFNumberNSIntegerType — read a CFNumber as a pointer-sized signed integer.
-const KCF_NUMBER_NSINTEGER_TYPE: isize = 15;
+// kCFNumberSInt32Type — read a CFNumber as a 32-bit signed integer (window ids).
+const KCF_NUMBER_SINT32_TYPE: isize = 3;
 
 /// Pump the main run loop for roughly `seconds`, so AppKit renders and the
 /// window server has a chance to composite before we screenshot.
@@ -248,18 +297,19 @@ struct ProxyWindow {
 
 impl ProxyWindow {
     /// Create a borderless, non-activating window covering `container` (CG global
-    /// coords). The content sublayer starts empty and is filled live from an
-    /// `SCStream`; `content_rect` (CG global) is its initial frame. For the
-    /// backdrop/foreground pass `content_rect == container`; for the animated
-    /// proxy, `container` is the union of origin and destination so the bitmap can
-    /// move within a window that never itself resizes.
+    /// coords), with `image` drawn into the sub-region `content_rect` (also CG
+    /// global). For a static backdrop pass `content_rect == container`; for the
+    /// animated proxy, `container` is the union of the origin and destination so
+    /// the bitmap can move within a window that never itself resizes.
     fn new(
         mtm: MainThreadMarker,
         container: CGRect,
         content_rect: CGRect,
+        image: CGImageRef,
         level: c_int,
         opaque: bool,
     ) -> Self {
+        assert!(!image.is_null(), "cannot build a proxy from a null image");
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -292,18 +342,14 @@ impl ProxyWindow {
         let this = ProxyWindow { window, content, container };
         CATransaction::begin();
         CATransaction::setDisableActions(true);
+        this.set_contents(image);
         this.set_content_rect(content_rect);
         CATransaction::commit();
-        // Not ordered in here: an opaque backdrop shown before its first frame is
-        // latched would flash black. The caller orders the windows in (see
-        // `order_in`) once their contents are set.
-        this
-    }
 
-    /// Order the window in without activating glide (background app -> above other
-    /// inactive windows, below the active app).
-    fn order_in(&self) {
-        self.window.orderFront(None);
+        // Order in without activating glide (background app -> above other
+        // inactive windows, below the active app).
+        this.window.orderFront(None);
+        this
     }
 
     /// Stack this window directly above `other` (must be one of *our* windows;
@@ -343,6 +389,14 @@ impl ProxyWindow {
     fn id(&self) -> CGWindowID {
         self.window.windowNumber() as CGWindowID
     }
+
+    fn hide(&self) {
+        self.window.orderOut(None);
+    }
+
+    fn show(&self) {
+        self.window.orderFront(None);
+    }
 }
 
 /// Map a CG global rect `r` to layer coords inside a window whose frame is
@@ -367,6 +421,18 @@ fn cg_to_ns_rect(r: CGRect) -> NSRect {
         NSPoint::new(r.origin.x, primary_h - (r.origin.y + r.size.height)),
         NSSize::new(r.size.width, r.size.height),
     )
+}
+
+/// A `CGImageRef` that can be sent between threads and releases on drop. Used to
+/// hand freshly captured frames from the capture thread to the animation loop.
+struct SendImage(CGImageRef);
+unsafe impl Send for SendImage {}
+impl Drop for SendImage {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CFRelease(self.0) };
+        }
+    }
 }
 
 impl Drop for ProxyWindow {
@@ -450,376 +516,177 @@ fn clamp_to_rect(mut rect: CGRect, bounds: CGRect) -> CGRect {
 const SHADOW_MARGIN: f64 = 64.0;
 
 // ---------------------------------------------------------------------------
-// ScreenCaptureKit live capture (Phase 3). Each animated surface (here: the
-// proxy) is fed by an `SCStream` with a content filter selecting exactly the
-// windows it should show. The stream's delegate runs on a background queue and
-// only *stashes* the latest frame's IOSurface into a shared slot; the main
-// vsync loop (`run_spring`) reads the slot and sets it as the layer's contents,
-// so all Core Animation mutation stays on the main thread.
+// Capture helpers.
 // ---------------------------------------------------------------------------
 
-/// The latest captured frame, handed from an `SCStream` callback (background)
-/// thread to the main animation loop. The IOSurface is set directly as a
-/// `CALayer`'s `contents` (a valid contents object), avoiding any CGImage
-/// conversion.
-///
-/// We keep the frame's `CVImageBuffer` (pixel buffer) retained, not just the
-/// IOSurface: SCK hands out surfaces from a fixed pool and reuses them once the
-/// buffer is released, so holding only the IOSurface let SCK overwrite the very
-/// surface Core Animation was still displaying — which showed as intermittent
-/// black flashes. While we hold the pixel buffer, that surface stays in use and
-/// SCK won't recycle it.
-struct SendSurface {
-    _buffer: CFRetained<CVImageBuffer>,
-    surface: CFRetained<IOSurfaceRef>,
-}
-unsafe impl Send for SendSurface {}
-impl SendSurface {
-    /// The IOSurface as an opaque object pointer, for `CALayer.setContents`.
-    fn as_contents(&self) -> *const c_void {
-        (&*self.surface as *const IOSurfaceRef).cast()
-    }
-}
-
-/// Shared one-slot mailbox of the most recent frame for one surface.
-type SurfaceSlot = Arc<Mutex<Option<SendSurface>>>;
-
-/// Total SCK frames delivered across all streams (debug instrumentation, to
-/// confirm live capture is actually flowing vs. falling back to the seed bitmap).
-static SCK_FRAMES: AtomicU64 = AtomicU64::new(0);
-
-/// SCK marks each delivered sample buffer with an `SCFrameStatus` attachment.
-/// Only `Complete` frames carry new pixels; `Idle`/`Blank`/`Suspended` are sent
-/// for timing and have no usable surface — displaying one blanks the opaque
-/// backdrop to black (the flashes). Returns `Complete` if no attachment is found.
-fn frame_status(sbuf: &CMSampleBuffer) -> SCFrameStatus {
-    let Some(attachments) = (unsafe { sbuf.sample_attachments_array(false) }) else {
-        return SCFrameStatus::Complete;
-    };
-    let array = std::ptr::from_ref(&*attachments).cast::<c_void>();
-    let dict = unsafe { CFArrayGetValueAtIndex(array, 0) };
-    if dict.is_null() {
-        return SCFrameStatus::Complete;
-    }
-    let key_ns: &NSString = unsafe { SCStreamFrameInfoStatus };
-    let key = std::ptr::from_ref(key_ns).cast::<c_void>();
-    let value = unsafe { CFDictionaryGetValue(dict, key) };
-    if value.is_null() {
-        return SCFrameStatus::Complete;
-    }
-    let mut status: isize = SCFrameStatus::Complete.0;
+/// Capture the target window itself (the proxy bitmap), via the private SLS
+/// hardware capture path yabai uses. Returns a +1-retained `CGImageRef`.
+fn capture_window(cid: SLSConnectionID, wid: CGWindowID) -> Option<CGImageRef> {
     unsafe {
-        CFNumberGetValue(
-            value,
-            KCF_NUMBER_NSINTEGER_TYPE,
-            std::ptr::from_mut(&mut status).cast::<c_void>(),
-        );
+        let array = SLSHWCaptureWindowList(cid, &wid, 1, SLS_CAPTURE_FLAGS);
+        if array.is_null() || CFArrayGetCount(array) < 1 {
+            if !array.is_null() {
+                CFRelease(array);
+            }
+            return None;
+        }
+        let image = CFArrayGetValueAtIndex(array, 0);
+        let retained = CFRetain(image);
+        CFRelease(array);
+        Some(retained)
     }
-    SCFrameStatus(status)
 }
 
-define_class! {
-    // SAFETY: NSObject has no subclassing requirements and this class has no
-    // `Drop` impl. The one method's selector and signature match the
-    // `SCStreamOutput` protocol requirement.
-    #[unsafe(super(NSObject))]
-    #[ivars = SurfaceSlot]
-    struct StreamOutput;
+/// One on-screen window's id and CG-global frame, from `CGWindowListCopyWindowInfo`.
+struct WindowFrame {
+    id: CGWindowID,
+    frame: CGRect,
+}
 
-    unsafe impl NSObjectProtocol for StreamOutput {}
-
-    unsafe impl SCStreamOutput for StreamOutput {
-        #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
-        fn did_output(
-            &self,
-            _stream: &SCStream,
-            sample_buffer: &CMSampleBuffer,
-            kind: SCStreamOutputType,
-        ) {
-            if kind.0 != SCStreamOutputType::Screen.0 {
-                return;
-            }
-            // Skip non-`Complete` frames (idle/blank timing frames) — their
-            // surface is empty and would flash the opaque backdrop black.
-            if frame_status(sample_buffer).0 != SCFrameStatus::Complete.0 {
-                return;
-            }
-            // CMSampleBuffer -> CVImageBuffer(==CVPixelBuffer) -> IOSurface.
-            let Some(image) = (unsafe { sample_buffer.image_buffer() }) else {
-                return;
+/// On-screen windows *below* `wid` in z-order (front-to-back), including desktop
+/// elements (the wallpaper), each with its CG-global frame. This is the set that
+/// `kCGWindowListOptionOnScreenBelowWindow` used to feed `CGWindowListCreateImage`;
+/// we read the list here and composite the per-window SLS captures ourselves.
+/// Desktop elements are *not* excluded, so the wallpaper fills the backdrop.
+fn windows_below(wid: CGWindowID) -> Vec<WindowFrame> {
+    let option =
+        KCG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | KCG_WINDOW_LIST_OPTION_ON_SCREEN_BELOW_WINDOW;
+    let array = unsafe { CGWindowListCopyWindowInfo(option, wid) };
+    if array.is_null() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let count = unsafe { CFArrayGetCount(array) };
+    for i in 0..count {
+        let dict = unsafe { CFArrayGetValueAtIndex(array, i) } as CFDictionaryRef;
+        if dict.is_null() {
+            continue;
+        }
+        let num = unsafe { CFDictionaryGetValue(dict, kCGWindowNumber as *const c_void) };
+        let mut id: i32 = 0;
+        let got_id = !num.is_null()
+            && unsafe {
+                CFNumberGetValue(
+                    num,
+                    KCF_NUMBER_SINT32_TYPE,
+                    std::ptr::from_mut(&mut id).cast::<c_void>(),
+                )
             };
-            if let Some(surface) = CVPixelBufferGetIOSurface(Some(&image)) {
-                *self.ivars().lock().unwrap() = Some(SendSurface { _buffer: image, surface });
-                SCK_FRAMES.fetch_add(1, Ordering::Relaxed);
-            }
+        let bounds_dict =
+            unsafe { CFDictionaryGetValue(dict, kCGWindowBounds as *const c_void) } as CFDictionaryRef;
+        let mut frame = CGRect::default();
+        let got_frame = !bounds_dict.is_null()
+            && unsafe { CGRectMakeWithDictionaryRepresentation(bounds_dict, &mut frame) };
+        if got_id && got_frame {
+            out.push(WindowFrame { id: id as CGWindowID, frame });
         }
     }
+    unsafe { CFRelease(array) };
+    out
 }
 
-impl StreamOutput {
-    fn new(slot: SurfaceSlot) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(slot);
-        unsafe { msg_send![super(this), init] }
-    }
-}
-
-/// Fetch the shareable windows/displays. The SCK API is async (completion
-/// handler); we block on a semaphore since the demo drives everything inline.
-fn shareable_content() -> Option<Retained<SCShareableContent>> {
-    let slot: Arc<Mutex<Option<Retained<SCShareableContent>>>> = Arc::new(Mutex::new(None));
-    let sem = unsafe { dispatch_semaphore_create(0) };
-    let handler = {
-        let slot = slot.clone();
-        RcBlock::new(move |content: *mut SCShareableContent, _err: *mut NSError| {
-            if !content.is_null() {
-                *slot.lock().unwrap() = unsafe { Retained::retain(content) };
-            }
-            unsafe { dispatch_semaphore_signal(sem) };
-        })
-    };
-    unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
-    // DISPATCH_TIME_FOREVER.
-    unsafe { dispatch_semaphore_wait(sem, u64::MAX) };
-    let content = slot.lock().unwrap().take();
-    content
-}
-
-/// The `SCWindow` for a given window-server id, if it's shareable.
-fn find_scwindow(content: &SCShareableContent, wsid: u32) -> Option<Retained<SCWindow>> {
-    let windows = unsafe { content.windows() };
-    (0..windows.count())
-        .map(|i| windows.objectAtIndex(i))
-        .find(|w| unsafe { w.windowID() } == wsid)
-}
-
-/// The `SCDisplay` matching a CoreGraphics display id.
-fn find_scdisplay(
-    content: &SCShareableContent,
-    display_id: CGDirectDisplayID,
-) -> Option<Retained<SCDisplay>> {
-    let displays = unsafe { content.displays() };
-    (0..displays.count())
-        .map(|i| displays.objectAtIndex(i))
-        .find(|d| unsafe { d.displayID() } == display_id)
-}
-
-/// A process-wide transparent `CGColor`, leaked so it stays alive for the life of
-/// any `SCStreamConfiguration` that references it (the configuration holds the
-/// background color *unretained*).
-fn clear_cgcolor() -> &'static CGColor {
-    static CLEAR: OnceLock<usize> = OnceLock::new();
-    let ptr = *CLEAR.get_or_init(|| {
-        let color = CGColor::new_generic_gray(0.0, 0.0);
-        CFRetained::into_raw(color).as_ptr() as usize
-    });
-    unsafe { &*(ptr as *const CGColor) }
-}
-
-/// A configuration sized to a pixel width/height (the surface's backing size).
-/// `source_rect` (display-local points), when given, captures only that region of
-/// the display — used for the backdrop/foreground streams, which filter a whole
-/// display but only need the animation's bounding box. `transparent` leaves areas
-/// with no window content clear (a window's rounded corners, gaps in the
-/// foreground) rather than the default opaque black.
-fn stream_config(
-    px_w: usize,
-    px_h: usize,
-    source_rect: Option<CGRect>,
-    transparent: bool,
-) -> Retained<SCStreamConfiguration> {
-    let config = unsafe { SCStreamConfiguration::new() };
+/// Composite the SLS captures of `windows` into a single opaque image covering
+/// `bounds` (CG global), back-to-front, at `scale` pixels per point. Each window
+/// is captured individually with `SLSHWCaptureWindowList` (the only non-TCC-gated
+/// capture path) and drawn at its frame within `bounds`. Returns a +1-retained
+/// `CGImageRef`, or `None` if the context can't be built.
+///
+/// `windows` must be ordered front-to-back; we draw them in reverse so nearer
+/// windows land on top, matching what `CGWindowListCreateImage` produced.
+fn composite_windows(
+    cid: SLSConnectionID,
+    bounds: CGRect,
+    windows: &[WindowFrame],
+    scale: f64,
+) -> Option<CGImageRef> {
+    let px_w = (bounds.size.width * scale).round().max(1.0) as usize;
+    let px_h = (bounds.size.height * scale).round().max(1.0) as usize;
     unsafe {
-        config.setWidth(px_w);
-        config.setHeight(px_h);
-        config.setShowsCursor(false);
-        config.setScalesToFit(true);
-        // Deep queue so the surface we're displaying isn't recycled out from under
-        // Core Animation before the next vsync swaps it (shallow depths showed as
-        // intermittent black flashes).
-        config.setQueueDepth(8);
-        if transparent {
-            config.setBackgroundColor(clear_cgcolor());
+        let space = CGColorSpaceCreateDeviceRGB();
+        if space.is_null() {
+            return None;
         }
-        if let Some(r) = source_rect {
-            config.setSourceRect(r);
+        let ctx = CGBitmapContextCreate(
+            std::ptr::null_mut(),
+            px_w,
+            px_h,
+            8,
+            0,
+            space,
+            KCG_BITMAP_INFO_BGRA,
+        );
+        CGColorSpaceRelease(space);
+        if ctx.is_null() {
+            return None;
         }
-        // Default pixel format is BGRA, which is what CALayer wants.
-    }
-    config
-}
+        // Work in CG-global points within `bounds`. The bitmap context is y-up
+        // with its origin at the bottom-left, while CG window frames are y-down
+        // from the top-left, so flip: scale to pixels, then map global y to a
+        // y-up axis whose origin is `bounds`' bottom edge.
+        CGContextScaleCTM(ctx, scale, scale);
+        CGContextTranslateCTM(ctx, -bounds.origin.x, bounds.origin.y + bounds.size.height);
 
-/// Build an `NSArray<SCWindow>` from the window-server ids that resolve to a
-/// shareable `SCWindow`, preserving order.
-fn scwindows_for(content: &SCShareableContent, ids: &[u32]) -> Retained<NSArray<SCWindow>> {
-    let windows: Vec<Retained<SCWindow>> =
-        ids.iter().filter_map(|&id| find_scwindow(content, id)).collect();
-    NSArray::from_retained_slice(&windows)
-}
-
-/// A running `SCStream` plus its frame mailbox. Dropping it stops capture.
-struct WindowStream {
-    stream: Retained<SCStream>,
-    // Kept alive for the stream's lifetime (the stream does not retain it for us
-    // in a way we can rely on); also where frames are stashed via its ivars.
-    _output: Retained<StreamOutput>,
-    slot: SurfaceSlot,
-}
-
-impl Drop for WindowStream {
-    fn drop(&mut self) {
-        unsafe { self.stream.stopCaptureWithCompletionHandler(None) };
+        // Back-to-front: nearer windows drawn last land on top.
+        for w in windows.iter().rev() {
+            let Some(image) = capture_window(cid, w.id) else {
+                continue;
+            };
+            // Draw rect in the flipped (y-up) coordinate space set above.
+            let dest = CGRect::new(
+                CGPoint::new(w.frame.origin.x, -(w.frame.origin.y + w.frame.size.height)),
+                w.frame.size,
+            );
+            CGContextDrawImage(ctx, dest, image);
+            CFRelease(image);
+        }
+        let image = CGBitmapContextCreateImage(ctx);
+        CGContextRelease(ctx);
+        if image.is_null() { None } else { Some(image) }
     }
 }
 
-/// Start a live `SCStream` for `filter` with `config`, feeding frames into a
-/// fresh slot. Returns `None` if the stream can't accept the output.
-fn start_stream(filter: &SCContentFilter, config: &SCStreamConfiguration) -> Option<WindowStream> {
-    let slot: SurfaceSlot = Arc::new(Mutex::new(None));
-    let output = StreamOutput::new(slot.clone());
-    let stream = unsafe {
-        SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), filter, config, None)
-    };
-    let proto = ProtocolObject::from_ref(&*output);
-    if unsafe {
-        stream.addStreamOutput_type_sampleHandlerQueue_error(
-            proto,
-            SCStreamOutputType::Screen,
-            None,
-        )
-    }
-    .is_err()
-    {
+/// Capture everything *behind* the window in `bounds` (window excluded), to use
+/// as the occluding backdrop. Composited from per-window SLS captures of the
+/// windows below the target (including the desktop). Returns a +1-retained
+/// `CGImageRef`.
+fn capture_backdrop(cid: SLSConnectionID, bounds: CGRect, wid: CGWindowID, scale: f64) -> Option<CGImageRef> {
+    let windows = windows_below(wid);
+    composite_windows(cid, bounds, &windows, scale)
+}
+
+/// Capture the windows stacked *in front of* the target into one image, to lay
+/// back over the proxy. The backdrop occludes the relocated real window by
+/// covering "everything below the target", but it is ordered above all other
+/// inactive windows, so it also hides any window that was in front of the target.
+/// Re-drawing those front windows on top of the proxy restores them; areas with
+/// no front window stay transparent so the proxy shows through.
+///
+/// `live_above_pid` (when set) names the app whose windows still render *live*
+/// above our overlay — the active app, unless we raised our level above it for a
+/// focused target. Those windows are left out: their live copy already shows, so
+/// including them would double their content over the proxy. Returns a
+/// +1-retained `CGImageRef`, or `None` if nothing qualifies.
+fn capture_foreground(
+    cid: SLSConnectionID,
+    bounds: CGRect,
+    target: WindowServerId,
+    live_above_pid: Option<pid_t>,
+    scale: f64,
+) -> Option<CGImageRef> {
+    // Layer-0 (normal) windows in front of the target, in front-to-back order.
+    let z = window_server::get_visible_windows_with_layer(Some(0));
+    let target_idx = z.iter().position(|w| w.id == target)?;
+    let windows: Vec<WindowFrame> = z[..target_idx]
+        .iter()
+        .filter(|w| live_above_pid != Some(w.pid))
+        .map(|w| WindowFrame { id: w.id.as_u32(), frame: w.frame })
+        .collect();
+    if windows.is_empty() {
         return None;
     }
-    unsafe { stream.startCaptureWithCompletionHandler(None) };
-    Some(WindowStream { stream, _output: output, slot })
-}
-
-/// All three live capture streams for one animation. Each `slot` is read by the
-/// main loop and set as its layer's contents.
-struct Streams {
-    proxy: Option<WindowStream>,
-    backdrop: Option<WindowStream>,
-    foreground: Option<WindowStream>,
-}
-
-/// Build and start the proxy / backdrop / foreground streams from one shareable-
-/// content fetch. `region` is the animation's bounding box in global CG points
-/// (the backdrop/foreground capture only this sub-rect of the display);
-/// `live_above_pid`, when set, is the app whose front windows stay live above our
-/// overlay and so are left out of the foreground filter (same rule as the legacy
-/// `capture_foreground`). `proxy_px` sizes the proxy's window-only capture.
-fn start_streams(
-    target: WindowServerId,
-    display_id: CGDirectDisplayID,
-    region: CGRect,
-    proxy_px: (usize, usize),
-    scale: f64,
-    live_above_pid: Option<pid_t>,
-    own_windows: &[u32],
-) -> Streams {
-    let empty = Streams {
-        proxy: None,
-        backdrop: None,
-        foreground: None,
-    };
-    let t_content = Instant::now();
-    let Some(content) = shareable_content() else {
-        return empty;
-    };
-    if std::env::var("GLIDE_DEBUG").is_ok() {
-        println!(
-            "  shareable_content fetch={:.0}ms",
-            t_content.elapsed().as_secs_f64() * 1000.0
-        );
-    }
-    let Some(display) = find_scdisplay(&content, display_id) else {
-        return empty;
-    };
-
-    // Layer-0 windows in front of the target, front-to-back (same source the
-    // legacy path used). `above` = everything in front; `front` excludes the
-    // windows still drawn live above our overlay (else their shadow doubles).
-    let z = window_server::get_visible_windows_with_layer(Some(0));
-    let target_idx = z.iter().position(|w| w.id == target);
-    let above: Vec<u32> = target_idx
-        .map(|i| z[..i].iter().map(|w| w.id.as_u32()).collect())
-        .unwrap_or_default();
-    let front: Vec<u32> = target_idx
-        .map(|i| {
-            z[..i]
-                .iter()
-                .filter(|w| live_above_pid != Some(w.pid))
-                .map(|w| w.id.as_u32())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Proxy: just the target window (desktop-independent), captured at window
-    // size. Transparent background so the window's rounded corners read as clear.
-    let proxy = find_scwindow(&content, target.as_u32()).and_then(|w| {
-        let filter = unsafe {
-            SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &w)
-        };
-        start_stream(&filter, &stream_config(proxy_px.0, proxy_px.1, None, true))
-    });
-
-    // The backdrop/foreground capture the same sub-region of the display.
-    let display_origin = unsafe { CGDisplayBounds(display_id) }.origin;
-    let src = CGRect::new(
-        CGPoint::new(
-            region.origin.x - display_origin.x,
-            region.origin.y - display_origin.y,
-        ),
-        region.size,
-    );
-    let region_px = (
-        (region.size.width * scale) as usize,
-        (region.size.height * scale) as usize,
-    );
-    let region_config =
-        |transparent| stream_config(region_px.0, region_px.1, Some(src), transparent);
-
-    // Backdrop: the display excluding the target, every window in front of it,
-    // and our own proxy windows (which are already on screen — without this the
-    // backdrop stream would capture them and feed back on itself). Exclude-filters
-    // keep the desktop/dock → "everything below the target".
-    let mut backdrop_excludes = above.clone();
-    backdrop_excludes.push(target.as_u32());
-    backdrop_excludes.extend_from_slice(own_windows);
-    let backdrop = {
-        let windows = scwindows_for(&content, &backdrop_excludes);
-        let filter = unsafe {
-            SCContentFilter::initWithDisplay_excludingWindows(
-                SCContentFilter::alloc(),
-                &display,
-                &windows,
-            )
-        };
-        start_stream(&filter, &region_config(false))
-    };
-
-    // Foreground: only the front windows we want re-drawn on top (include-filters
-    // drop the desktop/dock → transparent where there is no front window).
-    // DISABLED: the include-filter delivers black frames (see the latch site), and
-    // building/starting it added startup latency for no visible benefit. The
-    // `front` list is still computed above so this is a one-line re-enable.
-    const FOREGROUND_ENABLED: bool = false;
-    let foreground = if !FOREGROUND_ENABLED || front.is_empty() {
-        None
-    } else {
-        let windows = scwindows_for(&content, &front);
-        let filter = unsafe {
-            SCContentFilter::initWithDisplay_includingWindows(
-                SCContentFilter::alloc(),
-                &display,
-                &windows,
-            )
-        };
-        start_stream(&filter, &region_config(true))
-    };
-
-    Streams { proxy, backdrop, foreground }
+    // The composite has a clear (zeroed-alpha) background, so areas with no front
+    // window stay transparent and the proxy shows through.
+    composite_windows(cid, bounds, &windows, scale)
 }
 
 // ---------------------------------------------------------------------------
@@ -846,7 +713,6 @@ fn resolve_existing(wsid: WindowServerId) -> Option<Target> {
 /// Run the full proxy-window animation for `target`, moving it to `dest`.
 /// Blocks until the animation settles, then tears everything down.
 fn animate(target: &Target, dest: CGRect) {
-    let t_start = Instant::now();
     let mtm = MainThreadMarker::new().expect("animate must run on the main thread");
 
     // Run as an accessory (background) app and never activate. That is what lets
@@ -894,15 +760,46 @@ fn animate(target: &Target, dest: CGRect) {
     // front window. Otherwise the active app's windows stay on top, so they are
     // left out of the overlay to avoid doubling their shadow.
     let live_above_pid = (!focused).then_some(front_pid);
+
+    // 1 + 2: captures. The proxy goes first: its pixel size gives the scale that
+    // sizes the composited backdrop/foreground bitmaps.
+    let Some(proxy_img) = capture_window(cid, wid) else {
+        eprintln!("window capture failed (Screen Recording permission?)");
+        unsafe { SLSReleaseConnection(cid) };
+        return;
+    };
+
+    // Capture pixels-per-point, measured now while the window is settled at the
+    // origin. The capture thread uses it to drop mid-resize captures (whose
+    // pixel size lags the reported window size), and the composites use it to
+    // size their backing bitmaps.
+    let scale = {
+        let w = unsafe { CGImageGetWidth(proxy_img) } as f64;
+        if origin.size.width > 1.0 {
+            w / origin.size.width
+        } else {
+            2.0
+        }
+    };
+
+    // Backdrop: everything below the target in `backdrop_bounds`, composited from
+    // per-window SLS captures (the window itself is excluded by the below-window
+    // list). Captured while the window is still at the origin.
+    let Some(backdrop_img) = capture_backdrop(cid, backdrop_bounds, wid, scale) else {
+        eprintln!("backdrop capture failed (Screen Recording permission?)");
+        unsafe {
+            CFRelease(proxy_img);
+            SLSReleaseConnection(cid);
+        }
+        return;
+    };
+    // Snapshot the windows in front of the target now, while it's still at the
+    // origin, so we can restore them on top of the proxy (the backdrop would
+    // otherwise hide them). Null when there's nothing to restore — then we skip.
+    let foreground_img = capture_foreground(cid, backdrop_bounds, target.wsid, live_above_pid, scale);
     if debug {
         dump_z_order(target.wsid);
     }
-
-    // Pixels-per-point for the target's display, to size the SCK streams' backing
-    // stores. (No screenshots are taken here — all capture is via ScreenCaptureKit
-    // below — so the legacy `CGWindowListCreateImage`/`SLSHWCaptureWindowList`
-    // path, which triggers the macOS "private window picker" alert, is gone.)
-    let scale = display_scale(display_for(origin));
 
     // 3: create the windows: backdrop (opaque, hides the relocated real target)
     // and the proxy (animated) above it. Both are ordered in with `orderFront`
@@ -921,28 +818,38 @@ fn animate(target: &Target, dest: CGRect) {
     // level, but the foreground overlay below restores those.
     let win_level = if focused { level + 1 } else { level };
 
-    let backdrop =
-        ProxyWindow::new(mtm, backdrop_bounds, backdrop_bounds, win_level, true).without_shadow();
+    let backdrop = ProxyWindow::new(
+        mtm,
+        backdrop_bounds,
+        backdrop_bounds,
+        backdrop_img,
+        win_level,
+        true,
+    )
+    .without_shadow();
     let proxy_container = union_rect(origin, dest);
-    let proxy = ProxyWindow::new(mtm, proxy_container, origin, win_level, false);
-    // Foreground: live capture of whatever is in front of the target, covering the
-    // same area as the backdrop and stacked above the proxy. The backdrop hides
-    // everything below the target (including front windows); this lays the front
-    // windows back on top, and is transparent where there is no front window (its
-    // stream is `None` when there's nothing to show, leaving the layer empty).
-    let foreground =
-        ProxyWindow::new(mtm, backdrop_bounds, backdrop_bounds, win_level, false).without_shadow();
+    let proxy = ProxyWindow::new(mtm, proxy_container, origin, proxy_img, win_level, false);
+    // Foreground: a static snapshot of whatever was in front of the target,
+    // covering the same area as the backdrop and stacked above the proxy. The
+    // backdrop hides everything below the target (including front windows); this
+    // lays the front windows back on top. It's transparent wherever nothing was
+    // above the target, so the proxy shows through there. Static for the
+    // animation (the front windows don't move while we animate the target).
+    let foreground = foreground_img.map(|img| {
+        ProxyWindow::new(mtm, backdrop_bounds, backdrop_bounds, img, win_level, false)
+            .without_shadow()
+    });
 
-    // Order the windows in (backdrop < proxy < foreground) once their contents
-    // are latched (below) — showing an opaque backdrop before its first frame
-    // would flash black. The window *level* set above persists across `orderFront`.
-    let show_stack = || {
-        backdrop.order_in();
-        proxy.order_in();
-        foreground.order_in();
+    // Establish the stack: backdrop < proxy < foreground. The window *level* set
+    // above persists across `orderFront`, but the relative order among same-level
+    // windows does not, so we re-run this after re-showing past the pause below.
+    let restack = || {
         proxy.order_above(&backdrop);
-        foreground.order_above(&proxy);
+        if let Some(fg) = &foreground {
+            fg.order_above(&proxy);
+        }
     };
+    restack();
 
     if debug {
         if focused {
@@ -954,54 +861,63 @@ fn animate(target: &Target, dest: CGRect) {
         dump_z_order(target.wsid);
     }
 
-    // Live content via ScreenCaptureKit: three `SCStream`s (target window →
-    // proxy; display-minus-target-and-above → backdrop; front windows →
-    // foreground) feed frames into per-surface slots; the animation loop sets the
-    // latest frame's IOSurface as each layer's contents. The proxy stream's
-    // backing store is matched to each leg's destination window size (the real
-    // window is moved there instantly before we animate). Surfaces whose stream
-    // fails to start keep their seed bitmap (no live updates).
-    let display = display_for(origin);
-    let dest_px = (
-        (dest.size.width * scale) as usize,
-        (dest.size.height * scale) as usize,
-    );
-    let own_windows = [backdrop.id(), proxy.id(), foreground.id()];
-    let t_streams = Instant::now();
-    let streams = start_streams(
-        target.wsid,
-        display,
-        backdrop_bounds,
-        dest_px,
-        scale,
-        live_above_pid,
-        &own_windows,
-    );
-    let streams_ms = t_streams.elapsed().as_secs_f64() * 1000.0;
-    let slot_of = |s: &Option<WindowStream>| -> SurfaceSlot {
-        s.as_ref().map(|s| s.slot.clone()).unwrap_or_default()
-    };
-    let proxy_slot = slot_of(&streams.proxy);
-    let backdrop_slot = slot_of(&streams.backdrop);
-    let foreground_slot = slot_of(&streams.foreground);
-    // Only the foreground is refreshed live per frame. The backdrop is a *static
-    // occluder*: it must show "what's behind the target" frozen at the pre-move
-    // state, exactly as the old static snapshot did. Re-rendering it live flashes
-    // black while the target window is relocated by AX (SCK briefly composites the
-    // vacated region as black). So both are latched to one frame below.
-    //
-    // The foreground is likewise static: its `includingWindows` stream delivers
-    // black frames during warm-up (and the front window covers much of the
-    // region), which painted solid black over the proxy. The front windows don't
-    // move during the sub-second animation, so a single snapshot is correct.
-    // Only the proxy (the animating window) is refreshed live.
-    let others: [(&ProxyWindow, &SurfaceSlot); 0] = [];
-    let has_foreground = streams.foreground.is_some();
+    // Live content: a background thread captures the target window on its *own*
+    // SLS connection (connections are thread-affine) and atomically swaps the
+    // latest frame into `live`; the animation loop redraws the proxy from it.
+    let live: Arc<Mutex<Option<SendImage>>> = Arc::new(Mutex::new(None));
+    let stop = Arc::new(AtomicBool::new(false));
+    // The size (CG points) the real window is currently being moved toward. The
+    // capture thread only trusts a capture once the window has actually reached
+    // this size — both its reported bounds and its backing-store pixels. That
+    // rejects the mid-resize blank captures regardless of which of the two lags.
+    let target_size = Arc::new(Mutex::new((origin.size.width, origin.size.height)));
+    let capture_thread = {
+        let live = live.clone();
+        let stop = stop.clone();
+        let target_size = target_size.clone();
+        std::thread::spawn(move || {
+            let mut cap_cid: SLSConnectionID = 0;
+            unsafe { SLSNewConnection(0, &mut cap_cid) };
+            while !stop.load(Ordering::Relaxed) {
+                if let Some(img) = capture_window(cap_cid, wid) {
+                    let si = SendImage(img);
 
-    // 5: drive the proxy on the MAIN thread, paced by a CVDisplayLink on the
-    // *window's* display, so a ProMotion builtin ticks up to 120Hz instead of the
-    // active-displays default.
+                    // Trust a capture only once the window has fully reached the
+                    // size we're animating toward: its reported bounds equal the
+                    // target AND its backing-store pixels equal reported×scale.
+                    // During a resize those two settle a frame or two apart, and a
+                    // capture taken in that gap comes back mostly blank, causing an
+                    // intermittent see-through flash and corner artifacts.
+                    // Gating on both keeps `live` to fully painted frames.
+                    let (pw, ph) =
+                        unsafe { (CGImageGetWidth(si.0) as f64, CGImageGetHeight(si.0) as f64) };
+                    let mut rb = CGRect::default();
+                    unsafe { SLSGetWindowBounds(cap_cid, wid, &mut rb) };
+                    let (tw, th) = *target_size.lock().unwrap();
+                    let pt_tol = 1.5;
+                    let px_tol = 2.0 * scale + 1.0;
+                    let reported_ok = (rb.size.width - tw).abs() <= pt_tol
+                        && (rb.size.height - th).abs() <= pt_tol;
+                    let px_ok = (pw - rb.size.width * scale).abs() <= px_tol
+                        && (ph - rb.size.height * scale).abs() <= px_tol;
+
+                    if reported_ok && px_ok {
+                        *live.lock().unwrap() = Some(si);
+                    }
+                    // else: `si` drops here, releasing the mid-resize capture.
+                    // FIXME: (actually we leak it). Retain::from_raw, CGImage::width
+                }
+                std::thread::sleep(Duration::from_millis(6));
+            }
+            unsafe { SLSReleaseConnection(cap_cid) };
+        })
+    };
+
+    // 5: drive the proxy on the MAIN thread (which owns the SLS connection),
+    // paced by a CVDisplayLink on the *window's* display, so a ProMotion
+    // builtin ticks up to 120Hz instead of the active-displays default.
     let sem = unsafe { dispatch_semaphore_create(0) };
+    let display = display_for(origin);
     let mut link: CVDisplayLinkRef = std::ptr::null_mut();
     unsafe {
         CVDisplayLinkCreateWithCGDisplay(display, &mut link);
@@ -1016,99 +932,45 @@ fn animate(target: &Target, dest: CGRect) {
         CVDisplayLinkStart(link);
     }
 
-    // Wait briefly for the first frames to arrive so the backdrop actually
-    // occludes (and the proxy has content) before we relocate the real window —
-    // otherwise the opaque backdrop would flash black, and the real window's jump
-    // to the destination would be visible, for the frame or two before SCK
-    // delivers. The stream delegates run on a background queue, so the slots fill
-    // while we pump.
-    let t_wait = Instant::now();
-    let deadline = Instant::now() + Duration::from_millis(800);
-    let ready = |slot: &SurfaceSlot| slot.lock().unwrap().is_some();
-    // Only the proxy and backdrop are shown at the start, so only wait for those.
-    // (The foreground is currently disabled; waiting for its first frame added
-    // ~hundreds of ms to startup for no visible benefit.)
-    let _ = has_foreground;
-    while Instant::now() < deadline && (!ready(&proxy_slot) || !ready(&backdrop_slot)) {
-        pump_runloop(0.01);
-    }
-    let first_frame_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
-
-    if debug {
-        println!(
-            "after wait: proxy={} backdrop={} foreground={} sck_frames={}",
-            ready(&proxy_slot),
-            ready(&backdrop_slot),
-            ready(&foreground_slot),
-            SCK_FRAMES.load(Ordering::Relaxed),
-        );
-        println!(
-            "startup timing: start_streams={streams_ms:.0}ms (incl. shareable_content), \
-             first_frame_wait={first_frame_ms:.0}ms, total_to_animate={:.0}ms",
-            t_start.elapsed().as_secs_f64() * 1000.0,
-        );
-    }
-
-    // Latch the backdrop and foreground to their current (pre-move) frames and
-    // leave them frozen for the animation. The backdrop occludes the relocated
-    // real window; the foreground re-lays the windows that were in front of it.
-    // The desktop and front windows don't meaningfully change in under a second,
-    // and freezing avoids SCK's black warm-up/transition frames.
-    let latch = |window: &ProxyWindow, slot: &SurfaceSlot| {
-        if let Some(surface) = slot.lock().unwrap().as_ref() {
-            CATransaction::begin();
-            CATransaction::setDisableActions(true);
-            window.set_contents(surface.as_contents());
-            CATransaction::commit();
-        }
-    };
-    latch(&backdrop, &backdrop_slot);
-    // The proxy keeps updating live in `run_spring`; latch its first frame too so
-    // it isn't transparent for one frame when shown.
-    latch(&proxy, &proxy_slot);
-    // FOREGROUND DISABLED pending a fix. The SCK `includingWindows` filter for the
-    // front-window overlay delivers solid-black frames (the proxy window-filter
-    // and backdrop exclude-filter are both clean), so latching it painted black
-    // over the animation. Leaving the foreground layer empty (transparent) keeps
-    // the animation flash-free; the cost is that an *inactive* window sitting in
-    // front of the target is not re-laid on top during the move (problem 1). The
-    // front-window list + stream are still built (see `start_streams`) for when
-    // the include-filter issue is solved.
-    let _foreground_disabled = (&foreground, &foreground_slot);
-
-    // Now that every layer holds a frame, show the stack (proxy then updates live).
-    show_stack();
-
     // 4 + forward animation: move the real window to its destination (occluded
-    // by the backdrop), then animate the proxy origin -> dest. The stream is
-    // already sized to the destination, so its frames match the relocated window.
+    // by the backdrop), then animate the proxy origin -> dest. The capture
+    // thread's size-match filter (above) keeps mid-resize blank captures out of
+    // `live`, so no settle delay is needed here.
+    *target_size.lock().unwrap() = (dest.size.width, dest.size.height);
     move_real_window(&target.elem, dest);
-    run_spring(&proxy, &proxy_slot, &others, origin, dest, sem);
+    run_spring(&proxy, &live, origin, dest, sem);
 
-    // Pause at the destination. No hide/show dance is needed (unlike the old
-    // static-snapshot proxy): the proxy is live, so it keeps showing the window's
-    // current content at the destination while we wait.
+    // Pause for a second to show the window at its destination.
+    backdrop.hide();
+    proxy.hide();
+    if let Some(fg) = &foreground {
+        fg.hide();
+    }
     pump_runloop(1.0);
+    backdrop.show();
+    proxy.show();
+    if let Some(fg) = &foreground {
+        fg.show();
+    }
+    restack();
 
-    // QoL: animate back. The proxy stream stays at the destination backing size
-    // (scalesToFit handles the smaller window), so no reconfigure is needed.
+    // QoL: animate back. Move the real window home, then animate dest -> origin.
+    *target_size.lock().unwrap() = (origin.size.width, origin.size.height);
     move_real_window(&target.elem, origin);
-    run_spring(&proxy, &proxy_slot, &others, dest, origin, sem);
+    run_spring(&proxy, &live, dest, origin, sem);
 
-    // 6: stop the link and capture stream, then tear the proxy windows down.
+    // 6: stop the capture thread and link, then tear the proxy windows down.
+    stop.store(true, Ordering::Relaxed);
+    let _ = capture_thread.join();
     unsafe {
         CVDisplayLinkStop(link);
         CVDisplayLinkRelease(link);
         dispatch_release(sem);
     }
-    drop(streams);
     drop(foreground);
     drop(proxy);
     drop(backdrop);
     unsafe { SLSReleaseConnection(cid) };
-    if debug {
-        println!("SCK frames delivered: {}", SCK_FRAMES.load(Ordering::Relaxed));
-    }
     println!("animation complete");
 }
 
@@ -1150,8 +1012,7 @@ fn move_real_window(elem: &AXUIElement, frame: CGRect) {
 /// shows live content (e.g. text typed in another app).
 fn run_spring(
     proxy: &ProxyWindow,
-    live: &SurfaceSlot,
-    others: &[(&ProxyWindow, &SurfaceSlot)],
+    live: &Mutex<Option<SendImage>>,
     from: CGRect,
     to: CGRect,
     sem: DispatchSemaphore,
@@ -1177,23 +1038,18 @@ fn run_spring(
         let v = spring.velocity_at(now);
         frames += 1;
 
-        // Swap in the latest captured frame's IOSurface and reposition the bitmap
-        // in ONE no-actions transaction, so contents and geometry are presented
-        // together and neither implicitly animates. When the slot is empty (SCK
-        // not yet delivering, or unavailable) we leave the existing contents.
+        // Swap in the latest captured frame and reposition the bitmap in ONE
+        // no-actions transaction, so contents and geometry are presented
+        // together and neither implicitly animates. `live` only holds captures
+        // whose size matches the window (see the capture thread), so there's no
+        // mid-resize blank frame to guard against here.
         let cur = lerp_rect(from, to, s);
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        if let Some(surface) = live.lock().unwrap().as_ref() {
-            proxy.set_contents(surface.as_contents());
+        if let Some(img) = live.lock().unwrap().as_ref() {
+            proxy.set_contents(img.0);
         }
         proxy.set_content_rect(cur);
-        // Refresh the live backdrop/foreground contents (their geometry is fixed).
-        for (window, slot) in others {
-            if let Some(surface) = slot.lock().unwrap().as_ref() {
-                window.set_contents(surface.as_contents());
-            }
-        }
         CATransaction::commit();
         // Turn the run loop so AppKit/Core Animation commit this frame. A
         // zero-length run avoids the ~20ms block of a timed one, keeping us near
@@ -1307,26 +1163,6 @@ fn display_for(rect: CGRect) -> CGDirectDisplayID {
         CGGetDisplaysWithPoint(center, 1, &mut id, &mut count);
         if count == 0 { CGMainDisplayID() } else { id }
     }
-}
-
-/// Pixels-per-point (backing scale factor) of `display`, used to size the SCK
-/// streams' backing stores. Matches the `NSScreen` by origin (as `visible_frame`
-/// does); falls back to 2.0 (Retina) if no match.
-fn display_scale(display: CGDirectDisplayID) -> f64 {
-    let Some(mtm) = MainThreadMarker::new() else {
-        return 2.0;
-    };
-    let db = unsafe { CGDisplayBounds(display) };
-    let primary_h = unsafe { CGDisplayBounds(CGMainDisplayID()) }.size.height;
-    NSScreen::screens(mtm)
-        .iter()
-        .find(|s| {
-            let f = s.frame();
-            let cg_y = primary_h - (f.origin.y + f.size.height);
-            (f.origin.x - db.origin.x).abs() < 1.0 && (cg_y - db.origin.y).abs() < 1.0
-        })
-        .map(|s| s.backingScaleFactor())
-        .unwrap_or(2.0)
 }
 
 fn slow_response() -> f64 {
