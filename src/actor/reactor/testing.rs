@@ -251,11 +251,15 @@ impl Apps {
                         ));
                     }
                 }
-                Request::SetWindowPos(wid, pos, txid) => {
+                Request::AnimationFrame { wid, frame, set_size, txid } => {
                     let window = self.windows.entry(wid).or_default();
                     window.last_seen_txid = txid;
                     let old_frame = window.frame;
-                    window.frame.origin = pos;
+                    if set_size {
+                        window.frame = frame;
+                    } else {
+                        window.frame.origin = frame.origin;
+                    }
                     if !window.animating && !old_frame.same_as(window.frame) {
                         events.push(Event::WindowFrameChanged(
                             wid,

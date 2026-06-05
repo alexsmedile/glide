@@ -229,7 +229,12 @@ impl Animation {
                     origin: window.start.origin,
                     size: window.finish.size,
                 };
-                _ = window.handle.send(Request::SetWindowFrame(window.wid, frame, window.txid));
+                _ = window.handle.send(Request::AnimationFrame {
+                    wid: window.wid,
+                    frame,
+                    set_size: true,
+                    txid: window.txid,
+                });
             }
         }
     }
@@ -239,9 +244,16 @@ impl Animation {
             if keep.contains(&window.wid) {
                 continue;
             }
-            _ = window
-                .handle
-                .send(Request::SetWindowFrame(window.wid, window.finish, window.txid));
+            // Jump to the final frame and end the animation. Sent as a set_size
+            // animation frame (not SetWindowFrame) so it records the window's
+            // final frame for the EndWindowAnimation fixup, and skips the
+            // enhanced-UI toggle and retries while the animation is still active.
+            _ = window.handle.send(Request::AnimationFrame {
+                wid: window.wid,
+                frame: window.finish,
+                set_size: true,
+                txid: window.txid,
+            });
             _ = window.handle.send(Request::EndWindowAnimation(window.wid));
         }
     }
@@ -250,12 +262,18 @@ impl Animation {
         let t = f64::from(frame) / f64::from(self.frames);
         for window in &self.windows {
             let mut rect = get_frame(window.start, window.finish, t);
-            if frame * 2 == self.frames || frame == self.frames {
+            // Don't animate size, too slow. Resize halfway through and again at
+            // the end, in case it got clipped during the animation.
+            let set_size = frame * 2 == self.frames || frame == self.frames;
+            if set_size {
                 rect.size = window.finish.size;
-                _ = window.handle.send(Request::SetWindowFrame(window.wid, rect, window.txid));
-            } else {
-                _ = window.handle.send(Request::SetWindowPos(window.wid, rect.origin, window.txid));
             }
+            _ = window.handle.send(Request::AnimationFrame {
+                wid: window.wid,
+                frame: rect,
+                set_size,
+                txid: window.txid,
+            });
         }
     }
 
@@ -278,11 +296,8 @@ impl Animation {
     }
 
     fn skip_to_end_and_end(self) {
-        if self.windows.is_empty() {
-            return;
-        }
-        self.skip_to_end();
-        self.end();
+        // Finish every window: jump it to its final frame and end its animation.
+        self.finish_windows_not_in(&[]);
     }
 }
 
@@ -350,14 +365,37 @@ mod tests {
         }
     }
 
-    fn assert_set_window_pos(request: &Request, wid: WindowId, pos: CGPoint) {
+    fn assert_animation_frame(request: &Request, wid: WindowId, frame: CGRect) {
         match request {
-            Request::SetWindowPos(req_wid, req_pos, txid) => {
+            Request::AnimationFrame {
+                wid: req_wid,
+                frame: req_frame,
+                set_size,
+                txid,
+            } => {
                 assert_eq!(*req_wid, wid);
-                assert_eq!(*req_pos, pos);
+                assert_eq!(*req_frame, frame);
+                assert!(*set_size, "expected a set_size frame");
                 assert_eq!(*txid, TransactionId::default());
             }
-            _ => panic!("expected SetWindowPos, got {request:?}"),
+            _ => panic!("expected AnimationFrame, got {request:?}"),
+        }
+    }
+
+    fn assert_animation_pos(request: &Request, wid: WindowId, pos: CGPoint) {
+        match request {
+            Request::AnimationFrame {
+                wid: req_wid,
+                frame,
+                set_size,
+                txid,
+            } => {
+                assert_eq!(*req_wid, wid);
+                assert_eq!(frame.origin, pos);
+                assert!(!*set_size, "expected a position-only frame");
+                assert_eq!(*txid, TransactionId::default());
+            }
+            _ => panic!("expected AnimationFrame, got {request:?}"),
         }
     }
 
@@ -388,7 +426,7 @@ mod tests {
 
         manager.tick();
         let continuing_frame = manager.active.as_ref().unwrap().current_frames()[0].1;
-        assert_set_window_pos(&collect_requests(&mut rx)[0], wid, continuing_frame.origin);
+        assert_animation_pos(&collect_requests(&mut rx)[0], wid, continuing_frame.origin);
 
         manager.handle_message(Message::Replace(second));
         assert!(collect_requests(&mut rx).is_empty());
@@ -398,7 +436,7 @@ mod tests {
 
         manager.tick();
         let expected_next = get_frame(resumed_start, rect(80.0, 90.0, 10.0, 10.0), 1.0 / 30.0);
-        assert_set_window_pos(&collect_requests(&mut rx)[0], wid, expected_next.origin);
+        assert_animation_pos(&collect_requests(&mut rx)[0], wid, expected_next.origin);
     }
 
     #[test]
@@ -451,7 +489,7 @@ mod tests {
         let requests = collect_requests(&mut rx);
         assert_eq!(requests.len(), 3);
         assert!(matches!(requests[0], Request::BeginWindowAnimation(req_wid) if req_wid == wid3));
-        assert_set_window_frame(&requests[1], wid2, rect(60.0, 60.0, 10.0, 10.0));
+        assert_animation_frame(&requests[1], wid2, rect(60.0, 60.0, 10.0, 10.0));
         assert!(matches!(requests[2], Request::EndWindowAnimation(req_wid) if req_wid == wid2));
     }
 
@@ -480,7 +518,7 @@ mod tests {
         let requests = collect_requests(&mut rx);
         assert_eq!(requests.len(), 4);
         assert!(matches!(requests[0], Request::BeginWindowAnimation(req_wid) if req_wid == wid));
-        assert_set_window_frame(&requests[1], wid, rect(50.0, 60.0, 10.0, 10.0));
+        assert_animation_frame(&requests[1], wid, rect(50.0, 60.0, 10.0, 10.0));
         assert!(matches!(requests[2], Request::EndWindowAnimation(req_wid) if req_wid == wid));
         assert_set_window_frame(&requests[3], wid, rect(80.0, 90.0, 10.0, 10.0));
     }

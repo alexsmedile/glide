@@ -33,7 +33,7 @@ use core_foundation::runloop::CFRunLoop;
 use core_foundation::string::CFString;
 use objc2::rc::Retained;
 use objc2_app_kit::NSRunningApplication;
-use objc2_core_foundation::{CGPoint, CGRect};
+use objc2_core_foundation::CGRect;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{
     UnboundedReceiver as Receiver, UnboundedSender as Sender, WeakUnboundedSender,
@@ -41,8 +41,6 @@ use tokio::sync::mpsc::{
 };
 use tokio::sync::oneshot;
 use tokio::{join, select};
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 
@@ -128,8 +126,28 @@ pub enum Request {
     Terminate,
     GetVisibleWindows,
 
+    /// Set a window's frame outside of an animation. Toggles enhanced UI around
+    /// the write and retries. See [`Request::AnimationFrame`] for the per-frame
+    /// variant used during animations.
     SetWindowFrame(WindowId, CGRect, TransactionId),
-    SetWindowPos(WindowId, CGPoint, TransactionId),
+
+    /// A single frame of an in-progress animation, sent between
+    /// [`Request::BeginWindowAnimation`] and [`Request::EndWindowAnimation`].
+    ///
+    /// When `set_size` is false only the position is written, which is much
+    /// cheaper than a resize; callers should set the size sparingly. No
+    /// enhanced-UI toggle or retries are performed, since enhanced UI is already
+    /// disabled for the duration of the animation.
+    ///
+    /// These are coalesced in the app thread: only the latest frame per window
+    /// in a drained batch is applied, so a backlog that piled up while the app
+    /// or AX API was slow collapses instead of writing each stale position.
+    AnimationFrame {
+        wid: WindowId,
+        frame: CGRect,
+        set_size: bool,
+        txid: TransactionId,
+    },
 
     /// Temporarily suspend position and size update events for this window.
     BeginWindowAnimation(WindowId),
@@ -187,16 +205,27 @@ struct State {
     raises_tx: Sender<(Span, RaiseRequest)>,
     active_window_animations: u32,
     restore_enhanced_ui_on_last_end: bool,
+    /// Latest animation frame per window, awaiting a flush. See
+    /// [`Request::AnimationFrame`].
+    pending_frames: HashMap<WindowId, PendingFrame>,
 }
 
 struct WindowState {
     elem: AXUIElement,
     is_standard: bool,
     last_seen_txid: TransactionId,
-    is_animating: bool,
-    /// The last frame requested via [`Request::SetWindowFrame`] during an animation.
+    /// The last frame requested via [`Request::AnimationFrame`] with `set_size`.
     /// Used to apply a deferred full-frame fixup in [`Request::EndWindowAnimation`].
     last_animation_frame: Option<CGRect>,
+}
+
+/// A coalesced [`Request::AnimationFrame`], buffered in [`State::pending_frames`]
+/// until it is flushed.
+struct PendingFrame {
+    span: Span,
+    frame: CGRect,
+    set_size: bool,
+    txid: TransactionId,
 }
 
 const APP_NOTIFICATIONS: &[&str] = &[
@@ -242,48 +271,110 @@ impl State {
 
     async fn handle_incoming(
         this: &RefCell<Self>,
-        requests_rx: Receiver<(Span, Request)>,
-        notifications_rx: Receiver<(AXUIElement, String)>,
+        mut requests_rx: Receiver<(Span, Request)>,
+        mut notifications_rx: Receiver<(AXUIElement, String)>,
     ) {
-        pub enum Incoming {
-            Notification((AXUIElement, String)),
-            Request((Span, Request)),
-        }
-
-        let mut merged = StreamExt::merge(
-            UnboundedReceiverStream::new(requests_rx).map(Incoming::Request),
-            UnboundedReceiverStream::new(notifications_rx).map(Incoming::Notification),
-        );
-
-        while let Some(incoming) = merged.next().await {
-            let mut this = this.borrow_mut();
-            match incoming {
-                Incoming::Request((span, mut request)) => {
-                    let _guard = span.enter();
-                    debug!(?this.bundle_id, ?this.pid, ?request, "Got request");
-                    match this.handle_request(&mut request) {
-                        Ok(should_terminate) if should_terminate => break,
-                        Ok(_) => (),
-                        #[allow(non_upper_case_globals)]
-                        Err(accessibility::Error::Ax(kAXErrorCannotComplete))
-                            if this.running_app.isTerminated() =>
-                        {
-                            // The app does not appear to be running anymore.
-                            // Normally this would be noticed by notification_center,
-                            // but the notification doesn't always happen.
-                            warn!(?this.bundle_id, ?this.pid, "Application terminated without notification");
-                            // End the thread immediately so we don't keep logging errors.
-                            this.send_event(Event::ApplicationThreadTerminated(this.pid));
-                            break;
-                        }
-                        Err(err) => {
-                            warn!(?this.bundle_id, ?this.pid, ?request, "Error handling request: {err}");
-                        }
+        loop {
+            // Process requests in batches so we can coalesce stale animation
+            // frames. Requests are biased over notifications because during an
+            // animation notifications for the animated windows are suspended
+            // anyway, and we want to drain the whole backlog at once.
+            let batch = select! {
+                biased;
+                req = requests_rx.recv() => {
+                    let Some(req) = req else { break };
+                    let mut batch = vec![req];
+                    // Drain everything else that is already queued without
+                    // blocking, so a slow app's backlog can collapse.
+                    while let Ok(req) = requests_rx.try_recv() {
+                        batch.push(req);
                     }
+                    batch
                 }
-                Incoming::Notification((elem, notif)) => {
-                    this.handle_notification(elem, &notif);
+                notif = notifications_rx.recv() => {
+                    let Some((elem, notif)) = notif else { break };
+                    this.borrow_mut().handle_notification(elem, &notif);
+                    continue;
                 }
+            };
+            if Self::handle_request_batch(this, batch) {
+                break;
+            }
+        }
+    }
+
+    /// Handles a batch of requests, then applies any animation frames that
+    /// weren't already flushed by an [`Request::EndWindowAnimation`]. Returns
+    /// whether the actor should terminate.
+    fn handle_request_batch(this: &RefCell<Self>, batch: Vec<(Span, Request)>) -> bool {
+        for (span, mut request) in batch {
+            let mut this = this.borrow_mut();
+            let _guard = span.enter();
+            debug!(?this.bundle_id, ?this.pid, ?request, "Got request");
+            match this.handle_request(&mut request) {
+                Ok(should_terminate) if should_terminate => return true,
+                Ok(_) => (),
+                #[allow(non_upper_case_globals)]
+                Err(accessibility::Error::Ax(kAXErrorCannotComplete))
+                    if this.running_app.isTerminated() =>
+                {
+                    // The app does not appear to be running anymore.
+                    // Normally this would be noticed by notification_center,
+                    // but the notification doesn't always happen.
+                    warn!(?this.bundle_id, ?this.pid, "Application terminated without notification");
+                    // End the thread immediately so we don't keep logging errors.
+                    this.send_event(Event::ApplicationThreadTerminated(this.pid));
+                    return true;
+                }
+                Err(err) => {
+                    warn!(?this.bundle_id, ?this.pid, ?request, "Error handling request: {err}");
+                }
+            }
+        }
+        this.borrow_mut().flush_all_frames();
+        false
+    }
+
+    /// Applies the latest pending animation frame for `wid`, if any. See
+    /// [`Request::AnimationFrame`].
+    fn flush_frames(&mut self, wid: WindowId) -> Result<(), accessibility::Error> {
+        let Some(PendingFrame { span, frame, set_size, txid }) = self.pending_frames.remove(&wid)
+        else {
+            return Ok(());
+        };
+        let _guard = span.enter();
+        // Enhanced UI is already disabled for the animation, so there is no toggle
+        // here, and we write once without retries to keep each frame cheap. The
+        // deferred fixup in EndWindowAnimation corrects the final frame.
+        let window = self.window_mut(wid)?;
+        window.last_seen_txid = txid;
+        if set_size {
+            window.last_animation_frame = Some(frame);
+            set_window_frame_once(&window.elem, frame)?;
+        } else {
+            trace("set_position", &window.elem, || {
+                window.elem.set_position(frame.origin.to_cgtype())
+            })?;
+        }
+        let frame = trace("frame", &window.elem, || window.elem.frame())?;
+        self.send_event(Event::WindowFrameChanged(
+            wid,
+            frame.to_icrate(),
+            txid,
+            Requested(true),
+            // We don't need to check the mouse state since we know this change was
+            // requested by the reactor.
+            None,
+        ));
+        Ok(())
+    }
+
+    /// Applies all pending animation frames, e.g. at the end of a batch.
+    fn flush_all_frames(&mut self) {
+        let wids: Vec<WindowId> = self.pending_frames.keys().copied().collect();
+        for wid in wids {
+            if let Err(e) = self.flush_frames(wid) {
+                warn!(?wid, "Failed to apply animation frame: {e}");
             }
         }
     }
@@ -413,11 +504,10 @@ impl State {
         ///
         /// See docs for [`AXUIElementExt::enhanced_user_interface`].
         fn without_enhanced<R>(
-            is_animating: bool,
             app: &AXUIElement,
             f: impl FnOnce() -> Result<R, accessibility::Error>,
         ) -> Result<R, accessibility::Error> {
-            if !is_animating && let Ok(true) = app.enhanced_user_interface() {
+            if let Ok(true) = app.enhanced_user_interface() {
                 _ = trace("set_enhanced_user_interface(false)", app, || {
                     app.set_enhanced_user_interface(false)
                 });
@@ -469,43 +559,26 @@ impl State {
                     known_visible,
                 });
             }
-            &mut Request::SetWindowPos(wid, pos, txid) => {
-                let app_is_animating = self.active_window_animations > 0;
-                let app_elem = &self.app.clone();
-                let window = self.window_mut(wid)?;
-                window.last_seen_txid = txid;
-                without_enhanced(app_is_animating, app_elem, || {
-                    trace("set_position", &window.elem, || {
-                        window.elem.set_position(pos.to_cgtype())
-                    })
-                })?;
-                let frame = trace("frame", &window.elem, || window.elem.frame())?;
-                self.send_event(Event::WindowFrameChanged(
+            &mut Request::AnimationFrame { wid, frame, set_size, txid } => {
+                // Coalesce to the latest frame per window, overwriting any earlier
+                // pending one. Applied by flush_frames on EndWindowAnimation or at
+                // the end of the batch. This skips stale frames that piled up while
+                // the app or AX API was slow to respond.
+                self.pending_frames.insert(
                     wid,
-                    frame.to_icrate(),
-                    txid,
-                    Requested(true),
-                    // We don't need to check the mouse state since we know this
-                    // change was requested by the reactor.
-                    None,
-                ));
+                    PendingFrame {
+                        span: Span::current(),
+                        frame,
+                        set_size,
+                        txid,
+                    },
+                );
             }
             &mut Request::SetWindowFrame(wid, frame, txid) => {
-                let app_is_animating = self.active_window_animations > 0;
                 let app_elem = &self.app.clone();
                 let window = self.window_mut(wid)?;
                 window.last_seen_txid = txid;
-                if window.is_animating {
-                    window.last_animation_frame = Some(frame);
-                }
-                without_enhanced(app_is_animating, app_elem, || {
-                    if window.is_animating {
-                        set_window_frame_once(&window.elem, frame)?;
-                    } else {
-                        set_window_frame_with_retries(&window.elem, frame)?;
-                    }
-                    Ok(())
-                })?;
+                without_enhanced(app_elem, || set_window_frame_with_retries(&window.elem, frame))?;
                 let frame = trace("frame", &window.elem, || window.elem.frame())?;
                 self.send_event(Event::WindowFrameChanged(
                     wid,
@@ -532,12 +605,16 @@ impl State {
                     }
                 }
                 let window = self.window_mut(wid)?;
-                window.is_animating = true;
                 window.last_animation_frame = None;
                 let elem = window.elem.clone();
                 self.stop_notifications_for_animation(&elem);
             }
             &mut Request::EndWindowAnimation(wid) => {
+                // Apply the latest pending frame for this window before ending the
+                // animation, so the fixup below targets the final frame.
+                if let Err(e) = self.flush_frames(wid) {
+                    warn!(?wid, "Failed to flush animation frame on end: {e}");
+                }
                 let remaining_animations = if self.active_window_animations == 0 {
                     warn!(?wid, "Got EndWindowAnimation without a matching begin");
                     0
@@ -554,7 +631,6 @@ impl State {
                     }
                     return Ok(false);
                 };
-                window.is_animating = false;
                 let last_animation_frame = window.last_animation_frame.take();
                 let elem = window.elem.clone();
                 let last_seen_txid = window.last_seen_txid;
@@ -1003,7 +1079,6 @@ impl State {
                 elem,
                 last_seen_txid: TransactionId::default(),
                 is_standard: info.is_standard,
-                is_animating: false,
                 last_animation_frame: None,
             },
         );
@@ -1144,6 +1219,7 @@ fn app_thread_main(
         raises_tx,
         active_window_animations: 0,
         restore_enhanced_ui_on_last_end: false,
+        pending_frames: HashMap::default(),
     };
 
     Executor::run(state.run(
