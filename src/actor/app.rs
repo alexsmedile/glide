@@ -356,16 +356,6 @@ impl State {
                 window.elem.set_position(frame.origin.to_cgtype())
             })?;
         }
-        let frame = trace("frame", &window.elem, || window.elem.frame())?;
-        self.send_event(Event::WindowFrameChanged(
-            wid,
-            frame.to_icrate(),
-            txid,
-            Requested(true),
-            // We don't need to check the mouse state since we know this change was
-            // requested by the reactor.
-            None,
-        ));
         Ok(())
     }
 

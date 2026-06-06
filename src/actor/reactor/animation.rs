@@ -244,10 +244,6 @@ impl Animation {
             if keep.contains(&window.wid) {
                 continue;
             }
-            // Jump to the final frame and end the animation. Sent as a set_size
-            // animation frame (not SetWindowFrame) so it records the window's
-            // final frame for the EndWindowAnimation fixup, and skips the
-            // enhanced-UI toggle and retries while the animation is still active.
             _ = window.handle.send(Request::AnimationFrame {
                 wid: window.wid,
                 frame: window.finish,
