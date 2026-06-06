@@ -146,9 +146,10 @@ impl ActiveAnimation {
     }
 
     fn replace_with(self, mut next: Animation) -> Self {
-        let continuing = next.patch_starts_from(self.current_frames());
+        let current = self.current_frames();
+        let continuing = next.patch_starts_from(&current);
         next.begin_windows_not_in(&continuing);
-        self.animation.finish_windows_not_in(&continuing);
+        next.carry_over(self.animation, &current);
         Self { animation: next, next_frame: 1 }
     }
 
@@ -239,11 +240,8 @@ impl Animation {
         }
     }
 
-    fn finish_windows_not_in(&self, keep: &[WindowId]) {
+    fn finish_all(&self) {
         for window in &self.windows {
-            if keep.contains(&window.wid) {
-                continue;
-            }
             _ = window.handle.send(Request::AnimationFrame {
                 wid: window.wid,
                 frame: window.finish,
@@ -279,9 +277,9 @@ impl Animation {
         }
     }
 
-    fn patch_starts_from(&mut self, current_frames: Vec<(WindowId, CGRect)>) -> Vec<WindowId> {
+    fn patch_starts_from(&mut self, current_frames: &[(WindowId, CGRect)]) -> Vec<WindowId> {
         let mut continuing = Vec::new();
-        for (wid, current_frame) in current_frames {
+        for &(wid, current_frame) in current_frames {
             let Some(window) = self.windows.iter_mut().find(|window| window.wid == wid) else {
                 continue;
             };
@@ -291,9 +289,27 @@ impl Animation {
         continuing
     }
 
+    /// Pull in windows from a previous animation that this one doesn't mention,
+    /// so they keep animating from their current position toward their original
+    /// destination instead of jumping there. Their animations are already begun,
+    /// so we only adopt them, patching their start to the current frame.
+    fn carry_over(&mut self, previous: Animation, current_frames: &[(WindowId, CGRect)]) {
+        for mut window in previous.windows {
+            if self.windows.iter().any(|existing| existing.wid == window.wid) {
+                continue;
+            }
+            if let Some(&(_, current_frame)) =
+                current_frames.iter().find(|(wid, _)| *wid == window.wid)
+            {
+                window.start = current_frame;
+            }
+            self.windows.push(window);
+        }
+    }
+
     fn skip_to_end_and_end(self) {
         // Finish every window: jump it to its final frame and end its animation.
-        self.finish_windows_not_in(&[]);
+        self.finish_all();
     }
 }
 
@@ -435,6 +451,13 @@ mod tests {
         assert_animation_pos(&collect_requests(&mut rx)[0], wid, expected_next.origin);
     }
 
+    fn animation_contains(manager: &AnimationManager, wid: WindowId) -> bool {
+        manager
+            .active
+            .as_ref()
+            .is_some_and(|active| active.animation.windows.iter().any(|w| w.wid == wid))
+    }
+
     #[test]
     fn replacement_only_restarts_changed_windows() {
         let (tx, mut rx) = unbounded_channel();
@@ -482,11 +505,24 @@ mod tests {
         assert_eq!(collect_requests(&mut rx).len(), 2);
         manager.handle_message(Message::Replace(second));
 
+        // Only the brand-new window (wid3) is begun. The dropped window (wid2)
+        // is carried over so it keeps animating toward its original destination
+        // instead of jumping there.
         let requests = collect_requests(&mut rx);
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 1);
         assert!(matches!(requests[0], Request::BeginWindowAnimation(req_wid) if req_wid == wid3));
-        assert_animation_frame(&requests[1], wid2, rect(60.0, 60.0, 10.0, 10.0));
-        assert!(matches!(requests[2], Request::EndWindowAnimation(req_wid) if req_wid == wid2));
+        assert!(animation_contains(&manager, wid2));
+
+        let carried = manager
+            .active
+            .as_ref()
+            .unwrap()
+            .animation
+            .windows
+            .iter()
+            .find(|w| w.wid == wid2)
+            .unwrap();
+        assert_eq!(carried.finish, rect(60.0, 60.0, 10.0, 10.0));
     }
 
     #[test]
