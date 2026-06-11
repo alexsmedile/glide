@@ -520,13 +520,25 @@ impl Reactor {
                 if old_frame == new_frame {
                     return;
                 }
-                let screens = self
-                    .screens
-                    .iter()
-                    .flat_map(|screen| Some((screen.space?, screen.frame)))
-                    .collect::<Vec<_>>();
-                // This event is ignored if the window is not in the layout.
+                let old_space = self.best_space_for_window(&old_frame);
+                let new_space = self.best_space_for_window(&new_frame);
+                if let Some(old) = old_space
+                    && let Some(new) = new_space
+                    && old != new
+                {
+                    self.send_layout_event(LayoutEvent::WindowSpaceChanged {
+                        wid,
+                        added: new,
+                        removed: old,
+                    });
+                }
                 if old_frame.size != new_frame.size {
+                    let screens = self
+                        .screens
+                        .iter()
+                        .flat_map(|screen| Some((screen.space?, screen.frame)))
+                        .collect::<Vec<_>>();
+                    // This event is ignored if the window is not in the layout.
                     self.send_layout_event(LayoutEvent::WindowResized {
                         wid,
                         old_frame,
@@ -1694,6 +1706,133 @@ pub mod tests {
         assert_eq!(
             screen2,
             apps.windows.get(&WindowId::new(1, 2)).expect("Window was not resized").frame,
+        );
+    }
+
+    #[test]
+    fn it_moves_windows_dragged_between_spaces() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen1, screen2],
+            spaces: vec![Some(space1), Some(space2)],
+            scale_factors: vec![2.0, 2.0],
+            converter: CoordinateConverter::default(),
+        });
+
+        // Both windows start on screen1 / space1.
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        reactor.handle_events(apps.simulate_events());
+
+        let dragged = WindowId::new(1, 1);
+        let space1_windows: Vec<_> = reactor
+            .layout
+            .calculate_layout(space1, screen1, &reactor.config)
+            .into_iter()
+            .map(|(wid, _)| wid)
+            .collect();
+        assert!(space1_windows.contains(&dragged));
+        assert!(reactor.layout.calculate_layout(space2, screen2, &reactor.config).is_empty());
+
+        // Drag window 1 onto screen2, keeping its size the same so this is a
+        // pure move (not a resize). The mouse button is still down.
+        let frame = apps.windows[&dragged].frame;
+        let new_frame = CGRect::new(CGPoint::new(1100., frame.origin.y), frame.size);
+        reactor.handle_event(Event::WindowFrameChanged(
+            dragged,
+            new_frame,
+            apps.windows[&dragged].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Down),
+        ));
+
+        // The window now belongs to space2's layout and has left space1.
+        let space1_windows: Vec<_> = reactor
+            .layout
+            .calculate_layout(space1, screen1, &reactor.config)
+            .into_iter()
+            .map(|(wid, _)| wid)
+            .collect();
+        let space2_windows: Vec<_> = reactor
+            .layout
+            .calculate_layout(space2, screen2, &reactor.config)
+            .into_iter()
+            .map(|(wid, _)| wid)
+            .collect();
+        assert!(!space1_windows.contains(&dragged), "{space1_windows:?}");
+        assert!(space2_windows.contains(&dragged), "{space2_windows:?}");
+        assert!(space1_windows.contains(&WindowId::new(1, 2)));
+
+        // The reactor must not write any frames while the drag is in progress.
+        assert!(
+            apps.requests().is_empty(),
+            "reactor shouldn't move windows mid-drag"
+        );
+
+        // Releasing the mouse re-tiles the window onto screen2.
+        reactor.handle_event(Event::MouseUp);
+        let requests = apps.requests();
+        assert!(!requests.is_empty(), "release should re-tile the window");
+        let events = apps.simulate_events_for_requests(requests);
+        for event in events {
+            reactor.handle_event(event);
+        }
+        assert_eq!(screen2, apps.windows[&dragged].frame);
+    }
+
+    #[test]
+    fn it_keeps_windows_in_space_on_intra_space_drag() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen1, screen2],
+            spaces: vec![Some(space1), Some(space2)],
+            scale_factors: vec![2.0, 2.0],
+            converter: CoordinateConverter::default(),
+        });
+
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        reactor.handle_events(apps.simulate_events());
+
+        // Drag a window to a different position but still on screen1 / space1.
+        let dragged = WindowId::new(1, 1);
+        let frame = apps.windows[&dragged].frame;
+        let new_frame = CGRect::new(
+            CGPoint::new(frame.origin.x + 20., frame.origin.y + 20.),
+            frame.size,
+        );
+        reactor.handle_event(Event::WindowFrameChanged(
+            dragged,
+            new_frame,
+            apps.windows[&dragged].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Down),
+        ));
+
+        // The window stays on space1 and space2 remains empty.
+        let space1_windows: Vec<_> = reactor
+            .layout
+            .calculate_layout(space1, screen1, &reactor.config)
+            .into_iter()
+            .map(|(wid, _)| wid)
+            .collect();
+        assert!(space1_windows.contains(&dragged));
+        assert!(reactor.layout.calculate_layout(space2, screen2, &reactor.config).is_empty());
+
+        // No frames are written while the mouse button is still down.
+        assert!(
+            apps.requests().is_empty(),
+            "reactor shouldn't move windows mid-drag"
         );
     }
 
