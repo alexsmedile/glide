@@ -36,6 +36,7 @@ pub enum Event {
     FocusedScreenChanged(ScreenId),
     ToggleSpace(ScreenId),
     ToggleGlobalEnabled,
+    SetGlobalEnabled(bool),
     LoginWindowActive(bool),
     ExposeActive(bool),
     ReactorCommand(reactor::Command),
@@ -172,14 +173,10 @@ impl SpaceManager {
                 self.request_space_refresh();
             }
             Event::ToggleGlobalEnabled => {
-                self.is_globally_enabled = !self.is_globally_enabled;
-                if !self.is_globally_enabled {
-                    self.group_indicators_tx.send(group_bars::Event::GlobalDisabled);
-                }
-                self.status_tx
-                    .send(status::Event::GlobalEnabledChanged(self.is_globally_enabled));
-                self.send_space_enabled_status();
-                self.request_space_refresh();
+                self.set_global_enabled(!self.is_globally_enabled);
+            }
+            Event::SetGlobalEnabled(enabled) => {
+                self.set_global_enabled(enabled);
             }
             Event::LoginWindowActive(active) => {
                 if active {
@@ -211,6 +208,20 @@ impl SpaceManager {
                 self.request_space_refresh();
             }
         }
+    }
+
+    fn set_global_enabled(&mut self, enabled: bool) {
+        if self.is_globally_enabled == enabled {
+            return;
+        }
+        self.is_globally_enabled = enabled;
+        if !self.is_globally_enabled {
+            self.group_indicators_tx.send(group_bars::Event::GlobalDisabled);
+        }
+        self.status_tx
+            .send(status::Event::GlobalEnabledChanged(self.is_globally_enabled));
+        self.send_space_enabled_status();
+        self.request_space_refresh();
     }
 
     fn handle_space_changed(&mut self, spaces: &[Option<SpaceId>]) {
@@ -498,6 +509,40 @@ mod tests {
         h.send_space_changed(vec![Some(space(10))]);
         let events = drain(&mut h.reactor_rx);
         assert_eq!(*space_changed_spaces(&events).unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn set_global_enabled_pauses_and_resumes() {
+        let mut h = TestHarness::new();
+        h.setup_space(screen(1), space(10));
+        // Enable the space so we can observe pause/resume affecting it.
+        h.on_event(Event::ToggleSpace(screen(1)));
+        h.drain_all();
+
+        // Pause: all spaces become None.
+        h.on_event(Event::SetGlobalEnabled(false));
+        h.drain_all();
+        h.send_space_changed(vec![Some(space(10))]);
+        let events = drain(&mut h.reactor_rx);
+        assert_eq!(*space_changed_spaces(&events).unwrap(), vec![None]);
+
+        // Resume: the enabled space is managed again.
+        h.on_event(Event::SetGlobalEnabled(true));
+        h.drain_all();
+        h.send_space_changed(vec![Some(space(10))]);
+        let events = drain(&mut h.reactor_rx);
+        assert_eq!(*space_changed_spaces(&events).unwrap(), vec![Some(space(10))]);
+    }
+
+    #[test]
+    fn set_global_enabled_is_idempotent() {
+        let mut h = TestHarness::new();
+        h.setup_space(screen(1), space(10));
+
+        // Already enabled; setting enabled again should produce no refresh.
+        h.on_event(Event::SetGlobalEnabled(true));
+        let ws_events = drain_ws(&mut h.ws_rx);
+        assert!(!ws_events.iter().any(|e| matches!(e, window_server::Event::RequestSpaceRefresh)));
     }
 
     #[test]
