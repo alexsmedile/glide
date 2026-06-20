@@ -69,8 +69,8 @@ pub enum LayoutEvent {
     WindowRemoved(WindowId),
     WindowSpaceChanged {
         wid: WindowId,
-        added: SpaceId,
-        removed: SpaceId,
+        added: Option<SpaceId>,
+        removed: Option<SpaceId>,
     },
     WindowFocused(Vec<SpaceId>, WindowId),
     WindowResized {
@@ -540,8 +540,12 @@ impl LayoutManager {
                 self.floating_windows.remove(&wid);
             }
             LayoutEvent::WindowSpaceChanged { wid, added, removed } => {
-                if let Some(node) = self.tree.window_node(self.layout(removed), wid) {
-                    self.tree.move_node_after(self.tree.selection(self.layout(added)), node);
+                if let Some(removed) = removed {
+                    self.tree.remove_window_from(self.layout(removed), wid);
+                }
+                if let Some(added) = added {
+                    let layout = self.layout(added);
+                    self.tree.add_window_after(layout, self.tree.selection(layout), wid);
                 }
             }
             LayoutEvent::WindowFocused(spaces, wid) => {
@@ -818,7 +822,12 @@ impl LayoutManager {
                 if !self.tree.move_node(layout, selection, direction) {
                     if let Some(new_space) = next_space(direction) {
                         let new_layout = self.layout(new_space);
-                        self.tree.move_node_after(self.tree.selection(new_layout), selection);
+                        self.tree.move_node_after_changing_layout(
+                            self.tree.selection(new_layout),
+                            new_layout,
+                            selection,
+                            layout,
+                        );
                     }
                 }
                 EventResponse::default()
@@ -2134,6 +2143,61 @@ mod tests {
                 .focus_window,
             Some(WindowId::new(pid, 4))
         );
+    }
+
+    #[test]
+    fn move_node_between_spaces_keeps_window_mapping_consistent() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let pid = 1;
+
+        let screen1 = rect(0, 0, 300, 30);
+        let screen2 = rect(300, 0, 300, 30);
+        _ = mgr.handle_event(SpaceExposed(space1, screen1.size));
+        _ = mgr.handle_event(SpaceExposed(space2, screen2.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(
+            space1,
+            pid,
+            vec![
+                (WindowId::new(pid, 1), win_info()),
+                (WindowId::new(pid, 2), win_info()),
+            ],
+        ));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space2, pid, vec![]));
+
+        let moved = WindowId::new(pid, 2);
+        _ = mgr.handle_event(WindowFocused(vec![space1, space2], moved));
+
+        // Move the selected window off the right edge of space1, into space2.
+        _ = mgr.handle_command(Some(space1), &[space1, space2], MoveNode(Direction::Right));
+
+        let windows_in = |mgr: &LayoutManager, space, screen| {
+            mgr.layout_sorted(space, screen)
+                .into_iter()
+                .map(|(wid, _)| wid)
+                .collect::<Vec<_>>()
+        };
+        assert!(!windows_in(&mgr, space1, screen1).contains(&moved));
+        assert!(windows_in(&mgr, space2, screen2).contains(&moved));
+
+        // The window <-> layout mapping must follow the node into space2. The
+        // old move_node_after reparented the node but left this mapping pointing
+        // at space1, so window_node lookups returned the wrong layout. This is
+        // the long-standing bug this assertion guards against.
+        assert_eq!(None, mgr.tree.window_node(mgr.layout(space1), moved));
+        assert!(mgr.tree.window_node(mgr.layout(space2), moved).is_some());
+
+        // A follow-up that resolves the window through its mapping now works.
+        // Focusing it must select it in space2 (WindowFocused uses window_node),
+        // and moving it left must carry it back to space1. With a stale mapping
+        // the focus would miss and the window would never return to space1.
+        _ = mgr.handle_event(WindowFocused(vec![space1, space2], moved));
+        _ = mgr.handle_command(Some(space2), &[space1, space2], MoveNode(Direction::Left));
+        assert!(windows_in(&mgr, space1, screen1).contains(&moved));
+        assert!(!windows_in(&mgr, space2, screen2).contains(&moved));
     }
 
     #[test]

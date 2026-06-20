@@ -172,6 +172,7 @@ impl Size {
             TreeEvent::RemovedFromForest(node) => {
                 self.info.remove(node);
             }
+            TreeEvent::ChangedLayout { .. } => {}
         }
     }
 

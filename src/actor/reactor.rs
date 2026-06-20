@@ -520,16 +520,16 @@ impl Reactor {
                 if old_frame == new_frame {
                     return;
                 }
-                let old_space = self.best_space_for_window(&old_frame);
-                let new_space = self.best_space_for_window(&new_frame);
-                if let Some(old) = old_space
-                    && let Some(new) = new_space
+                let old_screen = self.best_screen_idx_for_window(&old_frame);
+                let new_screen = self.best_screen_idx_for_window(&new_frame);
+                if let Some(old) = old_screen
+                    && let Some(new) = new_screen
                     && old != new
                 {
                     self.send_layout_event(LayoutEvent::WindowSpaceChanged {
                         wid,
-                        added: new,
-                        removed: old,
+                        added: self.screens[new].space,
+                        removed: self.screens[old].space,
                     });
                 }
                 if old_frame.size != new_frame.size {

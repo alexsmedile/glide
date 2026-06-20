@@ -120,6 +120,7 @@ impl Selection {
             RemovedFromForest(node) => {
                 self.nodes.remove(node);
             }
+            ChangedLayout { .. } => {}
         }
     }
 }

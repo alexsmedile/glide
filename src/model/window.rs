@@ -131,6 +131,14 @@ impl Window {
                     }
                 }
             }
+            ChangedLayout { node, old, new } => {
+                if let Some(wid) = self.windows.get(node)
+                    && let Some(nodes) = self.window_nodes.get_mut(wid)
+                {
+                    nodes.retain(|info| info.layout != old);
+                    nodes.push(WindowNodeInfo { layout: new, node });
+                }
+            }
         }
     }
 }

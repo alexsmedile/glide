@@ -206,6 +206,16 @@ impl LayoutTree {
 
     pub fn move_node_after(&mut self, sibling: NodeId, moving_node: NodeId) {
         let map = &self.tree.map;
+        debug_assert_eq!(
+            sibling.ancestors(map).last(),
+            moving_node.ancestors(map).last(),
+            "move_node_after cannot be used to move between layouts"
+        );
+        self.move_node_after_inner(sibling, moving_node);
+    }
+
+    fn move_node_after_inner(&mut self, sibling: NodeId, moving_node: NodeId) {
+        let map = &self.tree.map;
         let Some(old_parent) = moving_node.parent(map) else {
             return;
         };
@@ -224,6 +234,32 @@ impl LayoutTree {
         }
     }
 
+    pub fn move_node_after_changing_layout(
+        &mut self,
+        sibling: NodeId,
+        new_layout: LayoutId,
+        moving_node: NodeId,
+        old_layout: LayoutId,
+    ) {
+        // It's kind of messy that we special case this, but move_node_after_...
+        // is the only way of moving nodes between layouts currently, and we
+        // check with a debug assert that the correct one is called.
+        let map = &self.tree.map;
+        debug_assert_eq!(Some(self.root(new_layout)), sibling.ancestors(map).last());
+        debug_assert_eq!(Some(self.root(old_layout)), moving_node.ancestors(map).last());
+        self.move_node_after_inner(sibling, moving_node);
+        for node in moving_node.traverse_preorder(&self.tree.map) {
+            self.tree.data.dispatch_event(
+                &self.tree.map,
+                TreeEvent::ChangedLayout {
+                    node,
+                    old: old_layout,
+                    new: new_layout,
+                },
+            );
+        }
+    }
+
     #[allow(dead_code)]
     pub fn add_windows_if_missing(
         &mut self,
@@ -237,6 +273,12 @@ impl LayoutTree {
             if self.window_node(layout, wid).is_none() {
                 self.add_window_under(layout, parent, wid);
             }
+        }
+    }
+
+    pub fn remove_window_from(&mut self, layout: LayoutId, wid: WindowId) {
+        if let Some(node) = self.tree.data.window.node_for(layout, wid) {
+            node.detach(&mut self.tree).remove();
         }
     }
 
@@ -906,6 +948,12 @@ pub(super) enum TreeEvent {
     RemovingFromParent(NodeId),
     /// A node was removed from the forest.
     RemovedFromForest(NodeId),
+    /// A node was moved from one layout to another.
+    ChangedLayout {
+        node: NodeId,
+        old: LayoutId,
+        new: LayoutId,
+    },
 }
 
 impl Components {
@@ -1015,6 +1063,71 @@ mod tests {
         assert_eq!(None, tree.window_at(b3));
         assert_eq!(None, tree.window_at(a3));
         assert_eq!(2, root.children(tree.map()).count());
+    }
+
+    #[test]
+    fn move_node_after_changing_layout_updates_window_mapping() {
+        let mut tree = LayoutTree::new();
+        let layout1 = tree.create_layout();
+        let layout2 = tree.create_layout();
+        let root2 = tree.root(layout2);
+
+        let moving = tree.add_window_under(layout1, tree.root(layout1), w(1, 1));
+        let sibling = tree.add_window_under(layout2, root2, w(2, 1));
+
+        // Initially the window is registered under layout1 only.
+        assert_eq!(Some(moving), tree.window_node(layout1, w(1, 1)));
+        assert_eq!(None, tree.window_node(layout2, w(1, 1)));
+
+        tree.move_node_after_changing_layout(sibling, layout2, moving, layout1);
+
+        // The node is reparented into layout2's tree.
+        assert_eq!(Some(root2), moving.parent(tree.map()));
+        // The node <-> window mapping is unchanged.
+        assert_eq!(Some(w(1, 1)), tree.window_at(moving));
+        // The window <-> layout mapping now points at layout2, not layout1.
+        // This is the part that the old move_node_after left stale.
+        assert_eq!(None, tree.window_node(layout1, w(1, 1)));
+        assert_eq!(Some(moving), tree.window_node(layout2, w(1, 1)));
+    }
+
+    #[test]
+    fn move_node_after_changing_layout_updates_whole_subtree() {
+        let mut tree = LayoutTree::new();
+        let layout1 = tree.create_layout();
+        let layout2 = tree.create_layout();
+        let root2 = tree.root(layout2);
+
+        // A container in layout1 holding two windows.
+        let container = tree.add_container(tree.root(layout1), ContainerKind::Vertical);
+        let c1 = tree.add_window_under(layout1, container, w(1, 1));
+        let _c2 = tree.add_window_after(layout1, c1, w(1, 2));
+        let sibling = tree.add_window_under(layout2, root2, w(2, 1));
+
+        tree.move_node_after_changing_layout(sibling, layout2, container, layout1);
+
+        // The container moved under layout2's root, taking its windows with it.
+        assert_eq!(Some(root2), container.parent(tree.map()));
+        // Every descendant window's layout mapping is updated, not just the
+        // moved node itself.
+        for wid in [w(1, 1), w(1, 2)] {
+            assert_eq!(None, tree.window_node(layout1, wid));
+            assert!(tree.window_node(layout2, wid).is_some());
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn move_node_after_panics_across_layouts() {
+        let mut tree = LayoutTree::new();
+        let layout1 = tree.create_layout();
+        let layout2 = tree.create_layout();
+        let moving = tree.add_window_under(layout1, tree.root(layout1), w(1, 1));
+        let sibling = tree.add_window_under(layout2, tree.root(layout2), w(2, 1));
+
+        // move_node_after must not be used to move a node between layouts; doing
+        // so would leave the window <-> layout mapping stale.
+        tree.move_node_after(sibling, moving);
     }
 
     #[test]
