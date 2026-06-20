@@ -84,25 +84,22 @@ impl Window {
         self.window_ids().map(|wid| wid.pid).dedup()
     }
 
-    pub(super) fn take_nodes_for(
-        &mut self,
-        wid: WindowId,
-    ) -> impl Iterator<Item = (LayoutId, NodeId)> + use<> {
+    pub(super) fn take_nodes_for(&mut self, wid: WindowId) -> impl Iterator<Item = NodeId> + use<> {
         self.window_nodes
             .remove(&wid)
             .unwrap_or_default()
             .into_iter()
-            .map(|info| (info.layout, info.node))
+            .map(|info| info.node)
     }
 
     pub(super) fn take_nodes_for_app(
         &mut self,
         pid: pid_t,
-    ) -> impl Iterator<Item = (WindowId, LayoutId, NodeId)> + use<> {
+    ) -> impl Iterator<Item = (WindowId, NodeId)> + use<> {
         let removed = self.window_nodes.remove_all_for_pid(pid);
-        removed.into_iter().flat_map(|(wid, infos)| {
-            infos.into_iter().map(move |info| (wid, info.layout, info.node))
-        })
+        removed
+            .into_iter()
+            .flat_map(|(wid, infos)| infos.into_iter().map(move |info| (wid, info.node)))
     }
 
     pub(super) fn handle_event(&mut self, map: &NodeMap, event: TreeEvent) {

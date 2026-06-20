@@ -283,13 +283,13 @@ impl LayoutTree {
     }
 
     pub fn remove_window(&mut self, wid: WindowId) {
-        for (_, node) in self.tree.data.window.take_nodes_for(wid) {
+        for node in self.tree.data.window.take_nodes_for(wid) {
             node.detach(&mut self.tree).remove();
         }
     }
 
     pub fn remove_windows_for_app(&mut self, pid: pid_t) {
-        for (_, _, node) in self.tree.data.window.take_nodes_for_app(pid) {
+        for (_, node) in self.tree.data.window.take_nodes_for_app(pid) {
             node.detach(&mut self.tree).remove();
         }
     }
