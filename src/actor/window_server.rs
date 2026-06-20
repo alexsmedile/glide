@@ -450,6 +450,8 @@ mod tests {
             frame: CGRect::ZERO,
             sys_id: None,
             is_resizable: true,
+            ax_role: None,
+            ax_subrole: None,
         };
         h.on_event(Event::WindowCreated(wid, info, MouseState::Up));
         let sm_events = h.drain_sm();

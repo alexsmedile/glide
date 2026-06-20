@@ -254,6 +254,8 @@ struct WindowState {
     frame_monotonic: CGRect,
     is_ax_standard: bool,
     is_resizable: bool,
+    ax_role: Option<String>,
+    ax_subrole: Option<String>,
     last_sent_txid: TransactionId,
     window_server_id: Option<WindowServerId>,
 }
@@ -273,6 +275,8 @@ impl From<WindowInfo> for WindowState {
             frame_monotonic: info.frame,
             is_ax_standard: info.is_standard,
             is_resizable: info.is_resizable,
+            ax_role: info.ax_role,
+            ax_subrole: info.ax_subrole,
             last_sent_txid: TransactionId::default(),
             window_server_id: info.sys_id,
         }
@@ -484,10 +488,13 @@ impl Reactor {
                     animation_focus_wids.push(wid);
                     let info = LayoutWindowInfo {
                         bundle_id: app.info.bundle_id.clone(),
+                        app_name: app.info.localized_name.clone(),
                         title: window.title.clone().into(),
                         layer: ws_info.map(|i| i.layer),
                         is_standard: window.is_ax_standard,
                         is_resizable: window.is_resizable,
+                        ax_role: window.ax_role.clone(),
+                        ax_subrole: window.ax_subrole.clone(),
                     };
                     self.send_layout_event(LayoutEvent::WindowAdded(space, wid, info));
                 }
@@ -840,6 +847,7 @@ impl Reactor {
             };
             let layout_info = LayoutWindowInfo {
                 bundle_id: app.and_then(|a| a.info.bundle_id.clone()),
+                app_name: app.and_then(|a| a.info.localized_name.clone()),
                 title: window.title.clone().into(),
                 layer: window
                     .window_server_id
@@ -847,6 +855,8 @@ impl Reactor {
                     .map(|info| info.layer),
                 is_standard: window.is_ax_standard,
                 is_resizable: window.is_resizable,
+                ax_role: window.ax_role.clone(),
+                ax_subrole: window.ax_subrole.clone(),
             };
             app_windows.entry(space).or_default().push((wid, layout_info));
         }
@@ -1527,6 +1537,8 @@ pub mod tests {
                 frame_monotonic: CGRect::new(CGPoint::new(0., 0.), CGSize::new(500., 1000.)),
                 is_ax_standard: true,
                 is_resizable: true,
+                ax_role: None,
+                ax_subrole: None,
                 last_sent_txid: TransactionId::default(),
             },
         );
@@ -1538,6 +1550,8 @@ pub mod tests {
                 frame_monotonic: CGRect::new(CGPoint::new(500., 0.), CGSize::new(500., 1000.)),
                 is_ax_standard: true,
                 is_resizable: true,
+                ax_role: None,
+                ax_subrole: None,
                 last_sent_txid: TransactionId::default(),
             },
         );

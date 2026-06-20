@@ -88,18 +88,27 @@ pub struct WindowInfo {
     pub frame: CGRect,
     pub sys_id: Option<WindowServerId>,
     pub is_resizable: bool,
+    /// The macOS Accessibility AXRole, e.g. "AXWindow".
+    #[serde(default)]
+    pub ax_role: Option<String>,
+    /// The macOS Accessibility AXSubrole, e.g. "AXStandardWindow".
+    #[serde(default)]
+    pub ax_subrole: Option<String>,
 }
 
 impl TryFrom<&AXUIElement> for WindowInfo {
     type Error = accessibility::Error;
     fn try_from(element: &AXUIElement) -> Result<Self, accessibility::Error> {
+        let role = element.role()?;
+        let subrole = element.subrole()?;
         Ok(WindowInfo {
-            is_standard: element.role()? == kAXWindowRole
-                && element.subrole()? == kAXStandardWindowSubrole,
+            is_standard: role == kAXWindowRole && subrole == kAXStandardWindowSubrole,
             title: element.title().map(|t| t.to_string().into()).unwrap_or_default(),
             frame: element.frame()?.to_icrate(),
             sys_id: WindowServerId::try_from(element).ok(),
             is_resizable: element.is_settable(&AXAttribute::size())?,
+            ax_role: Some(role.to_string()),
+            ax_subrole: Some(subrole.to_string()),
         })
     }
 }

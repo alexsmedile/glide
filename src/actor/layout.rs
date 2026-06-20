@@ -84,10 +84,13 @@ pub enum LayoutEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayoutWindowInfo {
     pub bundle_id: Option<String>,
+    pub app_name: Option<String>,
     pub title: Option<Secret<String>>,
     pub layer: Option<i32>,
     pub is_standard: bool,
     pub is_resizable: bool,
+    pub ax_role: Option<String>,
+    pub ax_subrole: Option<String>,
 }
 
 #[must_use]
@@ -1473,10 +1476,13 @@ mod tests {
     fn win_info() -> LayoutWindowInfo {
         LayoutWindowInfo {
             bundle_id: None,
+            app_name: None,
             title: None,
             layer: Some(0),
             is_standard: true,
             is_resizable: true,
+            ax_role: None,
+            ax_subrole: None,
         }
     }
 
