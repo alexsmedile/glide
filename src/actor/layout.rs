@@ -822,12 +822,7 @@ impl LayoutManager {
                 if !self.tree.move_node(layout, selection, direction) {
                     if let Some(new_space) = next_space(direction) {
                         let new_layout = self.layout(new_space);
-                        self.tree.move_node_after_changing_layout(
-                            self.tree.selection(new_layout),
-                            new_layout,
-                            selection,
-                            layout,
-                        );
+                        self.tree.move_node_after(self.tree.selection(new_layout), selection);
                     }
                 }
                 EventResponse::default()

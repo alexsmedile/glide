@@ -85,7 +85,7 @@ impl Selection {
         match event {
             AddedToForest(_node) => {}
             AddedToParent(_node) => {}
-            Copied { src, dest, .. } => {
+            Copied { src, dest } => {
                 let Some(info) = self.nodes.get(src) else {
                     return;
                 };
@@ -120,7 +120,6 @@ impl Selection {
             RemovedFromForest(node) => {
                 self.nodes.remove(node);
             }
-            ChangedLayout { .. } => {}
         }
     }
 }
