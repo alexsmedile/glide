@@ -508,7 +508,11 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(err.message.contains("regex"), "unexpected error: {}", err.message);
+        assert!(
+            err.message.contains("regex"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 
     #[test]
