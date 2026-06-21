@@ -12,6 +12,8 @@ mod main_window;
 mod replay;
 
 #[cfg(test)]
+mod restore_snapshots;
+#[cfg(test)]
 mod testing;
 
 use std::collections::BTreeMap;

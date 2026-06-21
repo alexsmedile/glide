@@ -1,0 +1,13 @@
+# TODO: Promote this into a proper `cargo xtask` setup so release automation
+# has a single conventional entry point, instead of a one-off helper crate.
+[package]
+name = "snapshot-support"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+clap = { version = "4.5.4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = { version = "3.17.1", default-features = false }

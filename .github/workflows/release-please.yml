@@ -69,9 +69,50 @@ jobs:
             });
 
       - name: Create release PRs for new commits on main
+        id: release_pr
         uses: googleapis/release-please-action@v4
         with:
           # Use a custom access token so pull request actions are triggered.
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           target-branch: main
           skip-github-release: true
+
+      # Add a serialized layout snapshot to the release PR so it is reviewed and
+      # tested (via the PR's test run) before release, and so future versions can
+      # be tested for restore compatibility (see tests/snapshots). current.ron is
+      # kept current by the current_serialization_is_unchanged test; here we freeze
+      # a copy under the upcoming version, but only when the format changed since
+      # the last saved version. release-please force-pushes its branch, so this
+      # re-applies on every run and ends up in the PR before merge.
+      - name: Install latest stable
+        if: steps.release_pr.outputs.pr
+        run: rustup update stable
+      - name: Add layout restore snapshot to release PR
+        if: steps.release_pr.outputs.pr
+        run: |
+          set -euo pipefail
+          branch="release-please--branches--main"
+          git config user.name github-actions[bot]
+          git config user.email github-actions[bot]@users.noreply.github.com
+          git fetch origin "$branch"
+          git checkout -B "$branch" "origin/$branch"
+
+          # The release branch already carries the version bump.
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+
+          # The freeze decision and copy live in tested Rust
+          # (crates/snapshot-support, which has no macOS dependencies so it
+          # builds on this Linux runner). It prints the snapshot path it wrote,
+          # or nothing when the serialized format is unchanged.
+          target=$(cargo run --quiet --locked -p snapshot-support -- --version "$version")
+          if [ -z "$target" ]; then
+            echo "Serialized format unchanged; nothing to add for $version."
+            exit 0
+          fi
+          git add "$target"
+          if git diff --cached --quiet; then
+            echo "Snapshot for $version already present on the release branch."
+            exit 0
+          fi
+          git commit -m "chore: Save layout restore snapshot for $version"
+          git push origin "$branch"

@@ -158,36 +158,3 @@ where
         })
         .collect())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Older versions stored each node alongside its layout id. We must still be
-    /// able to restore those layouts.
-    #[test]
-    fn deserializes_legacy_window_nodes_with_layout_field() {
-        let legacy = "(windows:[(value:None,version:0),\
-            (value:Some((pid:1,idx:2147483649)),version:1),\
-            (value:Some((pid:1,idx:2147483650)),version:1)],\
-            window_nodes:{\
-            (pid:1,idx:2147483649):[(layout:(idx:1,version:1),node:(idx:1,version:1))],\
-            (pid:1,idx:2147483650):[(layout:(idx:1,version:1),node:(idx:2,version:1))]})";
-        let new = "(windows:[(value:None,version:0),\
-            (value:Some((pid:1,idx:2147483649)),version:1),\
-            (value:Some((pid:1,idx:2147483650)),version:1)],\
-            window_nodes:{\
-            (pid:1,idx:2147483649):[(idx:1,version:1)],\
-            (pid:1,idx:2147483650):[(idx:2,version:1)]})";
-
-        let from_legacy: Window = ron::from_str(legacy).unwrap();
-        let from_new: Window = ron::from_str(new).unwrap();
-
-        assert_eq!(from_legacy.window_nodes, from_new.window_nodes);
-        assert_eq!(
-            from_legacy.window_nodes.values().flatten().count(),
-            2,
-            "both nodes should survive the legacy conversion"
-        );
-    }
-}

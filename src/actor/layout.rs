@@ -1418,6 +1418,16 @@ impl LayoutManager {
     pub(super) fn active_layout_kind(&self, space: SpaceId) -> LayoutKind {
         self.tree.layout_kind(self.layout(space))
     }
+
+    /// Every window present in any layout. Used by the restore snapshot tests to
+    /// confirm a deserialized layout retained its window mapping.
+    #[cfg(test)]
+    pub(crate) fn all_windows(&self) -> std::collections::BTreeSet<WindowId> {
+        self.tree
+            .layouts()
+            .flat_map(|layout| self.tree.visible_windows_under(self.tree.root(layout)))
+            .collect()
+    }
 }
 
 // TODO: detect_edges does not account for screen boundaries.
