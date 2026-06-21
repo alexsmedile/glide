@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::tree::{NodeId, NodeMap};
 use crate::actor::app::WindowId;
 use crate::collections::BTreeExt;
-use crate::model::layout_tree::TreeEvent;
+use crate::model::layout_tree::{LayoutId, TreeEvent};
 
 /// Maintains a two-way mapping between leaf nodes and window ids.
 ///
@@ -21,6 +21,7 @@ use crate::model::layout_tree::TreeEvent;
 #[derive(Default, Serialize, Deserialize)]
 pub struct Window {
     windows: slotmap::SecondaryMap<NodeId, WindowId>,
+    #[serde(deserialize_with = "deserialize_window_nodes")]
     window_nodes: BTreeMap<WindowId, Vec<NodeId>>,
 }
 
@@ -119,5 +120,74 @@ impl Window {
                 }
             }
         }
+    }
+}
+
+/// A node entry in a serialized layout. Older layouts (prior to 0.2.14) stored
+/// each node alongside the id of the layout it belonged to; that id is now
+/// derived from the node's position in the tree, so it is accepted and
+/// discarded here. This backward compatibility will be dropped later.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SerializedNode {
+    Node(NodeId),
+    Legacy {
+        #[allow(dead_code)]
+        layout: LayoutId,
+        node: NodeId,
+    },
+}
+
+fn deserialize_window_nodes<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<WindowId, Vec<NodeId>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = BTreeMap::<WindowId, Vec<SerializedNode>>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|(wid, nodes)| {
+            let nodes = nodes
+                .into_iter()
+                .map(|n| match n {
+                    SerializedNode::Node(node) | SerializedNode::Legacy { node, .. } => node,
+                })
+                .collect();
+            (wid, nodes)
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Older versions stored each node alongside its layout id. We must still be
+    /// able to restore those layouts.
+    #[test]
+    fn deserializes_legacy_window_nodes_with_layout_field() {
+        let legacy = "(windows:[(value:None,version:0),\
+            (value:Some((pid:1,idx:2147483649)),version:1),\
+            (value:Some((pid:1,idx:2147483650)),version:1)],\
+            window_nodes:{\
+            (pid:1,idx:2147483649):[(layout:(idx:1,version:1),node:(idx:1,version:1))],\
+            (pid:1,idx:2147483650):[(layout:(idx:1,version:1),node:(idx:2,version:1))]})";
+        let new = "(windows:[(value:None,version:0),\
+            (value:Some((pid:1,idx:2147483649)),version:1),\
+            (value:Some((pid:1,idx:2147483650)),version:1)],\
+            window_nodes:{\
+            (pid:1,idx:2147483649):[(idx:1,version:1)],\
+            (pid:1,idx:2147483650):[(idx:2,version:1)]})";
+
+        let from_legacy: Window = ron::from_str(legacy).unwrap();
+        let from_new: Window = ron::from_str(new).unwrap();
+
+        assert_eq!(from_legacy.window_nodes, from_new.window_nodes);
+        assert_eq!(
+            from_legacy.window_nodes.values().flatten().count(),
+            2,
+            "both nodes should survive the legacy conversion"
+        );
     }
 }
