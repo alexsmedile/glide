@@ -559,7 +559,11 @@ impl LayoutManager {
                     }
                     if let Some(added) = added {
                         let layout = self.layout(added);
-                        self.tree.add_window_after(layout, self.tree.selection(layout), wid);
+                        if self.tree.is_scroll_layout(layout) {
+                            self.add_scroll_window(layout, wid);
+                        } else {
+                            self.tree.add_window_after(layout, self.tree.selection(layout), wid);
+                        }
                     }
                 }
             }
@@ -2271,6 +2275,43 @@ mod tests {
         };
         assert!(!tiled(&mgr, space1, screen1).contains(&floated));
         assert!(!tiled(&mgr, space2, screen2).contains(&floated));
+    }
+
+    #[test]
+    fn window_dragged_into_scroll_space_joins_a_column() {
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new();
+        mgr.set_config(&config_with_scroll(true, LayoutKind::Scroll));
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let pid = 1;
+
+        let screen1 = rect(0, 0, 300, 30);
+        let screen2 = rect(300, 0, 300, 30);
+        _ = mgr.handle_event(SpaceExposed(space1, screen1.size));
+        _ = mgr.handle_event(SpaceExposed(space2, screen2.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space1, pid, make_windows(pid, 2)));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space2, pid, vec![]));
+        assert_eq!(LayoutKind::Scroll, mgr.active_layout_kind(space2));
+
+        // Drag a window from the scroll space1 into the scroll space2.
+        let moved = WindowId::new(pid, 1);
+        _ = mgr.handle_event(WindowSpaceChanged {
+            wid: moved,
+            added: Some(space2),
+            removed: Some(space1),
+        });
+
+        // In a scroll layout windows live inside column containers, never as a
+        // direct child of the root. The old handler called add_window_after,
+        // which dropped a bare window node directly under the root.
+        let layout2 = mgr.layout(space2);
+        let node = mgr.tree.window_node(layout2, moved).expect("window should be in space2");
+        assert_ne!(
+            Some(mgr.tree.root(layout2)),
+            node.parent(mgr.tree.map()),
+            "scroll-space window should be nested in a column, not under the root"
+        );
     }
 
     #[test]
