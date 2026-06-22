@@ -540,12 +540,27 @@ impl LayoutManager {
                 self.floating_windows.remove(&wid);
             }
             LayoutEvent::WindowSpaceChanged { wid, added, removed } => {
-                if let Some(removed) = removed {
-                    self.tree.remove_window_from(self.layout(removed), wid);
-                }
-                if let Some(added) = added {
-                    let layout = self.layout(added);
-                    self.tree.add_window_after(layout, self.tree.selection(layout), wid);
+                if self.floating_windows.contains(&wid) {
+                    // Floating windows live outside the tree, tracked per space
+                    // in active_floating_windows. Move that bookkeeping rather
+                    // than tiling the window into the destination layout.
+                    if let Some(removed) = removed
+                        && let Some(by_pid) = self.active_floating_windows.get_mut(&removed)
+                        && let Some(wids) = by_pid.get_mut(&wid.pid)
+                    {
+                        wids.remove(&wid);
+                    }
+                    if let Some(added) = added {
+                        self.add_floating_window(wid, Some(added));
+                    }
+                } else {
+                    if let Some(removed) = removed {
+                        self.tree.remove_window_from(self.layout(removed), wid);
+                    }
+                    if let Some(added) = added {
+                        let layout = self.layout(added);
+                        self.tree.add_window_after(layout, self.tree.selection(layout), wid);
+                    }
                 }
             }
             LayoutEvent::WindowFocused(spaces, wid) => {
@@ -1419,6 +1434,15 @@ impl LayoutManager {
         self.tree.layout_kind(self.layout(space))
     }
 
+    #[cfg(test)]
+    pub(super) fn floating_windows_in_space(&self, space: SpaceId) -> BTreeSet<WindowId> {
+        self.active_floating_windows
+            .get(&space)
+            .into_iter()
+            .flat_map(|by_pid| by_pid.values().flatten().copied())
+            .collect()
+    }
+
     /// Every window present in any layout. Used by the restore snapshot tests to
     /// confirm a deserialized layout retained its window mapping.
     #[cfg(test)]
@@ -2203,6 +2227,50 @@ mod tests {
         _ = mgr.handle_command(Some(space2), &[space1, space2], MoveNode(Direction::Left));
         assert!(windows_in(&mgr, space1, screen1).contains(&moved));
         assert!(!windows_in(&mgr, space2, screen2).contains(&moved));
+    }
+
+    #[test]
+    fn floating_window_space_change_stays_floating() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let pid = 1;
+
+        let screen1 = rect(0, 0, 300, 30);
+        let screen2 = rect(300, 0, 300, 30);
+        _ = mgr.handle_event(SpaceExposed(space1, screen1.size));
+        _ = mgr.handle_event(SpaceExposed(space2, screen2.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space1, pid, make_windows(pid, 2)));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space2, pid, vec![]));
+
+        // Float the first window on space1.
+        let floated = WindowId::new(pid, 1);
+        _ = mgr.handle_event(WindowFocused(vec![space1], floated));
+        _ = mgr.handle_command(Some(space1), &[space1], ToggleWindowFloating);
+        assert_eq!(BTreeSet::from([floated]), mgr.floating_windows_in_space(space1));
+
+        // Drag the floating window onto space2.
+        _ = mgr.handle_event(WindowSpaceChanged {
+            wid: floated,
+            added: Some(space2),
+            removed: Some(space1),
+        });
+
+        // It must remain floating, tracked under space2 and not space1. It must
+        // not be tiled into either layout: the old handler called
+        // add_window_after unconditionally, which pulled it into space2's tree.
+        assert_eq!(BTreeSet::new(), mgr.floating_windows_in_space(space1));
+        assert_eq!(BTreeSet::from([floated]), mgr.floating_windows_in_space(space2));
+        let tiled = |mgr: &LayoutManager, space, screen| {
+            mgr.layout_sorted(space, screen)
+                .into_iter()
+                .map(|(wid, _)| wid)
+                .collect::<Vec<_>>()
+        };
+        assert!(!tiled(&mgr, space1, screen1).contains(&floated));
+        assert!(!tiled(&mgr, space2, screen2).contains(&floated));
     }
 
     #[test]
