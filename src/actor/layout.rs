@@ -67,6 +67,11 @@ pub enum LayoutEvent {
     WindowsOnScreenUpdated(SpaceId, pid_t, Vec<(WindowId, LayoutWindowInfo)>),
     WindowAdded(SpaceId, WindowId, LayoutWindowInfo),
     WindowRemoved(WindowId),
+    WindowSpaceChanged {
+        wid: WindowId,
+        added: Option<SpaceId>,
+        removed: Option<SpaceId>,
+    },
     WindowFocused(Vec<SpaceId>, WindowId),
     WindowResized {
         wid: WindowId,
@@ -533,6 +538,34 @@ impl LayoutManager {
             LayoutEvent::WindowRemoved(wid) => {
                 self.tree.remove_window(wid);
                 self.floating_windows.remove(&wid);
+            }
+            LayoutEvent::WindowSpaceChanged { wid, added, removed } => {
+                if self.floating_windows.contains(&wid) {
+                    // Floating windows live outside the tree, tracked per space
+                    // in active_floating_windows. Move that bookkeeping rather
+                    // than tiling the window into the destination layout.
+                    if let Some(removed) = removed
+                        && let Some(by_pid) = self.active_floating_windows.get_mut(&removed)
+                        && let Some(wids) = by_pid.get_mut(&wid.pid)
+                    {
+                        wids.remove(&wid);
+                    }
+                    if let Some(added) = added {
+                        self.add_floating_window(wid, Some(added));
+                    }
+                } else {
+                    if let Some(removed) = removed {
+                        self.tree.remove_window_from(self.layout(removed), wid);
+                    }
+                    if let Some(added) = added {
+                        let layout = self.layout(added);
+                        if self.tree.is_scroll_layout(layout) {
+                            self.add_scroll_window(layout, wid);
+                        } else {
+                            self.tree.add_window_after(layout, self.tree.selection(layout), wid);
+                        }
+                    }
+                }
             }
             LayoutEvent::WindowFocused(spaces, wid) => {
                 self.focused_window = Some(wid);
@@ -1404,6 +1437,25 @@ impl LayoutManager {
     pub(super) fn active_layout_kind(&self, space: SpaceId) -> LayoutKind {
         self.tree.layout_kind(self.layout(space))
     }
+
+    #[cfg(test)]
+    pub(super) fn floating_windows_in_space(&self, space: SpaceId) -> BTreeSet<WindowId> {
+        self.active_floating_windows
+            .get(&space)
+            .into_iter()
+            .flat_map(|by_pid| by_pid.values().flatten().copied())
+            .collect()
+    }
+
+    /// Every window present in any layout. Used by the restore snapshot tests to
+    /// confirm a deserialized layout retained its window mapping.
+    #[cfg(test)]
+    pub(crate) fn all_windows(&self) -> std::collections::BTreeSet<WindowId> {
+        self.tree
+            .layouts()
+            .flat_map(|layout| self.tree.visible_windows_under(self.tree.root(layout)))
+            .collect()
+    }
 }
 
 // TODO: detect_edges does not account for screen boundaries.
@@ -2123,6 +2175,142 @@ mod tests {
             mgr.handle_command(Some(space2), &[space1, space2], MoveFocus(Direction::Right))
                 .focus_window,
             Some(WindowId::new(pid, 4))
+        );
+    }
+
+    #[test]
+    fn move_node_between_spaces_keeps_window_mapping_consistent() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let pid = 1;
+
+        let screen1 = rect(0, 0, 300, 30);
+        let screen2 = rect(300, 0, 300, 30);
+        _ = mgr.handle_event(SpaceExposed(space1, screen1.size));
+        _ = mgr.handle_event(SpaceExposed(space2, screen2.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(
+            space1,
+            pid,
+            vec![
+                (WindowId::new(pid, 1), win_info()),
+                (WindowId::new(pid, 2), win_info()),
+            ],
+        ));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space2, pid, vec![]));
+
+        let moved = WindowId::new(pid, 2);
+        _ = mgr.handle_event(WindowFocused(vec![space1, space2], moved));
+
+        // Move the selected window off the right edge of space1, into space2.
+        _ = mgr.handle_command(Some(space1), &[space1, space2], MoveNode(Direction::Right));
+
+        let windows_in = |mgr: &LayoutManager, space, screen| {
+            mgr.layout_sorted(space, screen)
+                .into_iter()
+                .map(|(wid, _)| wid)
+                .collect::<Vec<_>>()
+        };
+        assert!(!windows_in(&mgr, space1, screen1).contains(&moved));
+        assert!(windows_in(&mgr, space2, screen2).contains(&moved));
+
+        // The window <-> layout mapping must follow the node into space2. The
+        // old move_node_after reparented the node but left this mapping pointing
+        // at space1, so window_node lookups returned the wrong layout. This is
+        // the long-standing bug this assertion guards against.
+        assert_eq!(None, mgr.tree.window_node(mgr.layout(space1), moved));
+        assert!(mgr.tree.window_node(mgr.layout(space2), moved).is_some());
+
+        // A follow-up that resolves the window through its mapping now works.
+        // Focusing it must select it in space2 (WindowFocused uses window_node),
+        // and moving it left must carry it back to space1. With a stale mapping
+        // the focus would miss and the window would never return to space1.
+        _ = mgr.handle_event(WindowFocused(vec![space1, space2], moved));
+        _ = mgr.handle_command(Some(space2), &[space1, space2], MoveNode(Direction::Left));
+        assert!(windows_in(&mgr, space1, screen1).contains(&moved));
+        assert!(!windows_in(&mgr, space2, screen2).contains(&moved));
+    }
+
+    #[test]
+    fn floating_window_space_change_stays_floating() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let pid = 1;
+
+        let screen1 = rect(0, 0, 300, 30);
+        let screen2 = rect(300, 0, 300, 30);
+        _ = mgr.handle_event(SpaceExposed(space1, screen1.size));
+        _ = mgr.handle_event(SpaceExposed(space2, screen2.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space1, pid, make_windows(pid, 2)));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space2, pid, vec![]));
+
+        // Float the first window on space1.
+        let floated = WindowId::new(pid, 1);
+        _ = mgr.handle_event(WindowFocused(vec![space1], floated));
+        _ = mgr.handle_command(Some(space1), &[space1], ToggleWindowFloating);
+        assert_eq!(BTreeSet::from([floated]), mgr.floating_windows_in_space(space1));
+
+        // Drag the floating window onto space2.
+        _ = mgr.handle_event(WindowSpaceChanged {
+            wid: floated,
+            added: Some(space2),
+            removed: Some(space1),
+        });
+
+        // It must remain floating, tracked under space2 and not space1. It must
+        // not be tiled into either layout: the old handler called
+        // add_window_after unconditionally, which pulled it into space2's tree.
+        assert_eq!(BTreeSet::new(), mgr.floating_windows_in_space(space1));
+        assert_eq!(BTreeSet::from([floated]), mgr.floating_windows_in_space(space2));
+        let tiled = |mgr: &LayoutManager, space, screen| {
+            mgr.layout_sorted(space, screen)
+                .into_iter()
+                .map(|(wid, _)| wid)
+                .collect::<Vec<_>>()
+        };
+        assert!(!tiled(&mgr, space1, screen1).contains(&floated));
+        assert!(!tiled(&mgr, space2, screen2).contains(&floated));
+    }
+
+    #[test]
+    fn window_dragged_into_scroll_space_joins_a_column() {
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new();
+        mgr.set_config(&config_with_scroll(true, LayoutKind::Scroll));
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let pid = 1;
+
+        let screen1 = rect(0, 0, 300, 30);
+        let screen2 = rect(300, 0, 300, 30);
+        _ = mgr.handle_event(SpaceExposed(space1, screen1.size));
+        _ = mgr.handle_event(SpaceExposed(space2, screen2.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space1, pid, make_windows(pid, 2)));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space2, pid, vec![]));
+        assert_eq!(LayoutKind::Scroll, mgr.active_layout_kind(space2));
+
+        // Drag a window from the scroll space1 into the scroll space2.
+        let moved = WindowId::new(pid, 1);
+        _ = mgr.handle_event(WindowSpaceChanged {
+            wid: moved,
+            added: Some(space2),
+            removed: Some(space1),
+        });
+
+        // In a scroll layout windows live inside column containers, never as a
+        // direct child of the root. The old handler called add_window_after,
+        // which dropped a bare window node directly under the root.
+        let layout2 = mgr.layout(space2);
+        let node = mgr.tree.window_node(layout2, moved).expect("window should be in space2");
+        assert_ne!(
+            Some(mgr.tree.root(layout2)),
+            node.parent(mgr.tree.map()),
+            "scroll-space window should be nested in a column, not under the root"
         );
     }
 

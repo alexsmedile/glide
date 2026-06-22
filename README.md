@@ -33,6 +33,12 @@ _Note:_ If you don't have Homebrew, see the "manual installation" section below.
 The first time you do this, you will have to follow instructions to enable
 Accessibility permissions.
 
+> [!IMPORTANT]
+> Glide requires **"Displays have separate Spaces"** to be turned on to work
+> properly with multiple monitors. This is the default on macOS. You can check
+> it under System Settings → Desktop & Dock → Mission Control. If you change it,
+> you must log out and back in for it to take effect.
+
 Once Glide is running, press Alt+Z (Option+Z on Mac keyboards) to start managing the current space. Note:
 This will resize all your windows! To stop managing the space, press Alt+Z again.
 

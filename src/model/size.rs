@@ -163,7 +163,7 @@ impl Size {
                 self.info[node].size = 1.0;
                 self.info[parent].total += 1.0;
             }
-            TreeEvent::Copied { src, dest, .. } => {
+            TreeEvent::Copied { src, dest } => {
                 self.info.insert(dest, self.info[src].clone());
             }
             TreeEvent::RemovingFromParent(node) => {

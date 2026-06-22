@@ -32,4 +32,4 @@ jobs:
       - name: Build
         run: cargo build --verbose --locked
       - name: Run tests
-        run: cargo test --verbose --locked
+        run: cargo test --workspace --verbose --locked

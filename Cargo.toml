@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
 [package]
 name = "glide-wm"
 version = "0.2.13"
@@ -139,6 +143,7 @@ tempfile = { version = "3.17.1", default-features = false }
 
 [dev-dependencies]
 pretty_assertions = "1.4.0"
+snapshot-support = { path = "crates/snapshot-support" }
 tokio = { version = "1.35.1", features = ["rt", "sync", "macros"] }
 test-log = { version = "0.2.16", default-features = false, features = [
     "trace",
