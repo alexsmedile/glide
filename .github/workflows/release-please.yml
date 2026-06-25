@@ -91,7 +91,7 @@ jobs:
         if: steps.release_pr.outputs.pr
         run: |
           set -euo pipefail
-          branch="release-please--branches--main"
+          branch="release-please--branches--main--components--glide-wm"
           git config user.name github-actions[bot]
           git config user.email github-actions[bot]@users.noreply.github.com
           git fetch origin "$branch"
