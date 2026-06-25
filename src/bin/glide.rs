@@ -35,6 +35,10 @@ enum Command {
     Ping(CmdPing),
     #[command()]
     Config(CmdConfig),
+    /// Pause window management on all spaces.
+    Pause,
+    /// Resume window management after pausing.
+    Resume,
 }
 
 /// Manage Glide as a system service.
@@ -120,6 +124,8 @@ fn main() -> Result<(), anyhow::Error> {
                 _ => bail!("Unexpected response"),
             }
         }
+        Command::Pause => set_enabled(make_client()?, false)?,
+        Command::Resume => set_enabled(make_client()?, true)?,
         Command::Config(CmdConfig {
             config,
             action: ConfigSubcommand::Update(CmdUpdate { watch }),
@@ -180,6 +186,17 @@ fn main() -> Result<(), anyhow::Error> {
     }
 
     Ok(())
+}
+
+fn set_enabled(client: Client, enabled: bool) -> Result<(), anyhow::Error> {
+    match client.send(Request::SetEnabled(enabled))? {
+        Response::Success => {
+            println!("Glide {}", if enabled { "resumed" } else { "paused" });
+            Ok(())
+        }
+        Response::Error(e) => bail!("{e}"),
+        _ => bail!("Unexpected response"),
+    }
 }
 
 fn launch(config: Option<PathBuf>, restore: bool) -> Result<(), anyhow::Error> {

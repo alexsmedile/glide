@@ -54,6 +54,7 @@ pub enum WmCommand {
 #[serde(rename_all = "snake_case")]
 pub enum WmCmd {
     ToggleGlobalEnabled,
+    SetGlobalEnabled(bool),
     ToggleSpaceActivated,
     Exec(ExecCmd),
 }
@@ -204,6 +205,9 @@ impl WmController {
             }
             Command(Wm(ToggleGlobalEnabled)) => {
                 self.sm_tx.send(space_manager::Event::ToggleGlobalEnabled);
+            }
+            Command(Wm(SetGlobalEnabled(enabled))) => {
+                self.sm_tx.send(space_manager::Event::SetGlobalEnabled(enabled));
             }
             Command(Wm(Exec(cmd))) => {
                 self.exec_cmd(cmd);

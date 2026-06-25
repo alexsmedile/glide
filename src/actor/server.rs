@@ -24,6 +24,8 @@ pub enum Request {
     Ping(String),
     UpdateConfig(Config),
     Service(ServiceRequest),
+    /// Pause (false) or resume (true) global window management.
+    SetEnabled(bool),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -99,6 +101,15 @@ impl State {
                 _ = self.wm_tx.send((
                     Span::current(),
                     wm_controller::WmEvent::ConfigUpdated(Arc::new(config)),
+                ));
+                Response::Success
+            }
+            Request::SetEnabled(enabled) => {
+                _ = self.wm_tx.send((
+                    Span::current(),
+                    wm_controller::WmEvent::Command(wm_controller::WmCommand::Wm(
+                        wm_controller::WmCmd::SetGlobalEnabled(enabled),
+                    )),
                 ));
                 Response::Success
             }
