@@ -50,7 +50,9 @@ default_keys = false
 
 [keys]
 # Note: Modifier and key names must be capitalized.
-# On Mac keyboards, "Alt" refers to the Option (⌥) key.
+#
+# "Alt" and "Option" can be used interchangeably, and refer to the same key
+# (⌥ on Mac keyboaards).
 #
 # Key names refer to physical key positions on a standard QWERTY keyboard,
 # not the characters produced by your keyboard layout. If you use an
