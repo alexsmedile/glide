@@ -62,22 +62,6 @@ default_keys = false
 #
 # For a comprehensive list of key names, see:
 # https://docs.rs/livesplit-hotkey/0.8.0/livesplit_hotkey/enum.KeyCode.html
-#
-# In addition to the commands bound below, you can also bind the following commands:
-#
-# Toggle glide on/off:
-# "<key>": "toggle_global_enabled"
-#
-# Set glide on/off:
-# "<key>": { "set_global_enabled" = { "enabled" = <bool> } }
-#
-# Focus the next/previous window:
-# "<key>": "focus_next"
-# "<key>": "focus_prev"
-#
-# Developer commands (print debug info to the logs):
-# "<key>": "show_timings"
-# "<key>": "serialize"
 
 # Save the current state to the restore file and exit.
 # Restore this with the --restore option when starting glide.
@@ -149,18 +133,27 @@ default_keys = false
 # Toggle whether the focused node takes up the whole screen.
 "Alt + F" = "toggle_fullscreen"
 
+# Toggle glide on/off.
+# "<key>" = "toggle_global_enabled"
+
+# Set glide on/off.
+# "<key>" = { "set_global_enabled" = { "enabled" = <bool> } }
+
+# Focus the next/previous window.
+# "<key>" = "focus_next"
+# "<key>" = "focus_prev"
+
 #
 # Utilities
 #
 
-# Execute an arbitrary command. Accepts an array or space-delimited string as args:
-#
+# Execute an arbitrary command. Accepts an array or space-delimited string as args.
 # "<key>" = { "exec" = ["bash", "-c", "echo 'hello world' >/tmp/test.txt"] }
-#
+
 # Add `unsafe_privileged = true` to execute directly from Glide and inherit its
 # full permissions, like accessibility, which can read anything on your screen.
 #
-# CAUTION: Make sure you understand the risks before using this:
+# CAUTION: Make sure you understand the risks before using this.
 # "<key>" = { "exec" = { "cmd" = ["bash", "-c", "echo hi"], unsafe_privileged = true } }
 
 #
@@ -169,6 +162,13 @@ default_keys = false
 
 # Print the current layout in the logs.
 "Alt + Shift + D" = "debug"
+
+# "<key>" = "show_timings"
+# "<key>" = "serialize"
+
+#
+# Experimental commands
+#
 
 # Scroll layout commands are experimental and intentionally not bound by
 # default. If you enable settings.experimental.scroll.enable, add explicit
