@@ -1401,6 +1401,10 @@ impl LayoutManager {
     }
 
     fn top_layer_windows(&self, space: SpaceId) -> Vec<WindowId> {
+        if self.is_floating() {
+            // For now don't mess with window order if a floating window is focused.
+            return Vec::new();
+        }
         let Some(layout) = self.try_layout(space) else {
             return Vec::new();
         };
@@ -1849,6 +1853,34 @@ mod tests {
         if let Some(focus) = response.focus_window {
             _ = mgr.handle_event(WindowFocused(vec![space], focus));
         }
+    }
+
+    #[test]
+    fn space_exposed_does_not_bury_focused_floating_window() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new();
+        let space = SpaceId::new(1);
+        let pid = 1;
+
+        let screen1 = rect(0, 0, 120, 120);
+        _ = mgr.handle_event(SpaceExposed(space, screen1.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, make_windows(pid, 3)));
+        _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, 1)));
+
+        // With a tiled window focused, re-exposing the space (e.g. via mission
+        // control) raises the tiled windows on top.
+        let response = mgr.handle_event(SpaceExposed(space, screen1.size));
+        assert!(!response.raise_windows.is_empty());
+
+        // Float the focused window and re-expose the space. The floating window
+        // must not be buried, so no tiled windows are raised over it.
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        let response = mgr.handle_event(SpaceExposed(space, screen1.size));
+        assert!(
+            response.raise_windows.is_empty()
+                || response.raise_windows.contains(&WindowId::new(pid, 1))
+        );
     }
 
     #[test]
