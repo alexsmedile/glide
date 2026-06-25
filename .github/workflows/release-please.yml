@@ -77,21 +77,36 @@ jobs:
           target-branch: main
           skip-github-release: true
 
+      # Detect an open release PR independently of release_pr.outputs.pr, which
+      # is only set on runs where release-please actually creates or changes the
+      # PR. We want to keep the snapshot current on every push while a release PR
+      # is open, even when that run leaves the PR unchanged.
+      - name: Find open release PR
+        id: open_release_pr
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="release-please--branches--main--components--glide-wm"
+          number=$(gh pr list --state open --head "$branch" --json number --jq '.[0].number // empty')
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
       # Add a serialized layout snapshot to the release PR so it is reviewed and
       # tested (via the PR's test run) before release, and so future versions can
       # be tested for restore compatibility (see tests/snapshots). current.ron is
       # kept current by the current_serialization_is_unchanged test; here we freeze
       # a copy under the upcoming version, but only when the format changed since
-      # the last saved version. release-please force-pushes its branch, so this
-      # re-applies on every run and ends up in the PR before merge.
+      # the last saved version. This re-applies on every run while the release PR
+      # is open and is idempotent, so it ends up in the PR before merge.
       - name: Install latest stable
-        if: steps.release_pr.outputs.pr
+        if: steps.open_release_pr.outputs.number
         run: rustup update stable
       - name: Add layout restore snapshot to release PR
-        if: steps.release_pr.outputs.pr
+        if: steps.open_release_pr.outputs.number
         run: |
           set -euo pipefail
-          branch="release-please--branches--main--components--glide-wm"
+          branch="${{ steps.open_release_pr.outputs.branch }}"
           git config user.name github-actions[bot]
           git config user.email github-actions[bot]@users.noreply.github.com
           git fetch origin "$branch"
