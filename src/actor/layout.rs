@@ -241,44 +241,44 @@ enum WindowClass {
 /// rule with no conditions matches every window. All conditions match
 /// case-insensitively (the regex is compiled case-insensitively in config).
 fn app_rule_matches(conditions: &AppRuleConditions, info: &LayoutWindowInfo) -> bool {
-    if let Some(app_id_condition) = &conditions.app_id
-        && let Some(app_id) = &info.bundle_id
-        && !app_id.eq_ignore_ascii_case(app_id_condition)
+    // A specified condition fails to match when the window lacks that attribute.
+    if let Some(app_id) = &conditions.app_id
+        && !info.bundle_id.as_ref().is_some_and(|v| v.eq_ignore_ascii_case(app_id))
     {
         return false;
     }
-    if let Some(app_name_condition) = &conditions.app_name
-        && let Some(app_name) = &info.app_name
-        && !app_name.eq_ignore_ascii_case(app_name_condition)
+    if let Some(app_name) = &conditions.app_name
+        && !info.app_name.as_ref().is_some_and(|v| contains_ignore_case(v, app_name))
     {
         return false;
     }
     let title = info.title.as_ref().map(|t| t.expose_secret().as_str());
     if let Some(re) = conditions.title_regex.as_deref()
-        && let Some(title) = title
-        && !re.is_match(title)
+        && !title.is_some_and(|t| re.is_match(t))
     {
         return false;
     }
-    if let Some(substring_condition) = &conditions.title_substring
-        && let Some(title) = title
-        && !title.to_lowercase().contains(&substring_condition.to_lowercase())
+    if let Some(substring) = &conditions.title_substring
+        && !title.is_some_and(|t| contains_ignore_case(t, substring))
     {
         return false;
     }
-    if let Some(role_condition) = &conditions.ax_role
-        && let Some(role) = &info.ax_role
-        && !role.eq_ignore_ascii_case(role_condition)
+    if let Some(role) = &conditions.ax_role
+        && !info.ax_role.as_ref().is_some_and(|v| v.eq_ignore_ascii_case(role))
     {
         return false;
     }
-    if let Some(subrole_condition) = &conditions.ax_subrole
-        && let Some(subrole) = &info.ax_subrole
-        && !subrole.eq_ignore_ascii_case(subrole_condition)
+    if let Some(subrole) = &conditions.ax_subrole
+        && !info.ax_subrole.as_ref().is_some_and(|v| v.eq_ignore_ascii_case(subrole))
     {
         return false;
     }
     true
+}
+
+/// Case-insensitive substring test.
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
 fn classify_window(rules: &[AppRule], info: &LayoutWindowInfo) -> WindowClass {
@@ -1665,6 +1665,22 @@ mod tests {
         info.ax_role = Some("AXWindow".into());
         info.ax_subrole = Some("AXDialog".into());
         assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
+    }
+
+    #[test]
+    fn condition_does_not_match_when_attribute_is_absent() {
+        // A rule that requires an attribute must not match a window that lacks
+        // it; the condition should fail rather than be skipped.
+        let rules = [AppRule {
+            conditions: AppRuleConditions {
+                app_id: Some("com.example.X".into()),
+                ..Default::default()
+            },
+            float: Some(true),
+        }];
+        let mut info = win_info();
+        info.bundle_id = None;
+        assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
     }
 
     #[test]
