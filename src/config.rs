@@ -58,6 +58,7 @@ fn default_config_paths() -> Vec<PathBuf> {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Config {
     pub settings: Settings,
+    pub app_rules: Vec<AppRule>,
     pub keys: Vec<(Hotkey, WmCommand)>,
 }
 
@@ -66,6 +67,7 @@ pub struct Config {
 #[serde(default)]
 struct ConfigPartial {
     settings: SettingsPartial,
+    app_rules: Option<Vec<AppRule>>,
     keys: Option<FxHashMap<String, WmCommandOrDisable>>,
 }
 
@@ -96,7 +98,6 @@ pub struct Settings {
     pub inner_gap: f64,
     pub default_keys: bool,
     pub default_layout_kind: LayoutKind,
-    pub app_rules: Vec<AppRule>,
     #[derive_args(GroupBarsPartial)]
     pub group_bars: GroupBars,
     #[derive_args(StatusIconPartial)]
@@ -354,6 +355,7 @@ impl ConfigPartial {
         }
         Ok(Config {
             settings: self.settings.validate()?,
+            app_rules: self.app_rules.unwrap_or_default(),
             keys,
         })
     }
@@ -368,6 +370,7 @@ impl ConfigPartial {
         keys.extend(high.keys.unwrap_or_default());
         Self {
             settings: SettingsPartial::merge(low.settings, high.settings),
+            app_rules: high.app_rules.or(low.app_rules),
             keys: Some(keys),
         }
     }
@@ -477,14 +480,13 @@ mod tests {
 
     #[test]
     fn app_rules_are_empty_by_default() {
-        assert!(Config::default().settings.app_rules.is_empty());
+        assert!(Config::default().app_rules.is_empty());
     }
 
     #[test]
     fn app_rules_parse() {
         let config = Config::parse(
             r#"
-            [settings]
             app_rules = [
               { if = { app_id = "com.example.X", title_regex = "Dialog" }, float = true },
               { if = { title_substring = "Preferences", ax_subrole = "AXDialog" }, float = true },
@@ -493,7 +495,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.settings.app_rules,
+            config.app_rules,
             vec![
                 AppRule {
                     conditions: AppRuleConditions {
@@ -520,14 +522,14 @@ mod tests {
         // The `if.app_id` dotted-key form from the aerospace-style API.
         let config = Config::parse(
             r#"
-            [[settings.app_rules]]
+            [[app_rules]]
             if.app_id = "com.example.X"
             float = true
             "#,
         )
         .unwrap();
         assert_eq!(
-            config.settings.app_rules,
+            config.app_rules,
             vec![AppRule {
                 conditions: AppRuleConditions {
                     app_id: Some("com.example.X".into()),
@@ -542,7 +544,6 @@ mod tests {
     fn app_rule_invalid_regex_is_rejected() {
         let err = Config::parse(
             r#"
-            [settings]
             app_rules = [{ if = { title_regex = "(unterminated" }, float = true }]
             "#,
         )

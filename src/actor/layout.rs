@@ -361,7 +361,7 @@ impl LayoutManager {
     pub fn set_config(&mut self, config: &Config) {
         self.scroll_cfg = config.settings.experimental.scroll.clone().validated();
         self.scroll_enabled = self.scroll_cfg.enable;
-        self.app_rules = config.settings.app_rules.clone();
+        self.app_rules = config.app_rules.clone();
         self.default_layout_kind = match (self.scroll_enabled, config.settings.default_layout_kind)
         {
             (false, LayoutKind::Scroll) => {
