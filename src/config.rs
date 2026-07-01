@@ -18,7 +18,7 @@ use std::str::FromStr;
 use livesplit_hotkey::Hotkey;
 use macro_rules_attribute::derive;
 use partial::{PartialConfig, ValidationError};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -123,7 +123,8 @@ impl Deref for ConfigRegex {
 impl FromStr for ConfigRegex {
     type Err = regex::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Regex::new(s).map(ConfigRegex)
+        // App rule conditions always match case-insensitively.
+        RegexBuilder::new(s).case_insensitive(true).build().map(ConfigRegex)
     }
 }
 
@@ -165,23 +166,24 @@ pub struct AppRule {
 
 /// Conditions matched against a window and its application. All specified
 /// conditions must match (logical AND); omitted conditions are ignored, so an
-/// empty set of conditions matches every window.
+/// empty set of conditions matches every window. All conditions match
+/// case-insensitively.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct AppRuleConditions {
     /// Application bundle identifier, matched exactly (e.g. "com.apple.Safari").
     pub app_id: Option<String>,
-    /// Substring match (case-sensitive) on the application's localized name.
+    /// Substring match on the application's localized name.
     pub app_name: Option<String>,
     /// Regex matched against the window title. Must be a valid regex or the
     /// config is rejected.
     pub title_regex: Option<ConfigRegex>,
-    /// Literal substring match (case-sensitive) on the window title.
+    /// Literal substring match on the window title.
     pub title_substring: Option<String>,
-    /// Exact match for the macOS Accessibility AXRole (e.g. "AXWindow").
+    /// Match for the macOS Accessibility AXRole (e.g. "AXWindow").
     pub ax_role: Option<String>,
-    /// Exact match for the macOS Accessibility AXSubrole (e.g. "AXDialog").
+    /// Match for the macOS Accessibility AXSubrole (e.g. "AXDialog").
     pub ax_subrole: Option<String>,
 }
 

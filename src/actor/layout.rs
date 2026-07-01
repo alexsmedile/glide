@@ -238,17 +238,25 @@ enum WindowClass {
 }
 
 /// Returns true if every specified condition of `rule` matches the window. A
-/// rule with no conditions matches every window.
+/// rule with no conditions matches every window. All conditions match
+/// case-insensitively (the regex is compiled case-insensitively in config).
 fn app_rule_matches(rule: &AppRule, info: &LayoutWindowInfo) -> bool {
     let conditions = &rule.conditions;
     let title = || info.title.as_ref().map(|t| t.expose_secret().as_str()).unwrap_or("");
+    // Case-insensitive equality against an optional window attribute.
+    let eq = |pattern: &str, value: Option<&str>| {
+        value.is_some_and(|value| value.eq_ignore_ascii_case(pattern))
+    };
+    // Case-insensitive substring test.
+    let contains =
+        |haystack: &str, needle: &str| haystack.to_lowercase().contains(&needle.to_lowercase());
     if let Some(app_id) = &conditions.app_id
-        && info.bundle_id.as_deref() != Some(app_id.as_str())
+        && !eq(app_id, info.bundle_id.as_deref())
     {
         return false;
     }
     if let Some(app_name) = &conditions.app_name
-        && !info.app_name.as_deref().is_some_and(|n| n.contains(app_name.as_str()))
+        && !info.app_name.as_deref().is_some_and(|n| contains(n, app_name))
     {
         return false;
     }
@@ -258,17 +266,17 @@ fn app_rule_matches(rule: &AppRule, info: &LayoutWindowInfo) -> bool {
         return false;
     }
     if let Some(substring) = &conditions.title_substring
-        && !title().contains(substring.as_str())
+        && !contains(title(), substring)
     {
         return false;
     }
     if let Some(role) = &conditions.ax_role
-        && info.ax_role.as_deref() != Some(role.as_str())
+        && !eq(role, info.ax_role.as_deref())
     {
         return false;
     }
     if let Some(subrole) = &conditions.ax_subrole
-        && info.ax_subrole.as_deref() != Some(subrole.as_str())
+        && !eq(subrole, info.ax_subrole.as_deref())
     {
         return false;
     }
@@ -1636,6 +1644,29 @@ mod tests {
         // One mismatched condition (subrole) means the rule does not apply.
         info.ax_subrole = Some("AXStandardWindow".into());
         assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
+    }
+
+    #[test]
+    fn rule_conditions_match_case_insensitively() {
+        let rules = [AppRule {
+            conditions: AppRuleConditions {
+                app_id: Some("COM.EXAMPLE.x".into()),
+                app_name: Some("code".into()),
+                title_regex: Some("dialog".parse().unwrap()),
+                title_substring: Some("SETTINGS".into()),
+                ax_role: Some("axwindow".into()),
+                ax_subrole: Some("AXDIALOG".into()),
+            },
+            float: Some(true),
+        }];
+
+        let mut info = win_info();
+        info.bundle_id = Some("com.example.X".into());
+        info.app_name = Some("Visual Studio Code".into());
+        info.title = Some("Settings Dialog".to_owned().into());
+        info.ax_role = Some("AXWindow".into());
+        info.ax_subrole = Some("AXDialog".into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
     }
 
     #[test]
