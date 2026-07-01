@@ -32,12 +32,12 @@ default_layout_kind = "tree"
 
 # Per-app/window rules overriding how windows are managed when first observed.
 #
-# Each rule is a table with optional matchers and a `floating` action. All
-# specified matchers must match (logical AND); omitted matchers are ignored.
-# Rules are evaluated in order and the first match wins. A matching rule
-# overrides Glide's built-in floating heuristics.
+# Each rule nests its conditions under `if` and carries a `float` action. All
+# specified conditions must match (logical AND); omitted conditions are
+# ignored. Rules are evaluated in order and the first match wins. A matching
+# rule overrides Glide's built-in floating heuristics.
 #
-# Matchers:
+# Conditions (under `if`):
 #   app_id          - bundle identifier, exact match (e.g. "com.apple.Safari")
 #   app_name        - case-sensitive substring of the app's localized name
 #   title_regex     - regex against the window title (must be a valid regex)
@@ -46,15 +46,22 @@ default_layout_kind = "tree"
 #   ax_subrole      - exact Accessibility AXSubrole (e.g. "AXDialog")
 #
 # Action:
-#   floating        - true to float matching windows, false to tile them
+#   float           - true to float matching windows, false to tile them
 #
 # Example:
-#   app_rules = [
-#     { app_id = "com.example.X", title_regex = "Dialog", floating = true },
-#     { app_id = "com.example.X", floating = false },
-#     { title_substring = "Preferences", floating = true },
-#   ]
-app_rules = []
+#   [[app_rules]]
+#   if.app_id = "com.example.X"
+#   if.title_regex = "Dialog"
+#   float = true
+#
+#   [[app_rules]]
+#   if.app_id = "com.example.X"
+#   float = false
+#
+#   [[app_rules]]
+#   if.title_substring = "Preferences"
+#   float = true
+[[app_rules]]
 
 # Visual bars for window groups (tabbed/stacked containers).
 group_bars.enable = true

@@ -237,36 +237,37 @@ enum WindowClass {
     Regular,
 }
 
-/// Returns true if every specified matcher of `rule` matches the window. A
-/// rule with no matchers matches every window.
+/// Returns true if every specified condition of `rule` matches the window. A
+/// rule with no conditions matches every window.
 fn app_rule_matches(rule: &AppRule, info: &LayoutWindowInfo) -> bool {
+    let conditions = &rule.conditions;
     let title = || info.title.as_ref().map(|t| t.expose_secret().as_str()).unwrap_or("");
-    if let Some(app_id) = &rule.app_id
+    if let Some(app_id) = &conditions.app_id
         && info.bundle_id.as_deref() != Some(app_id.as_str())
     {
         return false;
     }
-    if let Some(app_name) = &rule.app_name
+    if let Some(app_name) = &conditions.app_name
         && !info.app_name.as_deref().is_some_and(|n| n.contains(app_name.as_str()))
     {
         return false;
     }
-    if let Some(re) = rule.title_regex.as_deref()
+    if let Some(re) = conditions.title_regex.as_deref()
         && !re.is_match(title())
     {
         return false;
     }
-    if let Some(substring) = &rule.title_substring
+    if let Some(substring) = &conditions.title_substring
         && !title().contains(substring.as_str())
     {
         return false;
     }
-    if let Some(role) = &rule.ax_role
+    if let Some(role) = &conditions.ax_role
         && info.ax_role.as_deref() != Some(role.as_str())
     {
         return false;
     }
-    if let Some(subrole) = &rule.ax_subrole
+    if let Some(subrole) = &conditions.ax_subrole
         && info.ax_subrole.as_deref() != Some(subrole.as_str())
     {
         return false;
@@ -312,11 +313,11 @@ fn classify_window(rules: &[AppRule], info: &LayoutWindowInfo) -> WindowClass {
     }
 
     // The first user rule with an action that matches overrides the built-in
-    // heuristics below. Rules without an action (no `floating`) are skipped.
+    // heuristics below. Rules without an action (no `float`) are skipped.
     if let Some(floating) = rules
         .iter()
-        .find(|rule| rule.floating.is_some() && app_rule_matches(rule, info))
-        .and_then(|rule| rule.floating)
+        .find(|rule| rule.float.is_some() && app_rule_matches(rule, info))
+        .and_then(|rule| rule.float)
     {
         return if floating {
             WindowClass::FloatByDefault
@@ -1527,6 +1528,7 @@ mod tests {
     use test_log::test;
 
     use super::*;
+    use crate::config::AppRuleConditions;
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> CGRect {
         CGRect::new(CGPoint::new(x as f64, y as f64), CGSize::new(w as f64, h as f64))
@@ -1567,9 +1569,11 @@ mod tests {
     #[test]
     fn app_id_rule_floats_matching_window_only() {
         let rules = [AppRule {
-            app_id: Some("com.example.X".into()),
-            floating: Some(true),
-            ..Default::default()
+            conditions: AppRuleConditions {
+                app_id: Some("com.example.X".into()),
+                ..Default::default()
+            },
+            float: Some(true),
         }];
 
         let mut info = win_info();
@@ -1584,15 +1588,19 @@ mod tests {
     fn earlier_rule_wins() {
         let rules = [
             AppRule {
-                app_id: Some("com.example.X".into()),
-                title_regex: Some("Dialog".parse().unwrap()),
-                floating: Some(true),
-                ..Default::default()
+                conditions: AppRuleConditions {
+                    app_id: Some("com.example.X".into()),
+                    title_regex: Some("Dialog".parse().unwrap()),
+                    ..Default::default()
+                },
+                float: Some(true),
             },
             AppRule {
-                app_id: Some("com.example.X".into()),
-                floating: Some(false),
-                ..Default::default()
+                conditions: AppRuleConditions {
+                    app_id: Some("com.example.X".into()),
+                    ..Default::default()
+                },
+                float: Some(false),
             },
         ];
 
@@ -1606,14 +1614,16 @@ mod tests {
     }
 
     #[test]
-    fn rule_matchers_combine_with_and() {
+    fn rule_conditions_combine_with_and() {
         let rules = [AppRule {
-            app_name: Some("Code".into()),
-            title_substring: Some("Settings".into()),
-            ax_role: Some("AXWindow".into()),
-            ax_subrole: Some("AXDialog".into()),
-            floating: Some(true),
-            ..Default::default()
+            conditions: AppRuleConditions {
+                app_name: Some("Code".into()),
+                title_substring: Some("Settings".into()),
+                ax_role: Some("AXWindow".into()),
+                ax_subrole: Some("AXDialog".into()),
+                ..Default::default()
+            },
+            float: Some(true),
         }];
 
         let mut info = win_info();
@@ -1623,7 +1633,7 @@ mod tests {
         info.ax_subrole = Some("AXDialog".into());
         assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
 
-        // One mismatched matcher (subrole) means the rule does not apply.
+        // One mismatched condition (subrole) means the rule does not apply.
         info.ax_subrole = Some("AXStandardWindow".into());
         assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
     }
@@ -1632,9 +1642,11 @@ mod tests {
     fn rule_overrides_builtin_float_heuristics() {
         // System Preferences floats by default; a rule can force it to tile.
         let rules = [AppRule {
-            app_id: Some("com.apple.systempreferences".into()),
-            floating: Some(false),
-            ..Default::default()
+            conditions: AppRuleConditions {
+                app_id: Some("com.apple.systempreferences".into()),
+                ..Default::default()
+            },
+            float: Some(false),
         }];
         let mut info = win_info();
         info.bundle_id = Some("com.apple.systempreferences".into());
@@ -1642,9 +1654,11 @@ mod tests {
 
         // A non-resizable window floats by default; a rule can force it to tile.
         let rules = [AppRule {
-            app_id: Some("com.example.X".into()),
-            floating: Some(false),
-            ..Default::default()
+            conditions: AppRuleConditions {
+                app_id: Some("com.example.X".into()),
+                ..Default::default()
+            },
+            float: Some(false),
         }];
         let mut info = win_info();
         info.bundle_id = Some("com.example.X".into());
@@ -1655,8 +1669,8 @@ mod tests {
     #[test]
     fn rules_cannot_override_untracked_phantom_windows() {
         let rules = [AppRule {
-            floating: Some(true),
-            ..Default::default()
+            conditions: AppRuleConditions::default(),
+            float: Some(true),
         }];
         let mut info = win_info();
         info.layer = Some(3);
@@ -1665,11 +1679,14 @@ mod tests {
 
     #[test]
     fn rule_without_action_is_skipped() {
-        // A rule with no `floating` action is ignored; classification falls
+        // A rule with no `float` action is ignored; classification falls
         // through to the built-in heuristics.
         let rules = [AppRule {
-            app_id: Some("com.example.X".into()),
-            ..Default::default()
+            conditions: AppRuleConditions {
+                app_id: Some("com.example.X".into()),
+                ..Default::default()
+            },
+            float: None,
         }];
         let mut info = win_info();
         info.bundle_id = Some("com.example.X".into());

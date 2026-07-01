@@ -148,13 +148,27 @@ impl Serialize for ConfigRegex {
 /// A rule that overrides how a window is managed when it is first observed,
 /// based on properties of the window and its application.
 ///
-/// All specified matchers must match (logical AND) for the rule to apply.
-/// Omitted matchers are ignored. Rules are evaluated in order and the first
-/// matching rule wins. See `app_rules` in the configuration.
+/// Conditions are nested under `if`; all specified conditions must match
+/// (logical AND) for the rule to apply. Rules are evaluated in order and the
+/// first matching rule wins. See `app_rules` in the configuration.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct AppRule {
+    /// Conditions a window must satisfy for this rule to apply.
+    #[serde(rename = "if")]
+    pub conditions: AppRuleConditions,
+    /// Whether matching windows should float (`true`) or tile (`false`).
+    pub float: Option<bool>,
+}
+
+/// Conditions matched against a window and its application. All specified
+/// conditions must match (logical AND); omitted conditions are ignored, so an
+/// empty set of conditions matches every window.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+#[serde(deny_unknown_fields)]
+#[serde(default)]
+pub struct AppRuleConditions {
     /// Application bundle identifier, matched exactly (e.g. "com.apple.Safari").
     pub app_id: Option<String>,
     /// Substring match (case-sensitive) on the application's localized name.
@@ -168,8 +182,6 @@ pub struct AppRule {
     pub ax_role: Option<String>,
     /// Exact match for the macOS Accessibility AXSubrole (e.g. "AXDialog").
     pub ax_subrole: Option<String>,
-    /// Whether matching windows should float (`true`) or tile (`false`).
-    pub floating: Option<bool>,
 }
 
 #[derive(PartialConfig!)]
@@ -474,8 +486,8 @@ mod tests {
             r#"
             [settings]
             app_rules = [
-              { app_id = "com.example.X", title_regex = "Dialog", floating = true },
-              { title_substring = "Preferences", ax_subrole = "AXDialog", floating = true },
+              { if = { app_id = "com.example.X", title_regex = "Dialog" }, float = true },
+              { if = { title_substring = "Preferences", ax_subrole = "AXDialog" }, float = true },
             ]
             "#,
         )
@@ -484,18 +496,45 @@ mod tests {
             config.settings.app_rules,
             vec![
                 AppRule {
-                    app_id: Some("com.example.X".into()),
-                    title_regex: Some("Dialog".parse().unwrap()),
-                    floating: Some(true),
-                    ..Default::default()
+                    conditions: AppRuleConditions {
+                        app_id: Some("com.example.X".into()),
+                        title_regex: Some("Dialog".parse().unwrap()),
+                        ..Default::default()
+                    },
+                    float: Some(true),
                 },
                 AppRule {
-                    title_substring: Some("Preferences".into()),
-                    ax_subrole: Some("AXDialog".into()),
-                    floating: Some(true),
-                    ..Default::default()
+                    conditions: AppRuleConditions {
+                        title_substring: Some("Preferences".into()),
+                        ax_subrole: Some("AXDialog".into()),
+                        ..Default::default()
+                    },
+                    float: Some(true),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn app_rules_parse_with_dotted_if_keys() {
+        // The `if.app_id` dotted-key form from the aerospace-style API.
+        let config = Config::parse(
+            r#"
+            [[settings.app_rules]]
+            if.app_id = "com.example.X"
+            float = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.settings.app_rules,
+            vec![AppRule {
+                conditions: AppRuleConditions {
+                    app_id: Some("com.example.X".into()),
+                    ..Default::default()
+                },
+                float: Some(true),
+            }]
         );
     }
 
@@ -504,7 +543,7 @@ mod tests {
         let err = Config::parse(
             r#"
             [settings]
-            app_rules = [{ title_regex = "(unterminated", floating = true }]
+            app_rules = [{ if = { title_regex = "(unterminated" }, float = true }]
             "#,
         )
         .unwrap_err();
