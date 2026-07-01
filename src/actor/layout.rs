@@ -15,7 +15,7 @@ use tracing::{debug, error, warn};
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::collections::{BTreeExt, BTreeSet, HashMap, HashSet};
-use crate::config::{AppRule, Config, NewWindowPlacement, ScrollConfig};
+use crate::config::{AppRule, AppRuleConditions, Config, NewWindowPlacement, ScrollConfig};
 use crate::model::scroll_viewport::ViewportState;
 use crate::model::{
     ContainerKind, Direction, LayoutId, LayoutKind, LayoutTree, NodeId, Orientation,
@@ -240,43 +240,41 @@ enum WindowClass {
 /// Returns true if every specified condition of `rule` matches the window. A
 /// rule with no conditions matches every window. All conditions match
 /// case-insensitively (the regex is compiled case-insensitively in config).
-fn app_rule_matches(rule: &AppRule, info: &LayoutWindowInfo) -> bool {
-    let conditions = &rule.conditions;
-    let title = || info.title.as_ref().map(|t| t.expose_secret().as_str()).unwrap_or("");
-    // Case-insensitive equality against an optional window attribute.
-    let eq = |pattern: &str, value: Option<&str>| {
-        value.is_some_and(|value| value.eq_ignore_ascii_case(pattern))
-    };
-    // Case-insensitive substring test.
-    let contains =
-        |haystack: &str, needle: &str| haystack.to_lowercase().contains(&needle.to_lowercase());
-    if let Some(app_id) = &conditions.app_id
-        && !eq(app_id, info.bundle_id.as_deref())
+fn app_rule_matches(conditions: &AppRuleConditions, info: &LayoutWindowInfo) -> bool {
+    if let Some(app_id_condition) = &conditions.app_id
+        && let Some(app_id) = &info.bundle_id
+        && !app_id.eq_ignore_ascii_case(app_id_condition)
     {
         return false;
     }
-    if let Some(app_name) = &conditions.app_name
-        && !info.app_name.as_deref().is_some_and(|n| contains(n, app_name))
+    if let Some(app_name_condition) = &conditions.app_name
+        && let Some(app_name) = &info.app_name
+        && !app_name.eq_ignore_ascii_case(app_name_condition)
     {
         return false;
     }
+    let title = info.title.as_ref().map(|t| t.expose_secret().as_str());
     if let Some(re) = conditions.title_regex.as_deref()
-        && !re.is_match(title())
+        && let Some(title) = title
+        && !re.is_match(title)
     {
         return false;
     }
-    if let Some(substring) = &conditions.title_substring
-        && !contains(title(), substring)
+    if let Some(substring_condition) = &conditions.title_substring
+        && let Some(title) = title
+        && !title.to_lowercase().contains(&substring_condition.to_lowercase())
     {
         return false;
     }
-    if let Some(role) = &conditions.ax_role
-        && !eq(role, info.ax_role.as_deref())
+    if let Some(role_condition) = &conditions.ax_role
+        && let Some(role) = &info.ax_role
+        && !role.eq_ignore_ascii_case(role_condition)
     {
         return false;
     }
-    if let Some(subrole) = &conditions.ax_subrole
-        && !eq(subrole, info.ax_subrole.as_deref())
+    if let Some(subrole_condition) = &conditions.ax_subrole
+        && let Some(subrole) = &info.ax_subrole
+        && !subrole.eq_ignore_ascii_case(subrole_condition)
     {
         return false;
     }
@@ -324,7 +322,7 @@ fn classify_window(rules: &[AppRule], info: &LayoutWindowInfo) -> WindowClass {
     // heuristics below. Rules without an action (no `float`) are skipped.
     if let Some(floating) = rules
         .iter()
-        .find(|rule| rule.float.is_some() && app_rule_matches(rule, info))
+        .find(|rule| rule.float.is_some() && app_rule_matches(&rule.conditions, info))
         .and_then(|rule| rule.float)
     {
         return if floating {
