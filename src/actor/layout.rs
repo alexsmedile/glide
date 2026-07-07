@@ -238,8 +238,7 @@ enum WindowClass {
 }
 
 /// Returns true if every specified condition of `rule` matches the window. A
-/// rule with no conditions matches every window. All conditions match
-/// case-insensitively (the regex is compiled case-insensitively in config).
+/// rule with no conditions matches every window.
 fn app_rule_matches(conditions: &AppRuleConditions, info: &LayoutWindowInfo) -> bool {
     // A specified condition fails to match when the window lacks that attribute.
     if let Some(app_id) = &conditions.app_id
@@ -318,14 +317,9 @@ fn classify_window(rules: &[AppRule], info: &LayoutWindowInfo) -> WindowClass {
         _ => {}
     }
 
-    // The first user rule with an action that matches overrides the built-in
-    // heuristics below. Rules without an action (no `float`) are skipped.
-    if let Some(floating) = rules
-        .iter()
-        .find(|rule| rule.float.is_some() && app_rule_matches(&rule.conditions, info))
-        .and_then(|rule| rule.float)
-    {
-        return if floating {
+    // The first matching user rule overrides the built-in heuristics below.
+    if let Some(rule) = rules.iter().find(|rule| app_rule_matches(&rule.conditions, info)) {
+        return if rule.float {
             WindowClass::FloatByDefault
         } else {
             WindowClass::Regular
@@ -365,6 +359,7 @@ impl LayoutManager {
     }
 
     pub fn set_config(&mut self, config: &Config) {
+        // TODO: store a reference to Config instead of cloning fields
         self.scroll_cfg = config.settings.experimental.scroll.clone().validated();
         self.scroll_enabled = self.scroll_cfg.enable;
         self.app_rules = config.app_rules.clone();
@@ -1579,7 +1574,7 @@ mod tests {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
             },
-            float: Some(true),
+            float: true,
         }];
 
         let mut info = win_info();
@@ -1599,14 +1594,14 @@ mod tests {
                     title_regex: Some("Dialog".parse().unwrap()),
                     ..Default::default()
                 },
-                float: Some(true),
+                float: true,
             },
             AppRule {
                 conditions: AppRuleConditions {
                     app_id: Some("com.example.X".into()),
                     ..Default::default()
                 },
-                float: Some(false),
+                float: false,
             },
         ];
 
@@ -1629,7 +1624,7 @@ mod tests {
                 ax_subrole: Some("AXDialog".into()),
                 ..Default::default()
             },
-            float: Some(true),
+            float: true,
         }];
 
         let mut info = win_info();
@@ -1655,7 +1650,7 @@ mod tests {
                 ax_role: Some("axwindow".into()),
                 ax_subrole: Some("AXDIALOG".into()),
             },
-            float: Some(true),
+            float: true,
         }];
 
         let mut info = win_info();
@@ -1676,7 +1671,7 @@ mod tests {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
             },
-            float: Some(true),
+            float: true,
         }];
         let mut info = win_info();
         info.bundle_id = None;
@@ -1691,7 +1686,7 @@ mod tests {
                 app_id: Some("com.apple.systempreferences".into()),
                 ..Default::default()
             },
-            float: Some(false),
+            float: false,
         }];
         let mut info = win_info();
         info.bundle_id = Some("com.apple.systempreferences".into());
@@ -1703,7 +1698,7 @@ mod tests {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
             },
-            float: Some(false),
+            float: false,
         }];
         let mut info = win_info();
         info.bundle_id = Some("com.example.X".into());
@@ -1715,29 +1710,11 @@ mod tests {
     fn rules_cannot_override_untracked_phantom_windows() {
         let rules = [AppRule {
             conditions: AppRuleConditions::default(),
-            float: Some(true),
+            float: true,
         }];
         let mut info = win_info();
         info.layer = Some(3);
         assert_eq!(classify_window(&rules, &info), WindowClass::Untracked);
-    }
-
-    #[test]
-    fn rule_without_action_is_skipped() {
-        // A rule with no `float` action is ignored; classification falls
-        // through to the built-in heuristics.
-        let rules = [AppRule {
-            conditions: AppRuleConditions {
-                app_id: Some("com.example.X".into()),
-                ..Default::default()
-            },
-            float: None,
-        }];
-        let mut info = win_info();
-        info.bundle_id = Some("com.example.X".into());
-        assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
-        info.is_resizable = false;
-        assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
     }
 
     impl LayoutManager {

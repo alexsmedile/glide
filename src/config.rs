@@ -123,7 +123,6 @@ impl Deref for ConfigRegex {
 impl FromStr for ConfigRegex {
     type Err = regex::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // App rule conditions always match case-insensitively.
         RegexBuilder::new(s).case_insensitive(true).build().map(ConfigRegex)
     }
 }
@@ -153,15 +152,14 @@ impl Serialize for ConfigRegex {
 /// Conditions are nested under `if`; all specified conditions must match
 /// (logical AND) for the rule to apply. Rules are evaluated in order and the
 /// first matching rule wins. See `app_rules` in the configuration.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
-#[serde(default)]
 pub struct AppRule {
     /// Conditions a window must satisfy for this rule to apply.
-    #[serde(rename = "if")]
+    #[serde(rename = "if", default)]
     pub conditions: AppRuleConditions,
     /// Whether matching windows should float (`true`) or tile (`false`).
-    pub float: Option<bool>,
+    pub float: bool,
 }
 
 /// Conditions matched against a window and its application. All specified
@@ -505,7 +503,7 @@ mod tests {
                         title_regex: Some("Dialog".parse().unwrap()),
                         ..Default::default()
                     },
-                    float: Some(true),
+                    float: true,
                 },
                 AppRule {
                     conditions: AppRuleConditions {
@@ -513,7 +511,7 @@ mod tests {
                         ax_subrole: Some("AXDialog".into()),
                         ..Default::default()
                     },
-                    float: Some(true),
+                    float: true,
                 },
             ]
         );
@@ -537,7 +535,7 @@ mod tests {
                     app_id: Some("com.example.X".into()),
                     ..Default::default()
                 },
-                float: Some(true),
+                float: true,
             }]
         );
     }
