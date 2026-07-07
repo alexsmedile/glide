@@ -450,7 +450,7 @@ mod tests {
             frame: CGRect::ZERO,
             sys_id: None,
             is_resizable: true,
-            ax_role: None,
+            ax_role: "AXWindow".into(),
             ax_subrole: None,
         };
         h.on_event(Event::WindowCreated(wid, info, MouseState::Up));

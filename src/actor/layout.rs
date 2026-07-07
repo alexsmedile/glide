@@ -89,7 +89,7 @@ pub struct LayoutWindowInfo {
     pub layer: Option<i32>,
     pub is_standard: bool,
     pub is_resizable: bool,
-    pub ax_role: Option<String>,
+    pub ax_role: String,
     pub ax_subrole: Option<String>,
 }
 
@@ -264,7 +264,7 @@ fn app_rule_matches(conditions: &AppRuleConditions, info: &LayoutWindowInfo) -> 
         return false;
     }
     if let Some(role) = &conditions.ax_role
-        && !info.ax_role.as_ref().is_some_and(|v| v.eq_ignore_ascii_case(role))
+        && !info.ax_role.eq_ignore_ascii_case(role)
     {
         return false;
     }
@@ -1552,7 +1552,7 @@ mod tests {
             layer: Some(0),
             is_standard: true,
             is_resizable: true,
-            ax_role: None,
+            ax_role: String::new(),
             ax_subrole: None,
         }
     }
@@ -1635,7 +1635,7 @@ mod tests {
         let mut info = win_info();
         info.app_name = Some("Visual Studio Code".into());
         info.title = Some("Settings — main".to_owned().into());
-        info.ax_role = Some("AXWindow".into());
+        info.ax_role = "AXWindow".into();
         info.ax_subrole = Some("AXDialog".into());
         assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
 
@@ -1662,7 +1662,7 @@ mod tests {
         info.bundle_id = Some("com.example.X".into());
         info.app_name = Some("Visual Studio Code".into());
         info.title = Some("Settings Dialog".to_owned().into());
-        info.ax_role = Some("AXWindow".into());
+        info.ax_role = "AXWindow".into();
         info.ax_subrole = Some("AXDialog".into());
         assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
     }
