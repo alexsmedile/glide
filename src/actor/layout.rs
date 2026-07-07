@@ -240,44 +240,24 @@ enum WindowClass {
 /// Returns true if every specified condition of `rule` matches the window. A
 /// rule with no conditions matches every window.
 fn app_rule_matches(conditions: &AppRuleConditions, info: &LayoutWindowInfo) -> bool {
-    // A specified condition fails to match when the window lacks that attribute.
-    if let Some(app_id) = &conditions.app_id
-        && !info.bundle_id.as_ref().is_some_and(|v| v.eq_ignore_ascii_case(app_id))
-    {
-        return false;
-    }
-    if let Some(app_name) = &conditions.app_name
-        && !info.app_name.as_ref().is_some_and(|v| contains_ignore_case(v, app_name))
-    {
-        return false;
-    }
     let title = info.title.as_ref().map(|t| t.expose_secret().as_str());
-    if let Some(re) = conditions.title_regex.as_deref()
-        && !title.is_some_and(|t| re.is_match(t))
-    {
-        return false;
-    }
-    if let Some(substring) = &conditions.title_substring
-        && !title.is_some_and(|t| contains_ignore_case(t, substring))
-    {
-        return false;
-    }
-    if let Some(role) = &conditions.ax_role
-        && !info.ax_role.eq_ignore_ascii_case(role)
-    {
-        return false;
-    }
-    if let Some(subrole) = &conditions.ax_subrole
-        && !info.ax_subrole.as_ref().is_some_and(|v| v.eq_ignore_ascii_case(subrole))
-    {
-        return false;
-    }
-    true
-}
-
-/// Case-insensitive substring test.
-fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
-    haystack.to_lowercase().contains(&needle.to_lowercase())
+    let eq = |pattern: Option<&str>, value: Option<&str>| {
+        pattern.map_or(true, |p| value.is_some_and(|v| v.eq_ignore_ascii_case(p)))
+    };
+    let contains = |needle: Option<&str>, haystack: Option<&str>| {
+        needle.map_or(true, |n| {
+            haystack.is_some_and(|v| v.to_lowercase().contains(&n.to_lowercase()))
+        })
+    };
+    let matches = |re: Option<&regex::Regex>, value: Option<&str>| {
+        re.map_or(true, |re| value.is_some_and(|v| re.is_match(v)))
+    };
+    eq(conditions.app_id.as_deref(), info.bundle_id.as_deref())
+        && contains(conditions.app_name.as_deref(), info.app_name.as_deref())
+        && matches(conditions.title_regex.as_deref(), title)
+        && contains(conditions.title_substring.as_deref(), title)
+        && eq(conditions.ax_role.as_deref(), Some(info.ax_role.as_str()))
+        && eq(conditions.ax_subrole.as_deref(), info.ax_subrole.as_deref())
 }
 
 fn classify_window(rules: &[AppRule], info: &LayoutWindowInfo) -> WindowClass {
