@@ -212,7 +212,7 @@ pub struct LayoutManager {
     layout_mapping: HashMap<SpaceId, SpaceLayoutMapping>,
     floating_windows: BTreeSet<WindowId>,
     #[serde(skip)]
-    active_floating_windows: HashMap<SpaceId, HashMap<pid_t, HashSet<WindowId>>>,
+    active_floating_windows: ActiveFloatingWindows,
     #[serde(skip)]
     focused_window: Option<WindowId>,
     /// Last window focused in floating mode.
@@ -486,8 +486,8 @@ impl LayoutManager {
         } else {
             log!(print, "No layout for space {space:?}");
         }
-        if let Some(floating) = self.active_floating_windows.get(&space) {
-            let floating = floating.values().flatten().collect::<Vec<_>>();
+        let floating = self.active_floating_windows.in_space(space).collect::<Vec<_>>();
+        if !floating.is_empty() {
             log!(print, "Floating {floating:?}");
         }
     }
@@ -519,9 +519,7 @@ impl LayoutManager {
                 self.last_floating_focus
                     .take_if(|f| f.pid == pid && !window_map.contains_key(f));
                 let layout = self.layout(space);
-                let floating_active =
-                    self.active_floating_windows.entry(space).or_default().entry(pid).or_default();
-                floating_active.clear();
+                let floating_active = self.active_floating_windows.reset_app(space, pid);
                 let mut add_floating = Vec::new();
                 let mut new_windows = Vec::new();
                 let tree_windows = windows
@@ -592,11 +590,8 @@ impl LayoutManager {
                     // Floating windows live outside the tree, tracked per space
                     // in active_floating_windows. Move that bookkeeping rather
                     // than tiling the window into the destination layout.
-                    if let Some(removed) = removed
-                        && let Some(by_pid) = self.active_floating_windows.get_mut(&removed)
-                        && let Some(wids) = by_pid.get_mut(&wid.pid)
-                    {
-                        wids.remove(&wid);
+                    if let Some(removed) = removed {
+                        self.active_floating_windows.remove(removed, wid);
                     }
                     if let Some(added) = added {
                         self.add_floating_window(wid, Some(added));
@@ -766,15 +761,11 @@ impl LayoutManager {
                 let focus_window = selection.or_else(|| raise_windows.pop());
                 return EventResponse { raise_windows, focus_window };
             } else {
-                let floating_windows = self
+                let mut raise_windows: Vec<_> = self
                     .active_floating_windows
-                    .entry(space)
-                    .or_default()
-                    .values()
-                    .flatten()
-                    .copied();
-                let mut raise_windows: Vec<_> =
-                    floating_windows.filter(|&wid| Some(wid) != self.last_floating_focus).collect();
+                    .in_space(space)
+                    .filter(|&wid| Some(wid) != self.last_floating_focus)
+                    .collect();
                 // We need to focus some window to transition into floating
                 // mode. If there is no last floating window, pick one.
                 let focus_window = self.last_floating_focus.or_else(|| raise_windows.pop());
@@ -1001,7 +992,9 @@ impl LayoutManager {
             }
         }
     }
+}
 
+impl LayoutManager {
     fn is_floating(&self) -> bool {
         if let Some(focus) = self.focused_window {
             self.floating_windows.contains(&focus)
@@ -1012,12 +1005,7 @@ impl LayoutManager {
 
     fn add_floating_window(&mut self, wid: WindowId, space: Option<SpaceId>) {
         if let Some(space) = space {
-            self.active_floating_windows
-                .entry(space)
-                .or_default()
-                .entry(wid.pid)
-                .or_default()
-                .insert(wid);
+            self.active_floating_windows.insert(space, wid);
         }
         self.floating_windows.insert(wid);
     }
@@ -1028,16 +1016,48 @@ impl LayoutManager {
             let selection = self.tree.selection(layout);
             let node = self.tree.add_window_after(layout, selection, wid);
             self.tree.select(node);
-            self.active_floating_windows
-                .entry(space)
-                .or_default()
-                .entry(wid.pid)
-                .or_default()
-                .remove(&wid);
+            self.active_floating_windows.remove(space, wid);
         }
         self.floating_windows.remove(&wid);
     }
+}
 
+/// Tracks which floating windows are present on each space.
+#[derive(Default)]
+struct ActiveFloatingWindows {
+    by_space: HashMap<SpaceId, HashMap<pid_t, HashSet<WindowId>>>,
+}
+
+impl ActiveFloatingWindows {
+    fn insert(&mut self, space: SpaceId, wid: WindowId) {
+        self.by_space.entry(space).or_default().entry(wid.pid).or_default().insert(wid);
+    }
+
+    fn remove(&mut self, space: SpaceId, wid: WindowId) {
+        if let Some(by_pid) = self.by_space.get_mut(&space)
+            && let Some(wids) = by_pid.get_mut(&wid.pid)
+        {
+            wids.remove(&wid);
+        }
+    }
+
+    /// Clears the set of floating windows for one app on one space and returns a
+    /// handle for inserting that app's current floating windows.
+    fn reset_app(&mut self, space: SpaceId, pid: pid_t) -> &mut HashSet<WindowId> {
+        let set = self.by_space.entry(space).or_default().entry(pid).or_default();
+        set.clear();
+        set
+    }
+
+    fn in_space(&self, space: SpaceId) -> impl Iterator<Item = WindowId> + '_ {
+        self.by_space
+            .get(&space)
+            .into_iter()
+            .flat_map(|by_pid| by_pid.values().flatten().copied())
+    }
+}
+
+impl LayoutManager {
     pub fn calculate_layout(
         &self,
         space: SpaceId,
@@ -1080,7 +1100,9 @@ impl LayoutManager {
         }
         (sizes, groups)
     }
+}
 
+impl LayoutManager {
     fn scroll_config(&self) -> &ScrollConfig {
         &self.scroll_cfg
     }
@@ -1439,7 +1461,9 @@ impl LayoutManager {
     pub fn has_interactive_state(&self) -> bool {
         self.interactive_resize.is_some() || self.interactive_move.is_some()
     }
+}
 
+impl LayoutManager {
     fn try_layout(&self, space: SpaceId) -> Option<LayoutId> {
         self.layout_mapping.get(&space)?.active_layout().into()
     }
@@ -1492,11 +1516,7 @@ impl LayoutManager {
 
     #[cfg(test)]
     pub(super) fn floating_windows_in_space(&self, space: SpaceId) -> BTreeSet<WindowId> {
-        self.active_floating_windows
-            .get(&space)
-            .into_iter()
-            .flat_map(|by_pid| by_pid.values().flatten().copied())
-            .collect()
+        self.active_floating_windows.in_space(space).collect()
     }
 
     /// Every window present in any layout. Used by the restore snapshot tests to
