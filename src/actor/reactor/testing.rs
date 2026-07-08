@@ -82,6 +82,8 @@ pub fn make_window(idx: usize) -> WindowInfo {
         ),
         // TODO: This is wrong and conflicts with windows from other apps.
         sys_id: Some(WindowServerId::new(idx as u32)),
+        ax_role: String::new(),
+        ax_subrole: None,
     }
 }
 

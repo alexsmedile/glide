@@ -15,7 +15,7 @@ use tracing::{debug, error, warn};
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::collections::{BTreeExt, BTreeSet, HashMap, HashSet};
-use crate::config::{Config, NewWindowPlacement, ScrollConfig};
+use crate::config::{AppRule, AppRuleConditions, Config, NewWindowPlacement, ScrollConfig};
 use crate::model::scroll_viewport::ViewportState;
 use crate::model::{
     ContainerKind, Direction, LayoutId, LayoutKind, LayoutTree, NodeId, Orientation,
@@ -89,10 +89,13 @@ pub enum LayoutEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayoutWindowInfo {
     pub bundle_id: Option<String>,
+    pub app_name: Option<String>,
     pub title: Option<Secret<String>>,
     pub layer: Option<i32>,
     pub is_standard: bool,
     pub is_resizable: bool,
+    pub ax_role: String,
+    pub ax_subrole: Option<String>,
 }
 
 #[must_use]
@@ -225,6 +228,8 @@ pub struct LayoutManager {
     #[serde(skip)]
     scroll_enabled: bool,
     #[serde(skip)]
+    app_rules: Vec<AppRule>,
+    #[serde(skip)]
     interactive_resize: Option<InteractiveScrollResize>,
     #[serde(skip)]
     interactive_move: Option<InteractiveScrollMove>,
@@ -237,10 +242,37 @@ enum WindowClass {
     Regular,
 }
 
-fn classify_window(info: &LayoutWindowInfo) -> WindowClass {
+/// Returns true if every specified condition of `rule` matches the window. A
+/// rule with no conditions matches every window.
+fn app_rule_matches(conditions: &AppRuleConditions, info: &LayoutWindowInfo) -> bool {
+    let title = info.title.as_ref().map(|t| t.expose_secret().as_str());
+    let eq = |pattern: Option<&str>, value: Option<&str>| {
+        pattern.map_or(true, |p| value.is_some_and(|v| v.eq_ignore_ascii_case(p)))
+    };
+    let contains = |needle: Option<&str>, haystack: Option<&str>| {
+        needle.map_or(true, |n| {
+            haystack.is_some_and(|v| v.to_lowercase().contains(&n.to_lowercase()))
+        })
+    };
+    let matches = |re: Option<&regex::Regex>, value: Option<&str>| {
+        re.map_or(true, |re| value.is_some_and(|v| re.is_match(v)))
+    };
+    eq(conditions.app_id.as_deref(), info.bundle_id.as_deref())
+        && contains(conditions.app_name.as_deref(), info.app_name.as_deref())
+        && matches(conditions.title_regex.as_deref(), title)
+        && contains(conditions.title_substring.as_deref(), title)
+        && eq(conditions.ax_role.as_deref(), Some(info.ax_role.as_str()))
+        && eq(conditions.ax_subrole.as_deref(), info.ax_subrole.as_deref())
+}
+
+fn classify_window(rules: &[AppRule], info: &LayoutWindowInfo) -> WindowClass {
     use LayoutWindowInfo as Info;
+
+    // Phantom/non-window cases are handled first and can't be overridden by app
+    // rules, since floating or tiling a window that doesn't really exist makes
+    // no sense.
     match info {
-        &Info { layer: Some(layer), .. } if layer != 0 => WindowClass::Untracked,
+        &Info { layer: Some(layer), .. } if layer != 0 => return WindowClass::Untracked,
 
         // Finder reports a nonstandard window that doesn't actually "exist".
         // In general windows with no layer info are suspect, since it means
@@ -251,7 +283,7 @@ fn classify_window(info: &LayoutWindowInfo) -> WindowClass {
             is_standard: false,
             bundle_id: Some(bundle_id),
             ..
-        } if bundle_id == "com.apple.finder" => WindowClass::Untracked,
+        } if bundle_id == "com.apple.finder" => return WindowClass::Untracked,
 
         // Firefox picture-in-picture windows sometimes get observed at layer 0
         // after they are created, even though the layer is later changed to 3.
@@ -264,9 +296,22 @@ fn classify_window(info: &LayoutWindowInfo) -> WindowClass {
         } if bundle_id == "org.mozilla.firefox"
             && title.expose_secret() == "Picture-in-Picture" =>
         {
-            WindowClass::Untracked
+            return WindowClass::Untracked;
         }
 
+        _ => {}
+    }
+
+    // The first matching user rule overrides the built-in heuristics below.
+    if let Some(rule) = rules.iter().find(|rule| app_rule_matches(&rule.conditions, info)) {
+        return if rule.float {
+            WindowClass::FloatByDefault
+        } else {
+            WindowClass::Regular
+        };
+    }
+
+    match info {
         Info { is_standard: false, .. } => WindowClass::FloatByDefault,
         Info { is_resizable: false, .. } => WindowClass::FloatByDefault,
 
@@ -292,14 +337,17 @@ impl LayoutManager {
             default_layout_kind: LayoutKind::default(),
             scroll_cfg: Config::default().settings.experimental.scroll.validated(),
             scroll_enabled: false,
+            app_rules: Vec::new(),
             interactive_resize: None,
             interactive_move: None,
         }
     }
 
     pub fn set_config(&mut self, config: &Config) {
+        // TODO: store a reference to Config instead of cloning fields
         self.scroll_cfg = config.settings.experimental.scroll.clone().validated();
         self.scroll_enabled = self.scroll_cfg.enable;
+        self.app_rules = config.app_rules.clone();
         self.default_layout_kind = match (self.scroll_enabled, config.settings.default_layout_kind)
         {
             (false, LayoutKind::Scroll) => {
@@ -488,7 +536,7 @@ impl LayoutManager {
                         if self.tree.window_node(layout, *wid).is_some() {
                             return true;
                         }
-                        match classify_window(window_map.get(wid).unwrap()) {
+                        match classify_window(&self.app_rules, window_map.get(wid).unwrap()) {
                             WindowClass::Untracked => false,
                             WindowClass::FloatByDefault => {
                                 add_floating.push(*wid);
@@ -522,7 +570,7 @@ impl LayoutManager {
             }
             LayoutEvent::WindowAdded(space, wid, info) => {
                 self.debug_tree(space);
-                match classify_window(&info) {
+                match classify_window(&self.app_rules, &info) {
                     WindowClass::FloatByDefault => self.add_floating_window(wid, Some(space)),
                     WindowClass::Regular => {
                         let layout = self.layout(space);
@@ -1517,6 +1565,7 @@ mod tests {
     use test_log::test;
 
     use super::*;
+    use crate::config::AppRuleConditions;
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> CGRect {
         CGRect::new(CGPoint::new(x as f64, y as f64), CGSize::new(w as f64, h as f64))
@@ -1529,10 +1578,13 @@ mod tests {
     fn win_info() -> LayoutWindowInfo {
         LayoutWindowInfo {
             bundle_id: None,
+            app_name: None,
             title: None,
             layer: Some(0),
             is_standard: true,
             is_resizable: true,
+            ax_role: String::new(),
+            ax_subrole: None,
         }
     }
 
@@ -1541,6 +1593,164 @@ mod tests {
         config.settings.experimental.scroll.enable = enable;
         config.settings.default_layout_kind = default_layout_kind;
         config
+    }
+
+    #[test]
+    fn no_rules_falls_back_to_builtin_heuristics() {
+        let mut info = win_info();
+        assert_eq!(classify_window(&[], &info), WindowClass::Regular);
+        info.is_standard = false;
+        assert_eq!(classify_window(&[], &info), WindowClass::FloatByDefault);
+    }
+
+    #[test]
+    fn app_id_rule_floats_matching_window_only() {
+        let rules = [AppRule {
+            conditions: AppRuleConditions {
+                app_id: Some("com.example.X".into()),
+                ..Default::default()
+            },
+            float: true,
+        }];
+
+        let mut info = win_info();
+        info.bundle_id = Some("com.example.X".into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
+
+        info.bundle_id = Some("com.example.Y".into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
+    }
+
+    #[test]
+    fn earlier_rule_wins() {
+        let rules = [
+            AppRule {
+                conditions: AppRuleConditions {
+                    app_id: Some("com.example.X".into()),
+                    title_regex: Some("Dialog".parse().unwrap()),
+                    ..Default::default()
+                },
+                float: true,
+            },
+            AppRule {
+                conditions: AppRuleConditions {
+                    app_id: Some("com.example.X".into()),
+                    ..Default::default()
+                },
+                float: false,
+            },
+        ];
+
+        let mut info = win_info();
+        info.bundle_id = Some("com.example.X".into());
+        info.title = Some("My Dialog".to_owned().into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
+
+        info.title = Some("Main Window".to_owned().into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
+    }
+
+    #[test]
+    fn rule_conditions_combine_with_and() {
+        let rules = [AppRule {
+            conditions: AppRuleConditions {
+                app_name: Some("Code".into()),
+                title_substring: Some("Settings".into()),
+                ax_role: Some("AXWindow".into()),
+                ax_subrole: Some("AXDialog".into()),
+                ..Default::default()
+            },
+            float: true,
+        }];
+
+        let mut info = win_info();
+        info.app_name = Some("Visual Studio Code".into());
+        info.title = Some("Settings — main".to_owned().into());
+        info.ax_role = "AXWindow".into();
+        info.ax_subrole = Some("AXDialog".into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
+
+        // One mismatched condition (subrole) means the rule does not apply.
+        info.ax_subrole = Some("AXStandardWindow".into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
+    }
+
+    #[test]
+    fn rule_conditions_match_case_insensitively() {
+        let rules = [AppRule {
+            conditions: AppRuleConditions {
+                app_id: Some("COM.EXAMPLE.x".into()),
+                app_name: Some("code".into()),
+                title_regex: Some("dialog".parse().unwrap()),
+                title_substring: Some("SETTINGS".into()),
+                ax_role: Some("axwindow".into()),
+                ax_subrole: Some("AXDIALOG".into()),
+            },
+            float: true,
+        }];
+
+        let mut info = win_info();
+        info.bundle_id = Some("com.example.X".into());
+        info.app_name = Some("Visual Studio Code".into());
+        info.title = Some("Settings Dialog".to_owned().into());
+        info.ax_role = "AXWindow".into();
+        info.ax_subrole = Some("AXDialog".into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::FloatByDefault);
+    }
+
+    #[test]
+    fn condition_does_not_match_when_attribute_is_absent() {
+        // A rule that requires an attribute must not match a window that lacks
+        // it; the condition should fail rather than be skipped.
+        let rules = [AppRule {
+            conditions: AppRuleConditions {
+                app_id: Some("com.example.X".into()),
+                ..Default::default()
+            },
+            float: true,
+        }];
+        let mut info = win_info();
+        info.bundle_id = None;
+        assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
+    }
+
+    #[test]
+    fn rule_overrides_builtin_float_heuristics() {
+        // System Preferences floats by default; a rule can force it to tile.
+        let rules = [AppRule {
+            conditions: AppRuleConditions {
+                app_id: Some("com.apple.systempreferences".into()),
+                ..Default::default()
+            },
+            float: false,
+        }];
+        let mut info = win_info();
+        info.bundle_id = Some("com.apple.systempreferences".into());
+        assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
+
+        // A non-resizable window floats by default; a rule can force it to tile.
+        let rules = [AppRule {
+            conditions: AppRuleConditions {
+                app_id: Some("com.example.X".into()),
+                ..Default::default()
+            },
+            float: false,
+        }];
+        let mut info = win_info();
+        info.bundle_id = Some("com.example.X".into());
+        info.is_resizable = false;
+        assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
+    }
+
+    #[test]
+    fn rules_cannot_override_untracked_phantom_windows() {
+        let rules = [AppRule {
+            conditions: AppRuleConditions::default(),
+            float: true,
+        }];
+        let mut info = win_info();
+        info.layer = Some(3);
+        assert_eq!(classify_window(&rules, &info), WindowClass::Untracked);
     }
 
     impl LayoutManager {

@@ -7,7 +7,9 @@ use std::fmt::{Debug, Formatter};
 
 use accessibility::{AXAttribute, AXUIElement, AXUIElementAttributes};
 pub use accessibility_sys::pid_t;
-use accessibility_sys::{kAXStandardWindowSubrole, kAXWindowRole};
+use accessibility_sys::{
+    kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXStandardWindowSubrole, kAXWindowRole,
+};
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::string::CFString;
@@ -88,18 +90,36 @@ pub struct WindowInfo {
     pub frame: CGRect,
     pub sys_id: Option<WindowServerId>,
     pub is_resizable: bool,
+    /// The macOS Accessibility AXRole, e.g. "AXWindow".
+    pub ax_role: String,
+    /// The macOS Accessibility AXSubrole, e.g. "AXStandardWindow".
+    pub ax_subrole: Option<String>,
 }
 
 impl TryFrom<&AXUIElement> for WindowInfo {
     type Error = accessibility::Error;
     fn try_from(element: &AXUIElement) -> Result<Self, accessibility::Error> {
+        let role = element.role()?;
+        let subrole = match element.subrole() {
+            Ok(s) => Some(s),
+            Err(accessibility::Error::Ax(e))
+                if e == kAXErrorNoValue || e == kAXErrorAttributeUnsupported =>
+            {
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let is_standard = role == kAXWindowRole
+            && subrole.as_ref().is_some_and(|s| *s == kAXStandardWindowSubrole);
+        let ax_subrole = subrole.map(|s| s.to_string());
         Ok(WindowInfo {
-            is_standard: element.role()? == kAXWindowRole
-                && element.subrole()? == kAXStandardWindowSubrole,
+            is_standard,
             title: element.title().map(|t| t.to_string().into()).unwrap_or_default(),
             frame: element.frame()?.to_icrate(),
             sys_id: WindowServerId::try_from(element).ok(),
             is_resizable: element.is_settable(&AXAttribute::size())?,
+            ax_role: role.to_string(),
+            ax_subrole,
         })
     }
 }

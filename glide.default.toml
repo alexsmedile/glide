@@ -222,3 +222,35 @@ scroll.infinite_loop = false
 
 # Aspect ratio for single-column mode (e.g. "16:9"). Empty string disables.
 scroll.single_column_aspect_ratio = ""
+
+# Per-app/window rules overriding how windows are managed when first observed.
+#
+# Each rule nests its conditions under `if` and carries a `float` action. All
+# specified conditions must match (logical AND); omitted conditions are ignored.
+# Rules are evaluated in order and the first match wins. A matching rule
+# overrides Glide's built-in floating heuristics.
+#
+# Conditions (under `if`, all matched case-insensitively):
+#   app_id          - bundle identifier, exact match (e.g. "com.apple.Safari")
+#   app_name        - substring of the app's localized name
+#   title_regex     - regex against the window title (must be a valid regex)
+#   title_substring - substring of the window title
+#   ax_role         - Accessibility AXRole (e.g. "AXWindow")
+#   ax_subrole      - Accessibility AXSubrole (e.g. "AXDialog")
+#
+# Action:
+#   float           - true to float matching windows, false to tile them
+#
+# Example:
+#   [[app_rules]]
+#   if.app_id = "com.example.X"
+#   if.title_regex = "Dialog"
+#   float = true
+#
+#   [[app_rules]]
+#   if.app_id = "com.example.X"
+#   float = false
+#
+#   [[app_rules]]
+#   if.title_substring = "Preferences"
+#   float = true

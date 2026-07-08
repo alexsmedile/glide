@@ -11,15 +11,16 @@
 mod partial;
 use std::fs::File;
 use std::io::Read;
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use livesplit_hotkey::Hotkey;
 use macro_rules_attribute::derive;
 use partial::{PartialConfig, ValidationError};
+use regex::{Regex, RegexBuilder};
 use rustc_hash::FxHashMap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::actor::wm_controller::WmCommand;
 use crate::model::LayoutKind;
@@ -57,6 +58,7 @@ fn default_config_paths() -> Vec<PathBuf> {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Config {
     pub settings: Settings,
+    pub app_rules: Vec<AppRule>,
     pub keys: Vec<(Hotkey, WmCommand)>,
 }
 
@@ -65,6 +67,7 @@ pub struct Config {
 #[serde(default)]
 struct ConfigPartial {
     settings: SettingsPartial,
+    app_rules: Option<Vec<AppRule>>,
     keys: Option<FxHashMap<String, WmCommandOrDisable>>,
 }
 
@@ -101,6 +104,85 @@ pub struct Settings {
     pub status_icon: StatusIcon,
     #[derive_args(ExperimentalPartial)]
     pub experimental: Experimental,
+}
+
+/// A [`Regex`] sourced from config. Deserializing compiles (and thus
+/// validates) the pattern, so an invalid regex surfaces as a config error at
+/// parse time rather than being silently ignored later. Serializes back to the
+/// original pattern string, and compares by pattern.
+#[derive(Debug, Clone)]
+pub struct ConfigRegex(Regex);
+
+impl Deref for ConfigRegex {
+    type Target = Regex;
+    fn deref(&self) -> &Regex {
+        &self.0
+    }
+}
+
+impl FromStr for ConfigRegex {
+    type Err = regex::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        RegexBuilder::new(s).case_insensitive(true).build().map(ConfigRegex)
+    }
+}
+
+impl PartialEq for ConfigRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigRegex {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let pattern = String::deserialize(deserializer)?;
+        pattern.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for ConfigRegex {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+/// A rule that overrides how a window is managed when it is first observed,
+/// based on properties of the window and its application.
+///
+/// Conditions are nested under `if`; all specified conditions must match
+/// (logical AND) for the rule to apply. Rules are evaluated in order and the
+/// first matching rule wins. See `app_rules` in the configuration.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AppRule {
+    /// Conditions a window must satisfy for this rule to apply.
+    #[serde(rename = "if", default)]
+    pub conditions: AppRuleConditions,
+    /// Whether matching windows should float (`true`) or tile (`false`).
+    pub float: bool,
+}
+
+/// Conditions matched against a window and its application. All specified
+/// conditions must match (logical AND); omitted conditions are ignored, so an
+/// empty set of conditions matches every window. All conditions match
+/// case-insensitively.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+#[serde(deny_unknown_fields)]
+#[serde(default)]
+pub struct AppRuleConditions {
+    /// Application bundle identifier, matched exactly (e.g. "com.apple.Safari").
+    pub app_id: Option<String>,
+    /// Substring match on the application's localized name.
+    pub app_name: Option<String>,
+    /// Regex matched against the window title. Must be a valid regex or the
+    /// config is rejected.
+    pub title_regex: Option<ConfigRegex>,
+    /// Literal substring match on the window title.
+    pub title_substring: Option<String>,
+    /// Match for the macOS Accessibility AXRole (e.g. "AXWindow").
+    pub ax_role: Option<String>,
+    /// Match for the macOS Accessibility AXSubrole (e.g. "AXDialog").
+    pub ax_subrole: Option<String>,
 }
 
 #[derive(PartialConfig!)]
@@ -273,6 +355,7 @@ impl ConfigPartial {
         }
         Ok(Config {
             settings: self.settings.validate()?,
+            app_rules: self.app_rules.unwrap_or_default(),
             keys,
         })
     }
@@ -287,6 +370,7 @@ impl ConfigPartial {
         keys.extend(high.keys.unwrap_or_default());
         Self {
             settings: SettingsPartial::merge(low.settings, high.settings),
+            app_rules: high.app_rules.or(low.app_rules),
             keys: Some(keys),
         }
     }
@@ -392,6 +476,83 @@ mod tests {
     #[test]
     fn scroll_gate_is_disabled_by_default() {
         assert!(!Config::default().settings.experimental.scroll.enable);
+    }
+
+    #[test]
+    fn app_rules_are_empty_by_default() {
+        assert!(Config::default().app_rules.is_empty());
+    }
+
+    #[test]
+    fn app_rules_parse() {
+        let config = Config::parse(
+            r#"
+            app_rules = [
+              { if = { app_id = "com.example.X", title_regex = "Dialog" }, float = true },
+              { if = { title_substring = "Preferences", ax_subrole = "AXDialog" }, float = true },
+            ]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.app_rules,
+            vec![
+                AppRule {
+                    conditions: AppRuleConditions {
+                        app_id: Some("com.example.X".into()),
+                        title_regex: Some("Dialog".parse().unwrap()),
+                        ..Default::default()
+                    },
+                    float: true,
+                },
+                AppRule {
+                    conditions: AppRuleConditions {
+                        title_substring: Some("Preferences".into()),
+                        ax_subrole: Some("AXDialog".into()),
+                        ..Default::default()
+                    },
+                    float: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn app_rules_parse_with_dotted_if_keys() {
+        // The `if.app_id` dotted-key form from the aerospace-style API.
+        let config = Config::parse(
+            r#"
+            [[app_rules]]
+            if.app_id = "com.example.X"
+            float = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.app_rules,
+            vec![AppRule {
+                conditions: AppRuleConditions {
+                    app_id: Some("com.example.X".into()),
+                    ..Default::default()
+                },
+                float: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn app_rule_invalid_regex_is_rejected() {
+        let err = Config::parse(
+            r#"
+            app_rules = [{ if = { title_regex = "(unterminated" }, float = true }]
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("regex"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 
     #[test]
