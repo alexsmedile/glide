@@ -15,7 +15,7 @@ use tracing::{debug, error, warn};
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::collections::{BTreeExt, BTreeSet, HashMap, HashSet};
-use crate::config::{AppRule, AppRuleConditions, Config, NewWindowPlacement, ScrollConfig};
+use crate::config::{Config, NewWindowPlacement, ScrollConfig, WindowRule, WindowRuleConditions};
 use crate::model::scroll_viewport::ViewportState;
 use crate::model::{
     ContainerKind, Direction, LayoutId, LayoutKind, LayoutTree, NodeId, Orientation,
@@ -228,7 +228,7 @@ pub struct LayoutManager {
     #[serde(skip)]
     scroll_enabled: bool,
     #[serde(skip)]
-    app_rules: Vec<AppRule>,
+    window_rules: Vec<WindowRule>,
     #[serde(skip)]
     interactive_resize: Option<InteractiveScrollResize>,
     #[serde(skip)]
@@ -244,7 +244,7 @@ enum WindowClass {
 
 /// Returns true if every specified condition of `rule` matches the window. A
 /// rule with no conditions matches every window.
-fn app_rule_matches(conditions: &AppRuleConditions, info: &LayoutWindowInfo) -> bool {
+fn window_rule_matches(conditions: &WindowRuleConditions, info: &LayoutWindowInfo) -> bool {
     let title = info.title.as_ref().map(|t| t.expose_secret().as_str());
     let eq = |pattern: Option<&str>, value: Option<&str>| {
         pattern.map_or(true, |p| value.is_some_and(|v| v.eq_ignore_ascii_case(p)))
@@ -265,7 +265,7 @@ fn app_rule_matches(conditions: &AppRuleConditions, info: &LayoutWindowInfo) -> 
         && eq(conditions.ax_subrole.as_deref(), info.ax_subrole.as_deref())
 }
 
-fn classify_window(rules: &[AppRule], info: &LayoutWindowInfo) -> WindowClass {
+fn classify_window(rules: &[WindowRule], info: &LayoutWindowInfo) -> WindowClass {
     use LayoutWindowInfo as Info;
 
     // Phantom/non-window cases are handled first and can't be overridden by app
@@ -303,7 +303,7 @@ fn classify_window(rules: &[AppRule], info: &LayoutWindowInfo) -> WindowClass {
     }
 
     // The first matching user rule overrides the built-in heuristics below.
-    if let Some(rule) = rules.iter().find(|rule| app_rule_matches(&rule.conditions, info)) {
+    if let Some(rule) = rules.iter().find(|rule| window_rule_matches(&rule.conditions, info)) {
         return if rule.float {
             WindowClass::FloatByDefault
         } else {
@@ -337,7 +337,7 @@ impl LayoutManager {
             default_layout_kind: LayoutKind::default(),
             scroll_cfg: Config::default().settings.experimental.scroll.validated(),
             scroll_enabled: false,
-            app_rules: Vec::new(),
+            window_rules: Vec::new(),
             interactive_resize: None,
             interactive_move: None,
         }
@@ -347,7 +347,7 @@ impl LayoutManager {
         // TODO: store a reference to Config instead of cloning fields
         self.scroll_cfg = config.settings.experimental.scroll.clone().validated();
         self.scroll_enabled = self.scroll_cfg.enable;
-        self.app_rules = config.app_rules.clone();
+        self.window_rules = config.window_rules.clone();
         self.default_layout_kind = match (self.scroll_enabled, config.settings.default_layout_kind)
         {
             (false, LayoutKind::Scroll) => {
@@ -534,7 +534,7 @@ impl LayoutManager {
                         if self.tree.window_node(layout, *wid).is_some() {
                             return true;
                         }
-                        match classify_window(&self.app_rules, window_map.get(wid).unwrap()) {
+                        match classify_window(&self.window_rules, window_map.get(wid).unwrap()) {
                             WindowClass::Untracked => false,
                             WindowClass::FloatByDefault => {
                                 add_floating.push(*wid);
@@ -568,7 +568,7 @@ impl LayoutManager {
             }
             LayoutEvent::WindowAdded(space, wid, info) => {
                 self.debug_tree(space);
-                match classify_window(&self.app_rules, &info) {
+                match classify_window(&self.window_rules, &info) {
                     WindowClass::FloatByDefault => self.add_floating_window(wid, Some(space)),
                     WindowClass::Regular => {
                         let layout = self.layout(space);
@@ -1585,7 +1585,7 @@ mod tests {
     use test_log::test;
 
     use super::*;
-    use crate::config::AppRuleConditions;
+    use crate::config::WindowRuleConditions;
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> CGRect {
         CGRect::new(CGPoint::new(x as f64, y as f64), CGSize::new(w as f64, h as f64))
@@ -1625,8 +1625,8 @@ mod tests {
 
     #[test]
     fn app_id_rule_floats_matching_window_only() {
-        let rules = [AppRule {
-            conditions: AppRuleConditions {
+        let rules = [WindowRule {
+            conditions: WindowRuleConditions {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
             },
@@ -1644,16 +1644,16 @@ mod tests {
     #[test]
     fn earlier_rule_wins() {
         let rules = [
-            AppRule {
-                conditions: AppRuleConditions {
+            WindowRule {
+                conditions: WindowRuleConditions {
                     app_id: Some("com.example.X".into()),
                     title_regex: Some("Dialog".parse().unwrap()),
                     ..Default::default()
                 },
                 float: true,
             },
-            AppRule {
-                conditions: AppRuleConditions {
+            WindowRule {
+                conditions: WindowRuleConditions {
                     app_id: Some("com.example.X".into()),
                     ..Default::default()
                 },
@@ -1672,8 +1672,8 @@ mod tests {
 
     #[test]
     fn rule_conditions_combine_with_and() {
-        let rules = [AppRule {
-            conditions: AppRuleConditions {
+        let rules = [WindowRule {
+            conditions: WindowRuleConditions {
                 app_name: Some("Code".into()),
                 title_substring: Some("Settings".into()),
                 ax_role: Some("AXWindow".into()),
@@ -1697,8 +1697,8 @@ mod tests {
 
     #[test]
     fn rule_conditions_match_case_insensitively() {
-        let rules = [AppRule {
-            conditions: AppRuleConditions {
+        let rules = [WindowRule {
+            conditions: WindowRuleConditions {
                 app_id: Some("COM.EXAMPLE.x".into()),
                 app_name: Some("code".into()),
                 title_regex: Some("dialog".parse().unwrap()),
@@ -1722,8 +1722,8 @@ mod tests {
     fn condition_does_not_match_when_attribute_is_absent() {
         // A rule that requires an attribute must not match a window that lacks
         // it; the condition should fail rather than be skipped.
-        let rules = [AppRule {
-            conditions: AppRuleConditions {
+        let rules = [WindowRule {
+            conditions: WindowRuleConditions {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
             },
@@ -1737,8 +1737,8 @@ mod tests {
     #[test]
     fn rule_overrides_builtin_float_heuristics() {
         // System Preferences floats by default; a rule can force it to tile.
-        let rules = [AppRule {
-            conditions: AppRuleConditions {
+        let rules = [WindowRule {
+            conditions: WindowRuleConditions {
                 app_id: Some("com.apple.systempreferences".into()),
                 ..Default::default()
             },
@@ -1749,8 +1749,8 @@ mod tests {
         assert_eq!(classify_window(&rules, &info), WindowClass::Regular);
 
         // A non-resizable window floats by default; a rule can force it to tile.
-        let rules = [AppRule {
-            conditions: AppRuleConditions {
+        let rules = [WindowRule {
+            conditions: WindowRuleConditions {
                 app_id: Some("com.example.X".into()),
                 ..Default::default()
             },
@@ -1764,8 +1764,8 @@ mod tests {
 
     #[test]
     fn rules_cannot_override_untracked_phantom_windows() {
-        let rules = [AppRule {
-            conditions: AppRuleConditions::default(),
+        let rules = [WindowRule {
+            conditions: WindowRuleConditions::default(),
             float: true,
         }];
         let mut info = win_info();

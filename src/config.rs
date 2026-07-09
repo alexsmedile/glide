@@ -58,7 +58,7 @@ fn default_config_paths() -> Vec<PathBuf> {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Config {
     pub settings: Settings,
-    pub app_rules: Vec<AppRule>,
+    pub window_rules: Vec<WindowRule>,
     pub keys: Vec<(Hotkey, WmCommand)>,
 }
 
@@ -67,7 +67,7 @@ pub struct Config {
 #[serde(default)]
 struct ConfigPartial {
     settings: SettingsPartial,
-    app_rules: Option<Vec<AppRule>>,
+    window_rules: Option<Vec<WindowRule>>,
     keys: Option<FxHashMap<String, WmCommandOrDisable>>,
 }
 
@@ -151,13 +151,13 @@ impl Serialize for ConfigRegex {
 ///
 /// Conditions are nested under `if`; all specified conditions must match
 /// (logical AND) for the rule to apply. Rules are evaluated in order and the
-/// first matching rule wins. See `app_rules` in the configuration.
+/// first matching rule wins. See `window_rules` in the configuration.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct AppRule {
+pub struct WindowRule {
     /// Conditions a window must satisfy for this rule to apply.
     #[serde(rename = "if", default)]
-    pub conditions: AppRuleConditions,
+    pub conditions: WindowRuleConditions,
     /// Whether matching windows should float (`true`) or tile (`false`).
     pub float: bool,
 }
@@ -169,7 +169,7 @@ pub struct AppRule {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 #[serde(default)]
-pub struct AppRuleConditions {
+pub struct WindowRuleConditions {
     /// Application bundle identifier, matched exactly (e.g. "com.apple.Safari").
     pub app_id: Option<String>,
     /// Substring match on the application's localized name.
@@ -355,7 +355,7 @@ impl ConfigPartial {
         }
         Ok(Config {
             settings: self.settings.validate()?,
-            app_rules: self.app_rules.unwrap_or_default(),
+            window_rules: self.window_rules.unwrap_or_default(),
             keys,
         })
     }
@@ -370,7 +370,7 @@ impl ConfigPartial {
         keys.extend(high.keys.unwrap_or_default());
         Self {
             settings: SettingsPartial::merge(low.settings, high.settings),
-            app_rules: high.app_rules.or(low.app_rules),
+            window_rules: high.window_rules.or(low.window_rules),
             keys: Some(keys),
         }
     }
@@ -479,15 +479,15 @@ mod tests {
     }
 
     #[test]
-    fn app_rules_are_empty_by_default() {
-        assert!(Config::default().app_rules.is_empty());
+    fn window_rules_are_empty_by_default() {
+        assert!(Config::default().window_rules.is_empty());
     }
 
     #[test]
-    fn app_rules_parse() {
+    fn window_rules_parse() {
         let config = Config::parse(
             r#"
-            app_rules = [
+            window_rules = [
               { if = { app_id = "com.example.X", title_regex = "Dialog" }, float = true },
               { if = { title_substring = "Preferences", ax_subrole = "AXDialog" }, float = true },
             ]
@@ -495,18 +495,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.app_rules,
+            config.window_rules,
             vec![
-                AppRule {
-                    conditions: AppRuleConditions {
+                WindowRule {
+                    conditions: WindowRuleConditions {
                         app_id: Some("com.example.X".into()),
                         title_regex: Some("Dialog".parse().unwrap()),
                         ..Default::default()
                     },
                     float: true,
                 },
-                AppRule {
-                    conditions: AppRuleConditions {
+                WindowRule {
+                    conditions: WindowRuleConditions {
                         title_substring: Some("Preferences".into()),
                         ax_subrole: Some("AXDialog".into()),
                         ..Default::default()
@@ -518,20 +518,20 @@ mod tests {
     }
 
     #[test]
-    fn app_rules_parse_with_dotted_if_keys() {
+    fn window_rules_parse_with_dotted_if_keys() {
         // The `if.app_id` dotted-key form from the aerospace-style API.
         let config = Config::parse(
             r#"
-            [[app_rules]]
+            [[window_rules]]
             if.app_id = "com.example.X"
             float = true
             "#,
         )
         .unwrap();
         assert_eq!(
-            config.app_rules,
-            vec![AppRule {
-                conditions: AppRuleConditions {
+            config.window_rules,
+            vec![WindowRule {
+                conditions: WindowRuleConditions {
                     app_id: Some("com.example.X".into()),
                     ..Default::default()
                 },
@@ -541,10 +541,10 @@ mod tests {
     }
 
     #[test]
-    fn app_rule_invalid_regex_is_rejected() {
+    fn window_rule_invalid_regex_is_rejected() {
         let err = Config::parse(
             r#"
-            app_rules = [{ if = { title_regex = "(unterminated" }, float = true }]
+            window_rules = [{ if = { title_regex = "(unterminated" }, float = true }]
             "#,
         )
         .unwrap_err();
