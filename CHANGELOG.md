@@ -1,9 +1,33 @@
 # Changelog
 
+## [0.2.14](https://github.com/tmandry/glide/compare/v0.2.13...v0.2.14) (2026-07-09)
+
+This release adds window rules to auto-float windows, pause/resume commands, and better multi-screen support.
+
+### Features
+
+* Add window rules to control floating per app or window ([c5d6953](https://github.com/tmandry/glide/commit/c5d6953))
+* Add `pause` and `resume` commands to suspend window management ([b177ea7](https://github.com/tmandry/glide/commit/b177ea7))
+* Support dragging windows between screens with the mouse ([5933e8b](https://github.com/tmandry/glide/commit/5933e8be85184999ed90308db268cf16447edb46))
+
+### Bug Fixes
+
+* Don't bury a floating window picked using mission control ([553f905](https://github.com/tmandry/glide/commit/553f905693cac8b3c2519b4c7bac3a3c7e0f7684))
+* Fix windows being lost or unresponsive after moving them to another screen ([9a55157](https://github.com/tmandry/glide/commit/9a55157d4ec8073fcfb2effac17aa51da5b2868f))
+
+### Improvements
+
+* **config:** Key bindings now accept "Option" in addition to "Alt" ([1801164](https://github.com/tmandry/glide/commit/1801164d688eda5ff51a7c3e559fbe8b5890faa2))
+* **config:** Key bindings now work with remapped keys from Karabiner-Elements and Raycast ([3bb88a6](https://github.com/tmandry/glide/commit/3bb88a6))
+
+### Documentation
+
+* Document "Displays have separate Spaces" requirement ([ddd09fc](https://github.com/tmandry/glide/commit/ddd09fcb461a0b6f6836cbdeebcf6e6593a810cb))
+
+
 ## [0.2.13](https://github.com/tmandry/glide/compare/v0.2.12...v0.2.13) (2026-06-06)
 
 After a short hiatus, we're back with the next release of Glide. This release brings better performance, robustness, and a few new commands.
-
 
 ### Features
 
