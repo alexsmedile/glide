@@ -242,15 +242,15 @@ scroll.single_column_aspect_ratio = ""
 #   float           - true to float matching windows, false to tile them
 #
 # Example:
-#   [[app_rules]]
+#   [[window_rules]]
 #   if.app_id = "com.example.X"
 #   if.title_regex = "Dialog"
 #   float = true
 #
-#   [[app_rules]]
+#   [[window_rules]]
 #   if.app_id = "com.example.X"
 #   float = false
 #
-#   [[app_rules]]
+#   [[window_rules]]
 #   if.title_substring = "Preferences"
 #   float = true
