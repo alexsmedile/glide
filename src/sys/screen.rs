@@ -5,15 +5,13 @@ use std::f64;
 use std::ffi::c_int;
 use std::mem::MaybeUninit;
 use std::num::NonZeroU64;
+use std::ptr::NonNull;
 
 use bitflags::bitflags;
-use core_foundation::array::{CFArray, CFArrayRef};
-use core_foundation::base::TCFType;
-use core_foundation::string::{CFString, CFStringRef};
 use objc2::rc::Retained;
 use objc2::{ClassType, msg_send};
 use objc2_app_kit::NSScreen;
-use objc2_core_foundation::{CGPoint, CGRect};
+use objc2_core_foundation::{CFArray, CFRetained, CFString, CGPoint, CGRect};
 use objc2_core_graphics::{CGDisplayBounds, CGError, CGGetActiveDisplayList};
 use objc2_foundation::{MainThreadMarker, NSArray, NSDictionary, NSNumber, ns_string};
 use serde::{Deserialize, Serialize};
@@ -33,7 +31,7 @@ impl SpaceId {
 /// Calculates the screen and space configuration.
 pub struct ScreenCache<S: System = Actual> {
     system: S,
-    uuids: Vec<CFString>,
+    uuids: Vec<CFRetained<CFString>>,
 }
 
 impl ScreenCache<Actual> {
@@ -125,10 +123,7 @@ impl<S: System> ScreenCache<S> {
         self.uuids
             .iter()
             .map(|screen| unsafe {
-                CGSManagedDisplayGetCurrentSpace(
-                    CGSMainConnectionID(),
-                    screen.as_concrete_TypeRef(),
-                )
+                CGSManagedDisplayGetCurrentSpace(CGSMainConnectionID(), screen)
             })
             .map(|id| Some(SpaceId(NonZeroU64::new(id)?)))
             .collect()
@@ -173,7 +168,7 @@ impl CoordinateConverter {
 #[allow(private_interfaces)]
 pub trait System {
     fn cg_screens(&self) -> Result<Vec<CGScreenInfo>, CGError>;
-    fn uuid_for_rect(&self, rect: CGRect) -> CFString;
+    fn uuid_for_rect(&self, rect: CGRect) -> CFRetained<CFString>;
 }
 
 #[derive(Debug, Clone)]
@@ -232,13 +227,11 @@ impl System for Actual {
             .collect())
     }
 
-    fn uuid_for_rect(&self, rect: CGRect) -> CFString {
-        unsafe {
-            CFString::wrap_under_create_rule(CGSCopyBestManagedDisplayForRect(
-                CGSMainConnectionID(),
-                rect,
-            ))
-        }
+    fn uuid_for_rect(&self, rect: CGRect) -> CFRetained<CFString> {
+        // SAFETY: The call returns an owned (+1) CFString, per the copy rule.
+        let uuid = unsafe { CGSCopyBestManagedDisplayForRect(CGSMainConnectionID(), rect) };
+        let uuid = uuid.expect("CGSCopyBestManagedDisplayForRect returned NULL");
+        unsafe { CFRetained::from_raw(uuid) }
     }
 }
 
@@ -323,22 +316,26 @@ pub mod diagnostic {
         SpaceId(NonZeroU64::new(unsafe { CGSGetActiveSpace(CGSMainConnectionID()) }).unwrap())
     }
 
-    pub fn visible_spaces() -> CFArray<SpaceId> {
-        unsafe {
-            let arr = CGSCopySpaces(CGSMainConnectionID(), CGSSpaceMask::ALL_VISIBLE_SPACES);
-            CFArray::wrap_under_create_rule(arr)
-        }
+    pub fn visible_spaces() -> CFRetained<CFArray<SpaceId>> {
+        // SAFETY: the array holds raw (non-retained) space id values, per the
+        // copy rule and the way this private API is documented to behave.
+        let arr = unsafe { CGSCopySpaces(CGSMainConnectionID(), CGSSpaceMask::ALL_VISIBLE_SPACES) };
+        let arr = arr.expect("CGSCopySpaces returned NULL");
+        unsafe { CFRetained::cast_unchecked(CFRetained::from_raw(arr)) }
     }
 
-    pub fn all_spaces() -> CFArray<SpaceId> {
-        unsafe {
-            let arr = CGSCopySpaces(CGSMainConnectionID(), CGSSpaceMask::ALL_SPACES);
-            CFArray::wrap_under_create_rule(arr)
-        }
+    pub fn all_spaces() -> CFRetained<CFArray<SpaceId>> {
+        // SAFETY: as above.
+        let arr = unsafe { CGSCopySpaces(CGSMainConnectionID(), CGSSpaceMask::ALL_SPACES) };
+        let arr = arr.expect("CGSCopySpaces returned NULL");
+        unsafe { CFRetained::cast_unchecked(CFRetained::from_raw(arr)) }
     }
 
-    pub fn managed_displays() -> CFArray {
-        unsafe { CFArray::wrap_under_create_rule(CGSCopyManagedDisplays(CGSMainConnectionID())) }
+    pub fn managed_displays() -> CFRetained<CFArray> {
+        // SAFETY: the call returns an owned (+1) array, per the copy rule.
+        let arr = unsafe { CGSCopyManagedDisplays(CGSMainConnectionID()) };
+        let arr = arr.expect("CGSCopyManagedDisplays returned NULL");
+        unsafe { CFRetained::from_raw(arr) }
     }
 
     pub fn managed_display_spaces() -> Retained<NSArray> {
@@ -353,11 +350,11 @@ pub mod diagnostic {
 unsafe extern "C" {
     fn CGSMainConnectionID() -> c_int;
     fn CGSGetActiveSpace(cid: c_int) -> u64;
-    fn CGSCopySpaces(cid: c_int, mask: CGSSpaceMask) -> CFArrayRef;
-    fn CGSCopyManagedDisplays(cid: c_int) -> CFArrayRef;
+    fn CGSCopySpaces(cid: c_int, mask: CGSSpaceMask) -> Option<NonNull<CFArray>>;
+    fn CGSCopyManagedDisplays(cid: c_int) -> Option<NonNull<CFArray>>;
     fn CGSCopyManagedDisplaySpaces(cid: c_int) -> *mut NSArray;
-    fn CGSManagedDisplayGetCurrentSpace(cid: c_int, uuid: CFStringRef) -> u64;
-    fn CGSCopyBestManagedDisplayForRect(cid: c_int, rect: CGRect) -> CFStringRef;
+    fn CGSManagedDisplayGetCurrentSpace(cid: c_int, uuid: &CFString) -> u64;
+    fn CGSCopyBestManagedDisplayForRect(cid: c_int, rect: CGRect) -> Option<NonNull<CFString>>;
 }
 
 bitflags! {
@@ -388,8 +385,7 @@ bitflags! {
 
 #[cfg(test)]
 mod test {
-    use core_foundation::string::CFString;
-    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+    use objc2_core_foundation::{CFRetained, CFString, CGPoint, CGRect, CGSize};
 
     use super::{CGError, CGScreenInfo, NSScreenInfo, ScreenCache, ScreenId, System};
 
@@ -400,8 +396,8 @@ mod test {
         fn cg_screens(&self) -> Result<Vec<CGScreenInfo>, CGError> {
             Ok(self.cg_screens.clone())
         }
-        fn uuid_for_rect(&self, _rect: CGRect) -> CFString {
-            CFString::new("stub")
+        fn uuid_for_rect(&self, _rect: CGRect) -> CFRetained<CFString> {
+            CFString::from_static_str("stub")
         }
     }
 

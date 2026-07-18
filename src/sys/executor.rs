@@ -11,9 +11,9 @@ use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake};
 
-use core_foundation::runloop::CFRunLoop;
 use objc2::MainThreadMarker;
 use objc2_app_kit::NSApp;
+use objc2_core_foundation::CFRunLoop;
 
 use super::run_loop::WakeupHandle;
 
@@ -26,7 +26,7 @@ pub struct Executor;
 
 impl Executor {
     pub fn run(task: impl Future<Output = ()>) {
-        Self::run_with_loop_fn(task, CFRunLoop::run_current);
+        Self::run_with_loop_fn(task, CFRunLoop::run);
     }
 
     pub fn run_main(mtm: MainThreadMarker, task: impl Future<Output = ()>) {
@@ -100,7 +100,7 @@ impl State {
         let mut context = Context::from_waker(&waker);
         if self.main_task.as_mut().unwrap().as_mut().poll(&mut context) == Poll::Ready(()) {
             self.main_task.take();
-            CFRunLoop::get_current().stop();
+            CFRunLoop::current().unwrap().stop();
         }
     }
 }

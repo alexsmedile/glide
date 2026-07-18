@@ -3,31 +3,28 @@
 
 use std::ffi::{c_int, c_void};
 use std::marker::PhantomData;
+use std::ptr;
 
 use accessibility::AXUIElement;
 use accessibility_sys::pid_t;
-use core_foundation::array::CFArray;
-use core_foundation::base::{CFType, CFTypeRef, ItemRef, TCFType};
-use core_foundation::boolean::CFBoolean;
-use core_foundation::dictionary::CFDictionary;
-use core_foundation::number::CFNumber;
-use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::base::CGError;
-use core_graphics::display::CGWindowListCopyWindowInfo;
-use core_graphics::window::{
-    CGWindowID, CGWindowListCreateDescriptionFromArray, kCGNullWindowID, kCGWindowBounds,
-    kCGWindowLayer, kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly,
-    kCGWindowNumber, kCGWindowOwnerPID,
-};
 use objc2_app_kit::NSWindow;
-use objc2_core_foundation::{CGPoint, CGRect};
+use objc2_core_foundation::{
+    CFArray, CFBoolean, CFDictionary, CFIndex, CFNumber, CFRetained, CFString, CFType, CGPoint,
+    CGRect, CGSize,
+};
+use objc2_core_graphics::{
+    CGRectMakeWithDictionaryRepresentation, CGWindowID, CGWindowListCopyWindowInfo,
+    CGWindowListCreateDescriptionFromArray, CGWindowListOption, kCGNullWindowID, kCGWindowBounds,
+    kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
+};
 use objc2_foundation::MainThreadMarker;
 use serde::{Deserialize, Serialize};
 use sorted_vec::SortedVec;
 use static_assertions::assert_not_impl_any;
 use tracing::warn;
 
-use super::geometry::{CGRectDef, ToICrate};
+use super::geometry::CGRectDef;
 use super::screen::CoordinateConverter;
 use crate::sys::app::ProcessSerialNumber;
 
@@ -115,21 +112,21 @@ pub fn get_visible_window_ids() -> Vec<WindowServerId> {
 
 /// Returns a list of windows visible on the screen, in order starting with the
 /// frontmost.
-pub fn get_visible_windows_raw() -> CFArray<CFDictionary<CFString, CFType>> {
+pub fn get_visible_windows_raw() -> CFRetained<CFArray<CFDictionary<CFString, CFType>>> {
     // Note that the ordering is not documented. But
     // NSWindow::windowNumbersWithOptions *is* documented to return the windows
     // in order, so we could always combine their information if the behavior
     // changed.
-    unsafe {
-        CFArray::wrap_under_get_rule(CGWindowListCopyWindowInfo(
-            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-            kCGNullWindowID,
-        ))
-    }
+    let options =
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
+    let array = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+        .expect("CGWindowListCopyWindowInfo returned NULL");
+    // SAFETY: CGWindowListCopyWindowInfo returns an array of window info dicts.
+    unsafe { CFRetained::cast_unchecked(array) }
 }
 
 fn make_info(
-    win: ItemRef<CFDictionary<CFString, CFType>>,
+    win: CFRetained<CFDictionary<CFString, CFType>>,
     layer_filter: Option<i32>,
 ) -> Option<WindowServerInfo> {
     let layer = get_num(&win, unsafe { kCGWindowLayer })?.try_into().ok()?;
@@ -138,13 +135,21 @@ fn make_info(
     }
     let id = get_num(&win, unsafe { kCGWindowNumber })?;
     let pid = get_num(&win, unsafe { kCGWindowOwnerPID })?;
-    let frame: CFDictionary = win.find(unsafe { kCGWindowBounds })?.downcast()?;
-    let frame = core_graphics_types::geometry::CGRect::from_dict_representation(&frame)?;
+    let frame_dict: CFRetained<CFDictionary> =
+        win.get(unsafe { kCGWindowBounds })?.downcast().ok()?;
+    let mut frame = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize { width: 0.0, height: 0.0 },
+    };
+    // SAFETY: `frame_dict` and `&mut frame` are valid for the duration of this call.
+    if !unsafe { CGRectMakeWithDictionaryRepresentation(Some(&frame_dict), &mut frame) } {
+        return None;
+    }
     Some(WindowServerInfo {
         id: WindowServerId(id.try_into().ok()?),
         pid: pid.try_into().ok()?,
         layer,
-        frame: frame.to_icrate(),
+        frame,
     })
 }
 
@@ -159,18 +164,30 @@ pub fn get_window(id: WindowServerId) -> Option<WindowServerInfo> {
     get_windows_inner(&[id]).iter().next().and_then(|w| make_info(w, None))
 }
 
-fn get_windows_inner(ids: &[WindowServerId]) -> CFArray<CFDictionary<CFString, CFType>> {
-    let array = CFArray::from_copyable(ids);
-    unsafe {
-        CFArray::wrap_under_create_rule(CGWindowListCreateDescriptionFromArray(
-            array.as_concrete_TypeRef(),
-        ))
+fn get_windows_inner(
+    ids: &[WindowServerId],
+) -> CFRetained<CFArray<CFDictionary<CFString, CFType>>> {
+    // SAFETY: `ids` outlives this call, and `CGWindowListCreateDescriptionFromArray`
+    // reads it as an array of raw (non-retained) `CGWindowID` values, matching how
+    // the array is constructed here (no retain/release callbacks).
+    let array = unsafe {
+        CFArray::new(
+            None,
+            ids.as_ptr() as *mut *const c_void,
+            ids.len() as CFIndex,
+            ptr::null(),
+        )
     }
+    .expect("CFArrayCreate returned NULL");
+    let described = unsafe { CGWindowListCreateDescriptionFromArray(Some(&array)) }
+        .expect("CGWindowListCreateDescriptionFromArray returned NULL");
+    // SAFETY: CGWindowListCreateDescriptionFromArray returns an array of window
+    // info dicts.
+    unsafe { CFRetained::cast_unchecked(described) }
 }
 
-fn get_num(dict: &CFDictionary<CFString, CFType>, key: CFStringRef) -> Option<i64> {
-    let item: CFNumber = dict.find(key)?.downcast()?;
-    Some(item.to_i64()?)
+fn get_num(dict: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<i64> {
+    dict.get(key)?.downcast::<CFNumber>().ok()?.as_i64()
 }
 
 pub fn get_window_at_point(
@@ -393,15 +410,8 @@ pub const kCGSWindowIsTerminated: u32 = 804;
 /// discussed by Apple engineers on developer forums.
 pub fn allow_hide_mouse() -> Result<(), CGError> {
     let cid = unsafe { CGSMainConnectionID() };
-    let property = CFString::from_static_string("SetsCursorInBackground");
-    check(unsafe {
-        CGSSetConnectionProperty(
-            cid,
-            cid,
-            property.as_concrete_TypeRef(),
-            CFBoolean::true_value().as_CFTypeRef(),
-        )
-    })
+    let property = CFString::from_static_str("SetsCursorInBackground");
+    check(unsafe { CGSSetConnectionProperty(cid, cid, &property, CFBoolean::new(true)) })
 }
 
 type CGSConnectionID = c_int;
@@ -412,7 +422,7 @@ unsafe extern "C" {
     fn CGSSetConnectionProperty(
         cid: CGSConnectionID,
         target_cid: CGSConnectionID,
-        key: CFStringRef,
-        value: CFTypeRef,
+        key: &CFString,
+        value: &CFType,
     ) -> CGError;
 }

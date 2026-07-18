@@ -13,13 +13,6 @@ use accessibility::{AXUIElement, AXUIElementAttributes};
 use accessibility_sys::pid_t;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use core_foundation::array::CFArray;
-use core_foundation::base::TCFType;
-use core_foundation::dictionary::CFDictionaryRef;
-use core_graphics::display::{CGDisplayBounds, CGMainDisplayID};
-use core_graphics::window::{
-    CGWindowID, CGWindowListCopyWindowInfo, kCGNullWindowID, kCGWindowListOptionOnScreenOnly,
-};
 use glide_wm::actor::{self, reactor};
 use glide_wm::sys::app::{AXUIElementExt, AppInfo, NSRunningApplicationExt, WindowInfo};
 use glide_wm::sys::event::{self, get_mouse_pos};
@@ -30,6 +23,10 @@ use glide_wm::sys::{self};
 use livesplit_hotkey::{ConsumePreference, Modifiers};
 use objc2_app_kit::{NSRunningApplication, NSScreen, NSWindow, NSWindowNumberListOptions};
 use objc2_core_foundation::CFRetained;
+use objc2_core_graphics::{
+    CGDisplayBounds, CGMainDisplayID, CGWindowID, CGWindowListCopyWindowInfo, CGWindowListOption,
+    kCGNullWindowID,
+};
 use objc2_foundation::{MainThreadMarker, NSString};
 use tokio::sync::mpsc::{self, UnboundedReceiver, unbounded_channel};
 use tracing::info;
@@ -376,12 +373,9 @@ async fn inspect_inner(mut rx: UnboundedReceiver<()>, mtm: MainThreadMarker) {
 }
 
 async fn get_windows_with_cg(opt: &Opt, print: bool) {
-    let windows: CFArray<CFDictionaryRef> = unsafe {
-        CFArray::wrap_under_get_rule(CGWindowListCopyWindowInfo(
-            kCGWindowListOptionOnScreenOnly,
-            kCGNullWindowID,
-        ))
-    };
+    let windows =
+        CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, kCGNullWindowID)
+            .expect("CGWindowListCopyWindowInfo returned NULL");
     if print && opt.verbose {
         println!("{windows:?}");
     }
@@ -395,8 +389,8 @@ async fn get_windows_with_cg(opt: &Opt, print: bool) {
             }
         }
     }
-    let display_id = unsafe { CGMainDisplayID() };
-    let screen = unsafe { CGDisplayBounds(display_id) };
+    let display_id = CGMainDisplayID();
+    let screen = CGDisplayBounds(display_id);
     if print {
         println!("main display = {screen:?}");
     }
