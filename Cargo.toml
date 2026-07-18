@@ -43,8 +43,8 @@ release.codegen-units = 1
 exec_cmd = []
 
 [dependencies]
-accessibility = { version = "0.3.0", git = "https://github.com/eiz/accessibility", branch = "master" }
-accessibility-sys = { version = "0.2.0", git = "https://github.com/eiz/accessibility", branch = "master" }
+accessibility = { version = "0.4.0", git = "https://github.com/tmandry/accessibility", branch = "objc2-migration" }
+accessibility-sys = { version = "0.3.0", git = "https://github.com/tmandry/accessibility", branch = "objc2-migration" }
 anyhow = "1.0.83"
 ascii_tree = "0.1.1"
 bitflags = "2.4.1"
@@ -94,8 +94,11 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
 ] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
     "alloc",
+    "CFArray",
     "CFCGTypes",
+    "CFDictionary",
     "CFMessagePort",
+    "CFNumber",
     "CFRunLoop",
     "CFData",
     "CFDate",

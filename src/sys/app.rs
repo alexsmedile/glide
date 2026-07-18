@@ -5,23 +5,18 @@
 
 use std::fmt::{Debug, Formatter};
 
-use accessibility::{AXAttribute, AXUIElement, AXUIElementAttributes};
+use accessibility::{AXAttribute, AXError, AXUIElement, AXUIElementAttributes};
 pub use accessibility_sys::pid_t;
-use accessibility_sys::{
-    kAXErrorAttributeUnsupported, kAXErrorNoValue, kAXStandardWindowSubrole, kAXWindowRole,
-};
-use core_foundation::base::{CFType, TCFType};
-use core_foundation::boolean::CFBoolean;
-use core_foundation::string::CFString;
+use accessibility_sys::{kAXStandardWindowSubrole, kAXWindowRole};
 use objc2::rc::Retained;
 use objc2::{class, msg_send};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CFBoolean, CFString, CFType, CGRect};
 use objc2_foundation::NSString;
 use redact::Secret;
 use serde::{Deserialize, Serialize};
 
-use super::geometry::{CGRectDef, ToICrate};
+use super::geometry::CGRectDef;
 use super::window_server::WindowServerId;
 
 pub fn running_apps(bundle: Option<String>) -> impl Iterator<Item = (pid_t, AppInfo)> {
@@ -103,19 +98,19 @@ impl TryFrom<&AXUIElement> for WindowInfo {
         let subrole = match element.subrole() {
             Ok(s) => Some(s),
             Err(accessibility::Error::Ax(e))
-                if e == kAXErrorNoValue || e == kAXErrorAttributeUnsupported =>
+                if e == AXError::NoValue || e == AXError::AttributeUnsupported =>
             {
                 None
             }
             Err(e) => return Err(e),
         };
-        let is_standard = role == kAXWindowRole
-            && subrole.as_ref().is_some_and(|s| *s == kAXStandardWindowSubrole);
+        let is_standard = role.to_string() == kAXWindowRole
+            && subrole.as_ref().is_some_and(|s| s.to_string() == kAXStandardWindowSubrole);
         let ax_subrole = subrole.map(|s| s.to_string());
         Ok(WindowInfo {
             is_standard,
             title: element.title().map(|t| t.to_string().into()).unwrap_or_default(),
-            frame: element.frame()?.to_icrate(),
+            frame: element.frame()?,
             sys_id: WindowServerId::try_from(element).ok(),
             is_resizable: element.is_settable(&AXAttribute::size())?,
             ax_role: role.to_string(),
@@ -147,10 +142,10 @@ pub trait AXUIElementExt {
 
 impl AXUIElementExt for AXUIElement {
     fn enhanced_user_interface(&self) -> Result<bool, accessibility::Error> {
-        Ok(self.attribute(&enhanced_ui())?.downcast() == Some(CFBoolean::true_value()))
+        Ok(self.attribute(&enhanced_ui())?.downcast::<CFBoolean>().is_ok_and(|b| b.value()))
     }
     fn set_enhanced_user_interface(&self, enabled: bool) -> Result<(), accessibility::Error> {
-        self.set_attribute(&enhanced_ui(), CFBoolean::from(enabled).as_CFType())
+        self.set_attribute(&enhanced_ui(), CFBoolean::new(enabled))
     }
 
     fn privacy_sensitive_inspect(&self) -> Inspect<'_> {
@@ -159,7 +154,7 @@ impl AXUIElementExt for AXUIElement {
 }
 
 fn enhanced_ui() -> AXAttribute<CFType> {
-    AXAttribute::new(&CFString::from_static_string("AXEnhancedUserInterface"))
+    AXAttribute::new(&CFString::from_static_str("AXEnhancedUserInterface"))
 }
 
 pub struct Inspect<'a>(&'a AXUIElement);
@@ -169,7 +164,7 @@ impl Debug for Inspect<'_> {
         let mut st = f.debug_struct("AXWindow");
         for attr in self.0.attribute_names().unwrap().iter() {
             if let Ok(value) = self.0.attribute(&AXAttribute::new(&attr)) {
-                st.field(&attr.to_string(), &value);
+                st.field(&attr.to_string(), &*value);
             }
         }
         st.finish()

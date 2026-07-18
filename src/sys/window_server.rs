@@ -5,7 +5,7 @@ use std::ffi::{c_int, c_void};
 use std::marker::PhantomData;
 
 use accessibility::AXUIElement;
-use accessibility_sys::{AXError, AXUIElementRef, kAXErrorSuccess, pid_t};
+use accessibility_sys::pid_t;
 use core_foundation::array::CFArray;
 use core_foundation::base::{CFType, CFTypeRef, ItemRef, TCFType};
 use core_foundation::boolean::CFBoolean;
@@ -59,9 +59,9 @@ impl TryFrom<&AXUIElement> for WindowServerId {
     type Error = accessibility::Error;
     fn try_from(element: &AXUIElement) -> Result<Self, accessibility::Error> {
         let mut id = 0;
-        let res = unsafe { _AXUIElementGetWindow(element.as_concrete_TypeRef(), &mut id) };
-        if res != kAXErrorSuccess {
-            return Err(accessibility::Error::Ax(res));
+        let res = unsafe { _AXUIElementGetWindow(element.as_sys(), &mut id) };
+        if let Some(err) = accessibility::AXError::from_raw(res) {
+            return Err(accessibility::Error::Ax(err));
         }
         Ok(WindowServerId(id))
     }
@@ -184,7 +184,10 @@ pub fn get_window_at_point(
 }
 
 unsafe extern "C" {
-    fn _AXUIElementGetWindow(elem: AXUIElementRef, wid: *mut CGWindowID) -> AXError;
+    fn _AXUIElementGetWindow(
+        elem: &accessibility_sys::AXUIElement,
+        wid: *mut CGWindowID,
+    ) -> accessibility_sys::AXError;
 }
 
 /// Set the key window of the window server and application.

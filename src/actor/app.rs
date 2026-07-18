@@ -20,20 +20,17 @@ use std::sync::LazyLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use accessibility::{AXUIElement, AXUIElementActions, AXUIElementAttributes};
+use accessibility::{AXError, AXUIElement, AXUIElementActions, AXUIElementAttributes};
 use accessibility_sys::{
     kAXApplicationActivatedNotification, kAXApplicationDeactivatedNotification,
-    kAXErrorCannotComplete, kAXErrorNoValue, kAXErrorNotificationAlreadyRegistered,
     kAXMainWindowChangedNotification, kAXStandardWindowSubrole, kAXTitleChangedNotification,
     kAXUIElementDestroyedNotification, kAXWindowCreatedNotification,
     kAXWindowDeminiaturizedNotification, kAXWindowMiniaturizedNotification,
     kAXWindowMovedNotification, kAXWindowResizedNotification, kAXWindowRole,
 };
-use core_foundation::runloop::CFRunLoop;
-use core_foundation::string::CFString;
 use objc2::rc::Retained;
 use objc2_app_kit::NSRunningApplication;
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CFRetained, CFRunLoop, CFString, CGRect};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{
     UnboundedReceiver as Receiver, UnboundedSender as Sender, WeakUnboundedSender,
@@ -51,7 +48,7 @@ use crate::sys::app::{AXUIElementExt, NSRunningApplicationExt, ProcessInfo};
 pub use crate::sys::app::{AppInfo, WindowInfo, pid_t};
 use crate::sys::event;
 use crate::sys::executor::Executor;
-use crate::sys::geometry::{SameAs, ToCGType, ToICrate};
+use crate::sys::geometry::SameAs;
 use crate::sys::observer::Observer;
 use crate::sys::window_server::WindowServerId;
 
@@ -193,7 +190,7 @@ struct State {
     pid: pid_t,
     bundle_id: Option<String>,
     running_app: Retained<NSRunningApplication>,
-    app: AXUIElement,
+    app: CFRetained<AXUIElement>,
     observer: Observer,
     ws_tx: window_server::Sender,
     requests_tx: WeakUnboundedSender<(Span, Request)>,
@@ -211,7 +208,7 @@ struct State {
 }
 
 struct WindowState {
-    elem: AXUIElement,
+    elem: CFRetained<AXUIElement>,
     is_standard: bool,
     last_seen_txid: TransactionId,
     /// The last frame requested via [`Request::AnimationFrame`] with `set_size`.
@@ -253,7 +250,7 @@ impl State {
         info: AppInfo,
         requests_tx: Sender<(Span, Request)>,
         requests_rx: Receiver<(Span, Request)>,
-        notifications_rx: Receiver<(AXUIElement, String)>,
+        notifications_rx: Receiver<(CFRetained<AXUIElement>, String)>,
         raises_rx: Receiver<(Span, RaiseRequest)>,
         startup: Option<wm_controller::StartupToken>,
     ) {
@@ -272,7 +269,7 @@ impl State {
     async fn handle_incoming(
         this: &RefCell<Self>,
         mut requests_rx: Receiver<(Span, Request)>,
-        mut notifications_rx: Receiver<(AXUIElement, String)>,
+        mut notifications_rx: Receiver<(CFRetained<AXUIElement>, String)>,
     ) {
         loop {
             // Process requests in batches so we can coalesce stale animation
@@ -314,8 +311,7 @@ impl State {
             match this.handle_request(&mut request) {
                 Ok(should_terminate) if should_terminate => return true,
                 Ok(_) => (),
-                #[allow(non_upper_case_globals)]
-                Err(accessibility::Error::Ax(kAXErrorCannotComplete))
+                Err(accessibility::Error::Ax(AXError::CannotComplete))
                     if this.running_app.isTerminated() =>
                 {
                     // The app does not appear to be running anymore.
@@ -353,7 +349,7 @@ impl State {
             set_window_frame_once(&window.elem, frame)?;
         } else {
             trace("set_position", &window.elem, || {
-                window.elem.set_position(frame.origin.to_cgtype())
+                window.elem.set_position(frame.origin)
             })?;
         }
         Ok(())
@@ -415,7 +411,7 @@ impl State {
             windows.push((wid, info));
         }
         self.main_window = self.app.main_window().ok().and_then(|w| self.id(&w).ok());
-        self.is_frontmost = self.app.frontmost().map(|b| b.into()).unwrap_or(false);
+        self.is_frontmost = self.app.frontmost().map(|b| b.value()).unwrap_or(false);
 
         let pid = self.pid;
         if self
@@ -466,8 +462,7 @@ impl State {
             loop {
                 match self.observer.add_notification(&self.app, notif) {
                     Ok(()) => break,
-                    #[allow(non_upper_case_globals)]
-                    Err(accessibility::Error::Ax(kAXErrorNotificationAlreadyRegistered)) => {
+                    Err(accessibility::Error::Ax(AXError::NotificationAlreadyRegistered)) => {
                         debug!(
                             pid = ?self.pid,
                             "Watching app for {notif} was already registered; continuing"
@@ -512,7 +507,7 @@ impl State {
         }
         match request {
             Request::Terminate => {
-                CFRunLoop::get_current().stop();
+                CFRunLoop::current().unwrap().stop();
                 self.send_event(Event::ApplicationThreadTerminated(self.pid));
                 return Ok(true);
             }
@@ -572,7 +567,7 @@ impl State {
                 let frame = trace("frame", &window.elem, || window.elem.frame())?;
                 self.send_event(Event::WindowFrameChanged(
                     wid,
-                    frame.to_icrate(),
+                    frame,
                     txid,
                     Requested(true),
                     None,
@@ -641,7 +636,7 @@ impl State {
                 let frame = trace("frame", &elem, || elem.frame())?;
                 self.send_event(Event::WindowFrameChanged(
                     wid,
-                    frame.to_icrate(),
+                    frame,
                     last_seen_txid,
                     Requested(true),
                     None,
@@ -663,7 +658,7 @@ impl State {
     }
 
     #[instrument(skip_all, fields(app = ?self.app, ?notif))]
-    fn handle_notification(&mut self, elem: AXUIElement, notif: &str) {
+    fn handle_notification(&mut self, elem: CFRetained<AXUIElement>, notif: &str) {
         trace!(?notif, ?elem, "Got notification");
         #[allow(non_upper_case_globals)]
         #[forbid(non_snake_case)]
@@ -708,7 +703,7 @@ impl State {
                 };
                 self.send_event(Event::WindowFrameChanged(
                     wid,
-                    frame.to_icrate(),
+                    frame,
                     last_seen,
                     Requested(false),
                     Some(event::get_mouse_state()),
@@ -775,7 +770,11 @@ impl State {
         let is_standard = {
             let this = this_ref.borrow();
             let window = this.window(first)?;
-            window.elem.subrole().map(|s| s == kAXStandardWindowSubrole).unwrap_or(false)
+            window
+                .elem
+                .subrole()
+                .map(|s| s.to_string() == kAXStandardWindowSubrole)
+                .unwrap_or(false)
         };
         // Check for cancellation again in case the request took too long.
         check_cancel()?;
@@ -807,7 +806,7 @@ impl State {
         // If the app thinks it isn't frontmost but it is, it will get a
         // notification soon and we'll match out against it, incorrectly marking
         // it as quiet. Otherwise nothing bad happens.
-        let is_frontmost: bool = trace("is_frontmost", &this.app, || this.app.frontmost())?.into();
+        let is_frontmost: bool = trace("is_frontmost", &this.app, || this.app.frontmost())?.value();
 
         // Make this the key window. This ensures that the window has focus and
         // can receive keyboard events, and activates the app if it isn't
@@ -821,7 +820,7 @@ impl State {
         // to the application and does not wait for it to complete.
         let make_key_result = crate::sys::window_server::make_key_window(
             this.pid,
-            WindowServerId::try_from(&this.window(first)?.elem)?,
+            WindowServerId::try_from(&*this.window(first)?.elem)?,
         );
         if make_key_result.is_err() {
             warn!(?this.pid, "Failed to activate app");
@@ -960,7 +959,7 @@ impl State {
         // stale events.
         //
         // TODO: I'm not sure this is necessary, for activation events at least.
-        let is_frontmost: bool = trace("is_frontmost", &self.app, || self.app.frontmost())?.into();
+        let is_frontmost: bool = trace("is_frontmost", &self.app, || self.app.frontmost())?.value();
         let old_frontmost = std::mem::replace(&mut self.is_frontmost, is_frontmost);
         debug!(
             "on_activation_changed, pid={:?}, is_frontmost={:?}, old_frontmost={:?}",
@@ -1037,16 +1036,16 @@ impl State {
     }
 
     #[must_use]
-    fn register_window(&mut self, elem: AXUIElement) -> Option<(WindowInfo, WindowId)> {
-        let Ok(info) = WindowInfo::try_from(&elem) else {
+    fn register_window(&mut self, elem: CFRetained<AXUIElement>) -> Option<(WindowInfo, WindowId)> {
+        let Ok(info) = WindowInfo::try_from(&*elem) else {
             return None;
         };
 
-        let wsid = WindowServerId::try_from(&elem)
+        let wsid = WindowServerId::try_from(&*elem)
             .or_else(|e| {
                 if self.bundle_id.as_deref() == Some("com.apple.finder")
                     && let Ok(role) = elem.role()
-                    && role == CFString::from_static_string("AXScrollArea")
+                    && role == CFString::from_static_str("AXScrollArea")
                 {
                     // Finder has a weird window like this; maybe the desktop.
                     Err(e)
@@ -1087,7 +1086,7 @@ impl State {
         fn register_notifs(win: &AXUIElement, state: &State, wsid: Option<WindowServerId>) -> bool {
             // Filter out elements that aren't regular windows.
             match win.role() {
-                Ok(role) if role == kAXWindowRole => (),
+                Ok(role) if role.to_string() == kAXWindowRole => (),
                 _ => return false,
             }
             for notif in WINDOW_NOTIFICATIONS {
@@ -1128,7 +1127,7 @@ impl State {
             if self.windows.contains_key(&wid) {
                 return Ok(wid);
             }
-        } else if let Some((&wid, _)) = self.windows.iter().find(|(_, w)| &w.elem == elem) {
+        } else if let Some((&wid, _)) = self.windows.iter().find(|(_, w)| &*w.elem == elem) {
             return Ok(wid);
         }
         Err(accessibility::Error::NotFound)
@@ -1226,10 +1225,8 @@ const SET_WINDOW_FRAME_RETRIES: usize = 3;
 const SET_WINDOW_FRAME_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 fn set_window_frame_once(window: &AXUIElement, frame: CGRect) -> Result<(), accessibility::Error> {
-    trace("set_size", window, || window.set_size(frame.size.to_cgtype()))?;
-    trace("set_position", window, || {
-        window.set_position(frame.origin.to_cgtype())
-    })?;
+    trace("set_size", window, || window.set_size(frame.size))?;
+    trace("set_position", window, || window.set_position(frame.origin))?;
     Ok(())
 }
 
@@ -1247,7 +1244,7 @@ fn set_window_frame_with_retries(
     let mut observed = requested;
     for attempt in 1..=SET_WINDOW_FRAME_RETRIES {
         set_window_frame_once(window, frame)?;
-        observed = trace("frame", window, || window.frame())?.to_icrate();
+        observed = trace("frame", window, || window.frame())?;
         if observed.same_as(requested) {
             return Ok(());
         }
@@ -1300,10 +1297,9 @@ thread_local! {
     static WARNINGS_SEEN: RefCell<crate::collections::HashSet<(&'static str, String)>> = RefCell::new(Default::default());
 }
 
-/// Converts kAXErrorNoValue to None.
+/// Converts AXError::NoValue to None.
 fn optional<T>(val: Result<T, accessibility::Error>) -> Result<Option<T>, accessibility::Error> {
-    #[expect(non_upper_case_globals)]
-    if let Err(accessibility::Error::Ax(kAXErrorNoValue)) = val {
+    if let Err(accessibility::Error::Ax(AXError::NoValue)) = val {
         return Ok(None);
     }
     val.map(Some)

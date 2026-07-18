@@ -6,15 +6,15 @@
 use std::env::VarError;
 use std::future::Future;
 use std::path::PathBuf;
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::time::Instant;
 
 use accessibility::{AXUIElement, AXUIElementAttributes};
-use accessibility_sys::{AXUIElementCopyElementAtPosition, AXUIElementRef, pid_t};
+use accessibility_sys::pid_t;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use core_foundation::array::CFArray;
-use core_foundation::base::{FromMutVoid, TCFType};
+use core_foundation::base::TCFType;
 use core_foundation::dictionary::CFDictionaryRef;
 use core_graphics::display::{CGDisplayBounds, CGMainDisplayID};
 use core_graphics::window::{
@@ -29,6 +29,7 @@ use glide_wm::sys::window_server::{self, WindowServerId, get_window};
 use glide_wm::sys::{self};
 use livesplit_hotkey::{ConsumePreference, Modifiers};
 use objc2_app_kit::{NSRunningApplication, NSScreen, NSWindow, NSWindowNumberListOptions};
+use objc2_core_foundation::CFRetained;
 use objc2_foundation::{MainThreadMarker, NSString};
 use tokio::sync::mpsc::{self, UnboundedReceiver, unbounded_channel};
 use tracing::info;
@@ -193,10 +194,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::App(App::ReadMainWindow { pid, wait }) => {
             let app = AXUIElement::application(pid);
-            println!("frontmost = {:?}", app.frontmost()?);
+            println!("frontmost = {:?}", &*app.frontmost()?);
             let main_window = if opt.verbose {
-                let main_window = dbg!(app.main_window()?);
-                let main_window_id: WindowServerId = (&app.main_window()?).try_into()?;
+                let main_window = app.main_window()?;
+                dbg!(&*main_window);
+                let main_window_id: WindowServerId = (&*app.main_window()?).try_into()?;
                 dbg!(main_window_id);
                 main_window
             } else {
@@ -211,7 +213,7 @@ async fn main() -> anyhow::Result<()> {
                 std::io::stdin().read_line(&mut String::new())?;
                 app.set_messaging_timeout(3600.0)?;
             }
-            dbg!(main_window.main()?);
+            dbg!(&*main_window.main()?);
         }
         Command::App(App::Run { pid_or_bundle }) => {
             run_app_actor(pid_or_bundle).await?;
@@ -330,20 +332,24 @@ async fn inspect_inner(mut rx: UnboundedReceiver<()>, mtm: MainThreadMarker) {
         let Some(pos) = get_mouse_pos(converter) else { continue };
         // This API doesn't always work, but for some reason get_window_at_point
         // *never* works from devtool.
-        let mut element: AXUIElementRef = ptr::null_mut();
+        let mut element: *const accessibility_sys::AXUIElement = ptr::null();
         let err = unsafe {
-            AXUIElementCopyElementAtPosition(
-                AXUIElement::system_wide().as_CFTypeRef() as _,
+            AXUIElement::system_wide().as_sys().copy_element_at_position(
                 pos.x as f32,
                 pos.y as f32,
-                &raw mut element,
+                NonNull::new_unchecked(&mut element),
             )
         };
-        if err != 0 {
-            println!("Failed to get element under cursor: {err:?}");
+        if let Some(err) = accessibility::AXError::from_raw(err) {
+            println!("Failed to get element under cursor: {err}");
             continue;
         }
-        let elem = unsafe { AXUIElement::from_mut_void(element as *mut _) };
+        // SAFETY: `element` is non-null on success, and owned per the copy rule.
+        let elem = unsafe {
+            CFRetained::cast_unchecked::<AXUIElement>(CFRetained::from_raw(NonNull::new_unchecked(
+                element.cast_mut(),
+            )))
+        };
         let ax_window = match elem.window() {
             Ok(win) => win,
             Err(e) => {
@@ -355,7 +361,7 @@ async fn inspect_inner(mut rx: UnboundedReceiver<()>, mtm: MainThreadMarker) {
         };
         println!("{:#?}", ax_window.privacy_sensitive_inspect());
         let Some(info) =
-            WindowServerId::try_from(&ax_window).ok().and_then(|wsid| get_window(wsid))
+            WindowServerId::try_from(&*ax_window).ok().and_then(|wsid| get_window(wsid))
         else {
             println!("Couldn't get window server info for {element:?}");
             continue;
@@ -441,7 +447,7 @@ async fn get_windows_with_ax(opt: &Opt, serial: bool, print: bool) {
 }
 
 fn get_windows_for_app(
-    app: AXUIElement,
+    app: CFRetained<AXUIElement>,
     verbose: bool,
 ) -> Result<Vec<(WindowInfo, String)>, accessibility::Error> {
     let Ok(windows) = &app.windows() else {
@@ -461,7 +467,7 @@ fn get_windows_for_app(
 fn get_apps(opt: &Opt) {
     for (pid, _bundle_id) in sys::app::running_apps(opt.bundle.clone()) {
         let app = AXUIElement::application(pid);
-        println!("{app:#?}");
+        println!("{:#?}", &*app);
     }
 }
 

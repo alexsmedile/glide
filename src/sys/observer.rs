@@ -1,31 +1,20 @@
 // Copyright The Glide Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::borrow::Cow;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
-use std::ptr;
+use std::ptr::{self, NonNull};
 
-use accessibility::AXUIElement;
-use accessibility_sys::{
-    AXError, AXObserverAddNotification, AXObserverCreate, AXObserverGetRunLoopSource,
-    AXObserverGetTypeID, AXObserverRef, AXObserverRemoveNotification, AXUIElementRef,
-    kAXErrorSuccess, pid_t,
-};
-use core_foundation::base::TCFType;
-use core_foundation::runloop::{CFRunLoopAddSource, CFRunLoopGetCurrent, kCFRunLoopCommonModes};
-use core_foundation::string::{CFString, CFStringRef};
-use core_foundation::{declare_TCFType, impl_TCFType};
-
-declare_TCFType!(AXObserver, AXObserverRef);
-impl_TCFType!(AXObserver, AXObserverRef, AXObserverGetTypeID);
+use accessibility::{AXError, AXUIElement, Error};
+use accessibility_sys::{AXObserver, pid_t};
+use objc2_core_foundation::{CFRetained, CFRunLoop, CFString, kCFRunLoopCommonModes};
 
 /// An observer for accessibility events.
 pub struct Observer {
     callback: *mut (),
     dtor: unsafe fn(*mut ()),
-    observer: ManuallyDrop<AXObserver>,
+    observer: ManuallyDrop<CFRetained<AXObserver>>,
 }
 
 static_assertions::assert_not_impl_any!(Observer: Send);
@@ -51,32 +40,36 @@ static_assertions::assert_not_impl_any!(Observer: Send);
 // fail and can be called before the call to `make_cyclic`. `install` is
 // infallible and can be called inside, meaning the callback passed to it can
 // capture a weak pointer to our object.
-pub struct ObserverBuilder<F>(AXObserver, PhantomData<F>);
+pub struct ObserverBuilder<F>(CFRetained<AXObserver>, PhantomData<F>);
 
 impl Observer {
     /// Creates a new observer for an app, given its `pid`.
     ///
     /// Note that you must call [`ObserverBuilder::install`] on the result of
     /// this function and supply a callback for the observer to have any effect.
-    pub fn new<F: Fn(AXUIElement, &str) + 'static>(
+    pub fn new<F: Fn(CFRetained<AXUIElement>, &str) + 'static>(
         pid: pid_t,
-    ) -> Result<ObserverBuilder<F>, accessibility::Error> {
+    ) -> Result<ObserverBuilder<F>, Error> {
         // SAFETY: We just create an observer here, and check the return code.
         // The callback cannot be called yet. The API guarantees that F will be
         // supplied as the callback in the call to install (and the 'static
         // bound on F means we don't need to worry about variance).
-        let mut observer: AXObserverRef = ptr::null_mut();
-        unsafe {
-            make_result(AXObserverCreate(pid, internal_callback::<F>, &mut observer))?;
-        }
-        Ok(ObserverBuilder(
-            unsafe { AXObserver::wrap_under_create_rule(observer) },
-            PhantomData,
-        ))
+        let mut observer: *mut AXObserver = ptr::null_mut();
+        let err = unsafe {
+            AXObserver::create(
+                pid,
+                Some(internal_callback::<F>),
+                NonNull::new_unchecked(&mut observer),
+            )
+        };
+        make_result(err)?;
+        // SAFETY: AXObserverCreate succeeded, so `observer` is a valid +1 object.
+        let observer = unsafe { CFRetained::from_raw(NonNull::new_unchecked(observer)) };
+        Ok(ObserverBuilder(observer, PhantomData))
     }
 }
 
-impl<F: Fn(AXUIElement, &str) + 'static> ObserverBuilder<F> {
+impl<F: Fn(CFRetained<AXUIElement>, &str) + 'static> ObserverBuilder<F> {
     /// Installs the observer with the supplied callback into the current
     /// thread's run loop.
     pub fn install(self, callback: F) -> Observer {
@@ -84,8 +77,8 @@ impl<F: Fn(AXUIElement, &str) + 'static> ObserverBuilder<F> {
         // internal_callback::<F>. F is 'static, so even if our destructor is
         // not run it will remain valid to call.
         unsafe {
-            let source = AXObserverGetRunLoopSource(self.0.as_concrete_TypeRef());
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+            let source = self.0.run_loop_source();
+            CFRunLoop::current().unwrap().add_source(Some(&source), kCFRunLoopCommonModes);
         }
         Observer {
             callback: Box::into_raw(Box::new(callback)) as *mut (),
@@ -113,12 +106,11 @@ impl Observer {
         &self,
         elem: &AXUIElement,
         notification: &'static str,
-    ) -> Result<(), accessibility::Error> {
+    ) -> Result<(), Error> {
         make_result(unsafe {
-            AXObserverAddNotification(
-                self.observer.as_concrete_TypeRef(),
-                elem.as_concrete_TypeRef(),
-                CFString::from_static_string(notification).as_concrete_TypeRef(),
+            self.observer.add_notification(
+                elem.as_sys(),
+                &CFString::from_static_str(notification),
                 self.callback as *mut c_void,
             )
         })
@@ -128,33 +120,33 @@ impl Observer {
         &self,
         elem: &AXUIElement,
         notification: &'static str,
-    ) -> Result<(), accessibility::Error> {
+    ) -> Result<(), Error> {
         make_result(unsafe {
-            AXObserverRemoveNotification(
-                self.observer.as_concrete_TypeRef(),
-                elem.as_concrete_TypeRef(),
-                CFString::from_static_string(notification).as_concrete_TypeRef(),
-            )
+            self.observer
+                .remove_notification(elem.as_sys(), &CFString::from_static_str(notification))
         })
     }
 }
 
-unsafe extern "C" fn internal_callback<F: Fn(AXUIElement, &str) + 'static>(
-    _observer: AXObserverRef,
-    elem: AXUIElementRef,
-    notif: CFStringRef,
+unsafe extern "C-unwind" fn internal_callback<F: Fn(CFRetained<AXUIElement>, &str) + 'static>(
+    _observer: NonNull<AXObserver>,
+    elem: NonNull<accessibility_sys::AXUIElement>,
+    notif: NonNull<CFString>,
     data: *mut c_void,
 ) {
     let callback = unsafe { &*(data as *const F) };
-    let elem = unsafe { AXUIElement::wrap_under_get_rule(elem) };
-    let notif = unsafe { CFString::wrap_under_get_rule(notif) };
-    let notif = Cow::<str>::from(&notif);
-    callback(elem, &*notif);
+    // SAFETY: `elem` is a valid, unretained (+0) reference for the duration of
+    // this call, and shares layout with `accessibility::AXUIElement`.
+    let elem = unsafe { CFRetained::retain(elem) };
+    let elem = unsafe { CFRetained::cast_unchecked::<AXUIElement>(elem) };
+    // SAFETY: `notif` is a valid reference for the duration of this call.
+    let notif = unsafe { notif.as_ref() };
+    callback(elem, &notif.to_string());
 }
 
-fn make_result(err: AXError) -> Result<(), accessibility::Error> {
-    if err != kAXErrorSuccess {
-        return Err(accessibility::Error::Ax(err));
+fn make_result(err: accessibility_sys::AXError) -> Result<(), Error> {
+    match AXError::from_raw(err) {
+        Some(err) => Err(Error::Ax(err)),
+        None => Ok(()),
     }
-    Ok(())
 }
