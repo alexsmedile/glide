@@ -210,6 +210,9 @@ pub struct Reactor {
     config: Arc<Config>,
     apps: HashMap<pid_t, AppState>,
     layout: LayoutManager,
+    /// One-shot frame targets requested by layout transitions. They are merged
+    /// into the next animation alongside the continuously calculated layout.
+    pending_frame_overrides: HashMap<WindowId, CGRect>,
     windows: HashMap<WindowId, WindowState>,
     window_server_info: HashMap<WindowServerId, WindowServerInfo>,
     window_ids: HashMap<WindowServerId, WindowId>,
@@ -349,6 +352,7 @@ impl Reactor {
             config,
             apps: HashMap::default(),
             layout,
+            pending_frame_overrides: HashMap::default(),
             windows: HashMap::default(),
             window_ids: HashMap::default(),
             window_server_info: HashMap::default(),
@@ -489,6 +493,7 @@ impl Reactor {
                 {
                     animation_focus_wids.push(wid);
                     let info = LayoutWindowInfo {
+                        frame: window.frame_monotonic,
                         bundle_id: app.info.bundle_id.clone(),
                         app_name: app.info.localized_name.clone(),
                         title: window.title.clone().into(),
@@ -529,6 +534,7 @@ impl Reactor {
                 if old_frame == new_frame {
                     return;
                 }
+                self.send_layout_event(LayoutEvent::WindowFrameChanged { wid, frame: new_frame });
                 let old_screen = self.best_screen_idx_for_window(&old_frame);
                 let new_screen = self.best_screen_idx_for_window(&new_frame);
                 if let Some(old) = old_screen
@@ -860,6 +866,7 @@ impl Reactor {
                 continue;
             };
             let layout_info = LayoutWindowInfo {
+                frame: window.frame_monotonic,
                 bundle_id: app.and_then(|a| a.info.bundle_id.clone()),
                 app_name: app.and_then(|a| a.info.localized_name.clone()),
                 title: window.title.clone().into(),
@@ -987,7 +994,12 @@ impl Reactor {
             response = self.filter_response(response, visible_window_order);
         }
 
-        let layout::EventResponse { raise_windows, focus_window } = response;
+        let layout::EventResponse {
+            frame_overrides,
+            raise_windows,
+            focus_window,
+        } = response;
+        self.pending_frame_overrides.extend(frame_overrides);
         if raise_windows.is_empty() && focus_window.is_none() {
             return;
         }
@@ -1085,6 +1097,7 @@ impl Reactor {
         let main_window = self.main_window();
         trace!(?main_window);
         let mut anim = Animation::new();
+        let mut targets = BTreeMap::new();
         for &screen in &self.screens {
             let Some(space) = screen.space else { continue };
             if !skip_anim {
@@ -1096,25 +1109,34 @@ impl Reactor {
             self.group_indicators_tx
                 .send(group_bars::Event::GroupsUpdated { space_id: space, groups });
 
-            for &(wid, target_frame) in &result {
-                let Some(window) = self.windows.get_mut(&wid) else {
-                    // If we restored a saved state the window may not be available yet.
-                    continue;
-                };
-                let target_frame = round_to_physical(target_frame, screen.scale_factor);
-                let current_frame = window.frame_monotonic;
-                if target_frame.same_as(current_frame) {
-                    continue;
-                }
-                let Some(app) = self.apps.get(&wid.pid) else {
-                    continue;
-                };
-                let txid = window.next_txid();
-                trace!(?wid, ?current_frame, ?target_frame);
-                let is_new = new_wids.contains(&wid);
-                anim.add_window(&app.handle, wid, current_frame, target_frame, is_new, txid);
-                window.frame_monotonic = target_frame;
+            targets
+                .extend(result.into_iter().map(|(wid, frame)| (wid, (frame, screen.scale_factor))));
+        }
+        for (wid, frame) in mem::take(&mut self.pending_frame_overrides) {
+            let scale_factor = self
+                .best_screen_idx_for_window(&frame)
+                .and_then(|idx| self.screens.get(idx))
+                .map_or(1.0, |screen| screen.scale_factor);
+            targets.insert(wid, (frame, scale_factor));
+        }
+        for (wid, (target_frame, scale_factor)) in targets {
+            let Some(window) = self.windows.get_mut(&wid) else {
+                // If we restored a saved state the window may not be available yet.
+                continue;
+            };
+            let target_frame = round_to_physical(target_frame, scale_factor);
+            let current_frame = window.frame_monotonic;
+            if target_frame.same_as(current_frame) {
+                continue;
             }
+            let Some(app) = self.apps.get(&wid.pid) else {
+                continue;
+            };
+            let txid = window.next_txid();
+            trace!(?wid, ?current_frame, ?target_frame);
+            let is_new = new_wids.contains(&wid);
+            anim.add_window(&app.handle, wid, current_frame, target_frame, is_new, txid);
+            window.frame_monotonic = target_frame;
         }
         // If the user is doing something with the mouse we don't want to
         // animate on top of that.
@@ -1202,6 +1224,97 @@ pub mod tests {
         assert!(
             apps.requests().is_empty(),
             "layout should be handed to the animation manager, not sent directly to app actors"
+        );
+        assert!(matches!(
+            animation_rx.try_recv(),
+            Ok(animation::Message::Replace(_))
+        ));
+    }
+
+    #[test]
+    fn floating_window_restores_its_last_user_frame() {
+        use LayoutCommand::ToggleWindowFloating;
+
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let wid = WindowId::new(1, 1);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(1, make_windows(1), Some(wid), true));
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.send_layout_event(LayoutEvent::WindowFocused(vec![space], wid));
+
+        // First float restores the frame the window had before it was tiled.
+        reactor.handle_event(Event::Command(Command::Layout(ToggleWindowFloating)));
+        let initial_frame = CGRect::new(CGPoint::new(100., 100.), CGSize::new(50., 50.));
+        let requests = apps.requests();
+        assert!(requests.iter().any(|request| {
+            matches!(request, Request::SetWindowFrame(request_wid, frame, _) if *request_wid == wid && *frame == initial_frame)
+        }), "{requests:?}");
+        for event in apps.simulate_events_for_requests(requests) {
+            reactor.handle_event(event);
+        }
+
+        // A user move/resize while floating becomes the next restore target.
+        let updated_frame = CGRect::new(CGPoint::new(300., 400.), CGSize::new(250., 125.));
+        reactor.handle_event(Event::WindowFrameChanged(
+            wid,
+            updated_frame,
+            apps.windows[&wid].last_seen_txid,
+            Requested(false),
+            None,
+        ));
+        assert_eq!(reactor.layout.floating_restore_frame(wid), Some(updated_frame));
+        assert!(apps.requests().is_empty());
+
+        reactor.handle_event(Event::Command(Command::Layout(ToggleWindowFloating)));
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!(reactor.windows[&wid].frame_monotonic, screen);
+        reactor.handle_event(Event::Command(Command::Layout(ToggleWindowFloating)));
+        let requests = apps.requests();
+        assert!(requests.iter().any(|request| {
+            matches!(request, Request::SetWindowFrame(request_wid, frame, _) if *request_wid == wid && *frame == updated_frame)
+        }), "{requests:?}");
+    }
+
+    #[test]
+    fn floating_frame_restoration_uses_animation() {
+        use LayoutCommand::ToggleWindowFloating;
+
+        let mut apps = Apps::new();
+        let (mut reactor, mut animation_rx) =
+            Reactor::new_for_test_with_animation(LayoutManager::new(), true);
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let wid = WindowId::new(1, 1);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(1, make_windows(1), Some(wid), true));
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_event(Event::StartupComplete);
+        let animation::Message::Replace(animation) = animation_rx.try_recv().unwrap() else {
+            panic!("expected initial layout animation");
+        };
+        animation.skip_to_end();
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.send_layout_event(LayoutEvent::WindowFocused(vec![space], wid));
+
+        reactor.handle_event(Event::Command(Command::Layout(ToggleWindowFloating)));
+        assert!(
+            apps.requests().is_empty(),
+            "restore should be animated, not written directly"
         );
         assert!(matches!(
             animation_rx.try_recv(),
@@ -1592,6 +1705,7 @@ pub mod tests {
 
         let response = reactor.filter_response(
             layout::EventResponse {
+                frame_overrides: vec![],
                 raise_windows: vec![w2],
                 focus_window: Some(w1),
             },
@@ -1610,6 +1724,7 @@ pub mod tests {
 
         let response = reactor.filter_response(
             layout::EventResponse {
+                frame_overrides: vec![],
                 raise_windows: vec![w2],
                 focus_window: Some(w1),
             },
@@ -1915,6 +2030,7 @@ pub mod tests {
         while raise_manager_rx.try_recv().is_ok() {}
 
         reactor.handle_layout_response(layout::EventResponse {
+            frame_overrides: vec![],
             raise_windows: vec![
                 WindowId::new(1, 1),
                 WindowId::new(1, 2),
@@ -1958,6 +2074,7 @@ pub mod tests {
         let _events = apps.simulate_events();
         while raise_manager_rx.try_recv().is_ok() {}
         reactor.handle_layout_response(layout::EventResponse {
+            frame_overrides: vec![],
             raise_windows: vec![WindowId::new(1, 1)],
             focus_window: Some(WindowId::new(2, 1)),
         });
