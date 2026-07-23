@@ -34,6 +34,7 @@ pub enum Event {
 
     // From WmController
     FocusedScreenChanged(ScreenId),
+    ToggleFocusedSpace,
     ToggleSpace(ScreenId),
     ToggleGlobalEnabled,
     SetGlobalEnabled(bool),
@@ -153,24 +154,17 @@ impl SpaceManager {
                 self.focused_screen = Some(screen_id);
                 self.send_space_enabled_status();
             }
+            Event::ToggleFocusedSpace => {
+                let Some(space) = self.focused_space() else {
+                    return;
+                };
+                self.toggle_space(space);
+            }
             Event::ToggleSpace(screen_id) => {
                 let Some(space) = self.space_for_screen(screen_id) else {
                     return;
                 };
-                let toggle_set = if self.config.settings.default_disable {
-                    &mut self.enabled_spaces
-                } else {
-                    &mut self.disabled_spaces
-                };
-                if !toggle_set.remove(&space) {
-                    toggle_set.insert(space);
-                }
-                if !self.is_space_enabled(space) {
-                    self.group_indicators_tx.send(group_bars::Event::SpaceDisabled(space));
-                }
-                self.status_tx
-                    .send(status::Event::SpaceEnabledChanged(self.is_space_enabled(space)));
-                self.request_space_refresh();
+                self.toggle_space(space);
             }
             Event::ToggleGlobalEnabled => {
                 self.set_global_enabled(!self.is_globally_enabled);
@@ -251,6 +245,22 @@ impl SpaceManager {
         }
     }
 
+    fn toggle_space(&mut self, space: SpaceId) {
+        let toggle_set = if self.config.settings.default_disable {
+            &mut self.enabled_spaces
+        } else {
+            &mut self.disabled_spaces
+        };
+        if !toggle_set.remove(&space) {
+            toggle_set.insert(space);
+        }
+        if !self.is_space_enabled(space) {
+            self.group_indicators_tx.send(group_bars::Event::SpaceDisabled(space));
+        }
+        self.send_space_enabled_status();
+        self.request_space_refresh();
+    }
+
     fn active_spaces(&self) -> Vec<Option<SpaceId>> {
         if !self.is_globally_enabled {
             return vec![None; self.cur_space.len()];
@@ -279,8 +289,16 @@ impl SpaceManager {
     }
 
     fn send_space_enabled_status(&self) {
-        let enabled = self.focused_space().map(|s| self.is_space_enabled(s)).unwrap_or(false);
+        let enabled =
+            self.focused_space().map(|space| self.is_space_active(space)).unwrap_or(false);
         self.status_tx.send(status::Event::SpaceEnabledChanged(enabled));
+    }
+
+    fn is_space_active(&self, space: SpaceId) -> bool {
+        self.is_globally_enabled
+            && !self.login_window_active
+            && (!self.one_space || self.starting_space == Some(space))
+            && self.is_space_enabled(space)
     }
 
     fn request_space_refresh(&self) {
@@ -471,6 +489,37 @@ mod tests {
         h.send_space_changed(vec![Some(space(10))]);
         let events = drain(&mut h.reactor_rx);
         assert_eq!(*space_changed_spaces(&events).unwrap(), vec![None]);
+    }
+
+    #[test]
+    fn toggle_focused_space_matches_the_reported_space() {
+        let mut h = TestHarness::new();
+        h.on_event(Event::ScreenParametersChanged {
+            screens: vec![screen(1), screen(2)],
+            frames: vec![CGRect::ZERO, CGRect::ZERO],
+            spaces: vec![Some(space(10)), Some(space(20))],
+            scale_factors: vec![1.0, 1.0],
+            converter: CoordinateConverter::default(),
+            on_screen: WindowsOnScreen::new(vec![]),
+        });
+        h.drain_all();
+        h.on_event(Event::FocusedScreenChanged(screen(2)));
+        h.drain_all();
+
+        h.on_event(Event::ToggleFocusedSpace);
+        let status_events = drain_status(&mut h.status_rx);
+        assert!(
+            status_events
+                .iter()
+                .any(|event| matches!(event, status::Event::SpaceEnabledChanged(true)))
+        );
+
+        h.send_space_changed(vec![Some(space(10)), Some(space(20))]);
+        let events = drain(&mut h.reactor_rx);
+        assert_eq!(
+            *space_changed_spaces(&events).unwrap(),
+            vec![None, Some(space(20))]
+        );
     }
 
     /// With default_disable=false, spaces start enabled. ToggleSpace disables.

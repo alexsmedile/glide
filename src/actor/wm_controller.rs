@@ -200,10 +200,7 @@ impl WmController {
                 self.send_reactor_event(reactor::Event::ApplicationTerminated(pid));
             }
             Command(Wm(ToggleSpaceActivated)) => {
-                let Some(screen_id) = self.get_focused_screen() else {
-                    return;
-                };
-                self.sm_tx.send(space_manager::Event::ToggleSpace(screen_id));
+                self.sm_tx.send(space_manager::Event::ToggleFocusedSpace);
             }
             Command(Wm(ToggleGlobalEnabled)) => {
                 self.sm_tx.send(space_manager::Event::ToggleGlobalEnabled);
