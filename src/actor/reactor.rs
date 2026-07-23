@@ -725,8 +725,13 @@ impl Reactor {
                 info!(?cmd);
                 let visible_spaces =
                     self.screens.iter().flat_map(|screen| screen.space).collect::<Vec<_>>();
-                let response =
-                    self.layout.handle_command(self.main_window_space(), &visible_spaces, cmd);
+                // macOS can temporarily have no main window (for example after
+                // clicking the desktop). Keep keyboard layout commands usable
+                // by targeting the last active screen in that case.
+                let command_space = self
+                    .main_window_space()
+                    .or_else(|| self.active_screen().and_then(|screen| screen.space));
+                let response = self.layout.handle_command(command_space, &visible_spaces, cmd);
                 self.handle_layout_response(response);
             }
             Event::Command(Command::Metrics(cmd)) => log::handle_command(cmd),
@@ -2136,6 +2141,50 @@ pub mod tests {
 
         reactor.handle_event(WindowDestroyed(WindowId::new(1, 1)));
         reactor.handle_event(Command(Layout(MoveFocus(Left))));
+    }
+
+    #[test]
+    fn move_focus_uses_active_screen_when_no_window_is_focused() {
+        use Direction::*;
+        use Event::*;
+        use LayoutCommand::*;
+
+        use super::Command::*;
+        use super::Reactor;
+
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let space = SpaceId::new(1);
+        reactor.handle_event(ScreenParametersChanged {
+            frames: vec![CGRect::ZERO],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+        });
+        reactor.handle_event(ApplicationGloballyActivated(1));
+        reactor.handle_events(apps.make_app_with_opts(
+            1,
+            make_windows(2),
+            Some(WindowId::new(1, 1)),
+            true,
+        ));
+        assert_eq!(reactor.main_window(), Some(WindowId::new(1, 1)));
+
+        let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
+        reactor.raise_manager_tx = raise_manager_tx;
+        reactor.handle_event(ApplicationGloballyDeactivated(1));
+        assert_eq!(reactor.main_window(), None);
+
+        reactor.handle_event(Command(Layout(MoveFocus(Right))));
+
+        let event = raise_manager_rx
+            .try_recv()
+            .expect("focus command should produce a raise request")
+            .1;
+        let raise::Event::RaiseRequest(RaiseRequest { focus_window, .. }) = event else {
+            panic!("unexpected raise event: {event:?}");
+        };
+        assert_eq!(focus_window.map(|(wid, _)| wid), Some(WindowId::new(1, 2)));
     }
 
     #[test]
