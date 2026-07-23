@@ -27,7 +27,7 @@ use crate::actor::{self, mouse, reactor, space_manager, status, window_server};
 use crate::sys;
 use crate::sys::bundle::CommandOutput;
 use crate::sys::event::HotkeyManager;
-use crate::sys::screen::NSScreenExt;
+use crate::sys::screen::{NSScreenExt, get_ns_screens};
 
 #[derive(Debug)]
 pub enum WmEvent {
@@ -41,6 +41,8 @@ pub enum WmEvent {
     ConfigUpdated(Arc<crate::config::Config>),
     /// Sent by SpaceManager to register or unregister hotkeys.
     HotkeysActive(bool),
+    /// Sent by WindowServer to collect a fresh AppKit display snapshot.
+    RefreshScreenParameters(u8),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,10 +200,7 @@ impl WmController {
                 self.send_reactor_event(reactor::Event::ApplicationTerminated(pid));
             }
             Command(Wm(ToggleSpaceActivated)) => {
-                let Some(screen_id) = self.get_focused_screen() else {
-                    return;
-                };
-                self.sm_tx.send(space_manager::Event::ToggleSpace(screen_id));
+                self.sm_tx.send(space_manager::Event::ToggleFocusedSpace);
             }
             Command(Wm(ToggleGlobalEnabled)) => {
                 self.sm_tx.send(space_manager::Event::ToggleGlobalEnabled);
@@ -232,6 +231,12 @@ impl WmController {
                 } else {
                     self.unregister_hotkeys();
                 }
+            }
+            RefreshScreenParameters(attempt) => {
+                self.ws_tx.send(window_server::Event::RetryScreenParameters {
+                    attempt,
+                    screens: get_ns_screens(self.mtm),
+                })
             }
         }
     }

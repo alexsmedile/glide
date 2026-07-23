@@ -4,13 +4,14 @@
 use std::cell::RefCell;
 use std::mem;
 use std::rc::{Rc, Weak};
+use std::time::Duration;
 
 use objc2::MainThreadMarker;
 use tracing::{debug, instrument, warn};
 
 pub use crate::actor::app::pid_t;
 use crate::actor::app::{self, AppInfo, AppThreadHandle, Quiet, WindowId, WindowInfo};
-use crate::actor::{self, reactor, space_manager};
+use crate::actor::{self, reactor, space_manager, wm_controller};
 use crate::collections::HashMap;
 use crate::sys::event::MouseState;
 use crate::sys::screen::{NSScreenInfo, ScreenCache};
@@ -36,7 +37,10 @@ pub struct WindowServer {
     /// Window server IDs currently visible on screen.
     visible_window_ids: Vec<WindowServerId>,
     sm_tx: space_manager::Sender,
+    wm_tx: wm_controller::Sender,
     skylight_tx: SkylightSender,
+    screen_config_retry_attempt: u8,
+    screen_config_retry_pending: bool,
 }
 
 #[derive(Debug)]
@@ -44,6 +48,11 @@ pub enum Event {
     // Sent by the NotificationCenter actor.
     /// Screen configuration changed. Carries NSScreenInfo gathered on the main thread.
     ScreenParametersChanged(Vec<NSScreenInfo>),
+    /// A display snapshot requested after a transiently inconsistent update.
+    RetryScreenParameters {
+        attempt: u8,
+        screens: Vec<NSScreenInfo>,
+    },
     /// The active space changed.
     SpaceChanged,
 
@@ -81,12 +90,19 @@ pub type Sender = actor::Sender<Event>;
 pub type Receiver = actor::Receiver<Event>;
 
 impl WindowServer {
-    pub fn new(sm_tx: space_manager::Sender, skylight_tx: SkylightSender) -> Self {
+    pub fn new(
+        sm_tx: space_manager::Sender,
+        wm_tx: wm_controller::Sender,
+        skylight_tx: SkylightSender,
+    ) -> Self {
         Self {
             screen_cache: ScreenCache::new(),
             visible_window_ids: vec![],
             sm_tx,
+            wm_tx,
             skylight_tx,
+            screen_config_retry_attempt: 0,
+            screen_config_retry_pending: false,
         }
     }
 
@@ -103,20 +119,15 @@ impl WindowServer {
             Event::RegisterWindow(wsid, wid, tx) => {
                 self.skylight_tx.send(SkylightRequest::TrackWindow(wsid, wid, tx));
             }
-            Event::ScreenParametersChanged(ns_screens) => {
-                let Some((screens, converter)) = self.screen_cache.update_screen_config(ns_screens)
-                else {
+            Event::ScreenParametersChanged(ns_screens) => self.handle_screen_parameters(ns_screens),
+            Event::RetryScreenParameters { attempt, screens } => {
+                if !self.screen_config_retry_pending || attempt != self.screen_config_retry_attempt
+                {
                     return;
-                };
-                let on_screen = self.get_windows_on_screen();
-                self.sm_tx.send(space_manager::Event::ScreenParametersChanged {
-                    screens: screens.iter().map(|s| s.id).collect(),
-                    frames: screens.iter().map(|s| s.visible_frame).collect(),
-                    converter,
-                    spaces: self.screen_cache.get_screen_spaces(),
-                    scale_factors: screens.iter().map(|s| s.scale_factor).collect(),
-                    on_screen,
-                });
+                }
+                self.screen_config_retry_pending = false;
+                self.screen_config_retry_attempt += 1;
+                self.handle_screen_parameters(screens);
             }
             Event::SpaceChanged | Event::RequestSpaceRefresh => {
                 let spaces = self.screen_cache.get_screen_spaces();
@@ -161,6 +172,49 @@ impl WindowServer {
             }
             Event::ReactorEvent(event) => self.send_reactor_event(event),
         }
+    }
+
+    fn handle_screen_parameters(&mut self, ns_screens: Vec<NSScreenInfo>) {
+        let Some((screens, converter)) = self.screen_cache.update_screen_config(ns_screens) else {
+            self.schedule_screen_config_retry();
+            return;
+        };
+        self.screen_config_retry_attempt = 0;
+        self.screen_config_retry_pending = false;
+        let on_screen = self.get_windows_on_screen();
+        self.sm_tx.send(space_manager::Event::ScreenParametersChanged {
+            screens: screens.iter().map(|s| s.id).collect(),
+            frames: screens.iter().map(|s| s.visible_frame).collect(),
+            converter,
+            spaces: self.screen_cache.get_screen_spaces(),
+            scale_factors: screens.iter().map(|s| s.scale_factor).collect(),
+            on_screen,
+        });
+    }
+
+    fn schedule_screen_config_retry(&mut self) {
+        const RETRY_DELAYS: [Duration; 3] = [
+            Duration::from_millis(100),
+            Duration::from_millis(250),
+            Duration::from_millis(500),
+        ];
+        if self.screen_config_retry_pending {
+            return;
+        }
+        let attempt = self.screen_config_retry_attempt;
+        let Some(&delay) = RETRY_DELAYS.get(attempt as usize) else {
+            warn!(attempt, "Giving up on inconsistent screen configuration");
+            return;
+        };
+        self.screen_config_retry_pending = true;
+        let wm_tx = self.wm_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            _ = wm_tx.send((
+                tracing::Span::none(),
+                wm_controller::WmEvent::RefreshScreenParameters(attempt),
+            ));
+        });
     }
 
     /// Queries the window server for visible windows and sends a
@@ -341,8 +395,9 @@ mod tests {
     impl TestHarness {
         fn new() -> Self {
             let (sm_tx, sm_rx) = actor::channel();
+            let (wm_tx, _wm_rx) = tokio::sync::mpsc::unbounded_channel();
             let (skylight_tx, skylight_rx) = actor::channel();
-            let ws = WindowServer::new(sm_tx, skylight_tx);
+            let ws = WindowServer::new(sm_tx, wm_tx, skylight_tx);
             Self { ws, sm_rx, skylight_rx }
         }
 
