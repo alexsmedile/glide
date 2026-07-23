@@ -447,4 +447,28 @@ mod test {
                 .collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn rejected_screen_update_preserves_the_previous_cache() {
+        let mut sc = ScreenCache::new_with(Stub {
+            cg_screens: vec![CGScreenInfo {
+                cg_id: ScreenId(1),
+                bounds: CGRect::new(CGPoint::ZERO, CGSize::new(100.0, 100.0)),
+            }],
+        });
+        let ns_screens = vec![NSScreenInfo {
+            cg_id: ScreenId(1),
+            frame: CGRect::ZERO,
+            visible_frame: CGRect::ZERO,
+            backing_scale_factor: 1.0,
+        }];
+        assert!(sc.update_screen_config(ns_screens.clone()).is_some());
+
+        sc.system.cg_screens.push(CGScreenInfo {
+            cg_id: ScreenId(2),
+            bounds: CGRect::new(CGPoint::new(100.0, 0.0), CGSize::new(100.0, 100.0)),
+        });
+        assert!(sc.update_screen_config(ns_screens).is_none());
+        assert_eq!(sc.uuids.len(), 1);
+    }
 }

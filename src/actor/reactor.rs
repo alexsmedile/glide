@@ -318,12 +318,12 @@ impl Reactor {
                     config,
                     reactor_tx.clone(),
                     ws_tx,
-                    wm_tx,
+                    wm_tx.clone(),
                     status_tx,
                     group_indicators_tx,
                     mouse_tx,
                 );
-                let window_server = window_server::WindowServer::new(sm_tx, skylight_tx);
+                let window_server = window_server::WindowServer::new(sm_tx, wm_tx, skylight_tx);
                 Executor::run(async move {
                     tokio::join!(
                         reactor.run(events, reactor_tx),
