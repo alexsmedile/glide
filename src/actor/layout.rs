@@ -21,7 +21,7 @@ use crate::model::{
     ContainerKind, Direction, LayoutId, LayoutKind, LayoutTree, NodeId, Orientation,
     SpaceLayoutMapping,
 };
-use crate::sys::geometry::{CGRectExt, CGSizeExt};
+use crate::sys::geometry::{CGRectDef, CGRectExt, CGSizeExt};
 use crate::sys::screen::SpaceId;
 
 #[allow(dead_code)]
@@ -79,6 +79,12 @@ pub enum LayoutEvent {
         new_frame: CGRect,
         screens: Vec<(SpaceId, CGRect)>,
     },
+    /// A user- or app-originated frame change. Floating windows retain this
+    /// frame for their next tiled-to-floating transition.
+    WindowFrameChanged {
+        wid: WindowId,
+        frame: CGRect,
+    },
     SpaceExposed(SpaceId, CGSize),
     MouseMovedOverWindow {
         over: (SpaceId, WindowId),
@@ -88,6 +94,8 @@ pub enum LayoutEvent {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayoutWindowInfo {
+    /// Frame reported before Glide first tiles this window.
+    pub frame: CGRect,
     pub bundle_id: Option<String>,
     pub app_name: Option<String>,
     pub title: Option<Secret<String>>,
@@ -101,6 +109,9 @@ pub struct LayoutWindowInfo {
 #[must_use]
 #[derive(Debug, Clone, Default)]
 pub struct EventResponse {
+    /// One-shot frame targets for transitions such as restoring a floating
+    /// window. The reactor merges these into its next animation.
+    pub frame_overrides: Vec<(WindowId, CGRect)>,
     /// Windows to raise quietly. No WindowFocused events will be created for
     /// these.
     pub raise_windows: Vec<WindowId>,
@@ -111,6 +122,7 @@ pub struct EventResponse {
 
 impl EventResponse {
     pub fn coalesce(mut self, other: Self) -> Self {
+        self.frame_overrides.extend(other.frame_overrides);
         self.raise_windows.extend(other.raise_windows);
         match (self.focus_window, other.focus_window) {
             (Some(focus_window), Some(other_focus)) => {
@@ -211,6 +223,10 @@ pub struct LayoutManager {
     tree: LayoutTree,
     layout_mapping: HashMap<SpaceId, SpaceLayoutMapping>,
     floating_windows: BTreeSet<WindowId>,
+    /// The last user-controlled frame for each floating window. This is kept
+    /// after a window is tiled so toggling it back to floating can restore it.
+    #[serde(default)]
+    floating_restore_frames: HashMap<WindowId, FloatingRestoreFrame>,
     #[serde(skip)]
     active_floating_windows: ActiveFloatingWindows,
     #[serde(skip)]
@@ -233,6 +249,12 @@ pub struct LayoutManager {
     interactive_resize: Option<InteractiveScrollResize>,
     #[serde(skip)]
     interactive_move: Option<InteractiveScrollMove>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FloatingRestoreFrame {
+    #[serde(with = "CGRectDef")]
+    frame: CGRect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -330,6 +352,7 @@ impl LayoutManager {
             tree: LayoutTree::new(),
             layout_mapping: Default::default(),
             floating_windows: Default::default(),
+            floating_restore_frames: Default::default(),
             active_floating_windows: Default::default(),
             focused_window: None,
             last_floating_focus: None,
@@ -507,6 +530,7 @@ impl LayoutManager {
                 }
                 self.ensure_layout_kind_allowed_for_space(space);
                 return EventResponse {
+                    frame_overrides: vec![],
                     raise_windows: self.top_layer_windows(space),
                     focus_window: None,
                 };
@@ -515,6 +539,11 @@ impl LayoutManager {
                 self.debug_tree(space);
                 // The windows may already be in the layout if we restored a saved state, so
                 // make sure not to duplicate or erase them here.
+                for (wid, info) in &windows {
+                    self.floating_restore_frames
+                        .entry(*wid)
+                        .or_insert(FloatingRestoreFrame { frame: info.frame });
+                }
                 let window_map = windows.iter().cloned().collect::<HashMap<_, _>>();
                 self.last_floating_focus
                     .take_if(|f| f.pid == pid && !window_map.contains_key(f));
@@ -561,13 +590,18 @@ impl LayoutManager {
             }
             LayoutEvent::AppsRunningUpdated(hash_set) => {
                 self.tree.retain_apps(|pid| hash_set.contains(&pid));
+                self.floating_restore_frames.retain(|wid, _| hash_set.contains(&wid.pid));
             }
             LayoutEvent::AppClosed(pid) => {
                 self.tree.remove_windows_for_app(pid);
                 self.floating_windows.remove_all_for_pid(pid);
+                self.floating_restore_frames.retain(|wid, _| wid.pid != pid);
             }
             LayoutEvent::WindowAdded(space, wid, info) => {
                 self.debug_tree(space);
+                self.floating_restore_frames
+                    .entry(wid)
+                    .or_insert(FloatingRestoreFrame { frame: info.frame });
                 match classify_window(&self.window_rules, &info) {
                     WindowClass::FloatByDefault => self.add_floating_window(wid, Some(space)),
                     WindowClass::Regular => {
@@ -584,6 +618,12 @@ impl LayoutManager {
             LayoutEvent::WindowRemoved(wid) => {
                 self.tree.remove_window(wid);
                 self.floating_windows.remove(&wid);
+                self.floating_restore_frames.remove(&wid);
+            }
+            LayoutEvent::WindowFrameChanged { wid, frame } => {
+                if self.floating_windows.contains(&wid) {
+                    self.floating_restore_frames.insert(wid, FloatingRestoreFrame { frame });
+                }
             }
             LayoutEvent::WindowSpaceChanged { wid, added, removed } => {
                 if self.floating_windows.contains(&wid) {
@@ -685,6 +725,7 @@ impl LayoutManager {
                     && self.tree.is_visible(new_node)
                 {
                     return EventResponse {
+                        frame_overrides: vec![],
                         raise_windows: vec![],
                         focus_window: Some(new_wid),
                     };
@@ -734,6 +775,14 @@ impl LayoutManager {
                 self.add_floating_window(wid, space);
                 self.tree.remove_window(wid);
                 self.last_floating_focus = Some(wid);
+                return EventResponse {
+                    frame_overrides: self
+                        .floating_restore_frames
+                        .get(&wid)
+                        .map(|restore| vec![(wid, restore.frame)])
+                        .unwrap_or_default(),
+                    ..Default::default()
+                };
             }
             return EventResponse::default();
         }
@@ -759,7 +808,11 @@ impl LayoutManager {
                 // We need to focus some window to transition into floating
                 // mode. If there is no selection, pick a window.
                 let focus_window = selection.or_else(|| raise_windows.pop());
-                return EventResponse { raise_windows, focus_window };
+                return EventResponse {
+                    frame_overrides: vec![],
+                    raise_windows,
+                    focus_window,
+                };
             } else {
                 let mut raise_windows: Vec<_> = self
                     .active_floating_windows
@@ -769,7 +822,11 @@ impl LayoutManager {
                 // We need to focus some window to transition into floating
                 // mode. If there is no last floating window, pick one.
                 let focus_window = self.last_floating_focus.or_else(|| raise_windows.pop());
-                return EventResponse { raise_windows, focus_window };
+                return EventResponse {
+                    frame_overrides: vec![],
+                    raise_windows,
+                    focus_window,
+                };
             }
         }
 
@@ -849,7 +906,11 @@ impl LayoutManager {
                 let raise_windows = new_focus
                     .map(|new| self.tree.select_returning_surfaced_windows(new))
                     .unwrap_or_default();
-                EventResponse { focus_window, raise_windows }
+                EventResponse {
+                    frame_overrides: vec![],
+                    focus_window,
+                    raise_windows,
+                }
             }
             LayoutCommand::FocusNext => {
                 let new_focus = self.tree.focus_next(layout, self.tree.selection(layout));
@@ -857,7 +918,11 @@ impl LayoutManager {
                 let raise_windows = new_focus
                     .map(|new| self.tree.select_returning_surfaced_windows(new))
                     .unwrap_or_default();
-                EventResponse { focus_window, raise_windows }
+                EventResponse {
+                    frame_overrides: vec![],
+                    focus_window,
+                    raise_windows,
+                }
             }
             LayoutCommand::FocusPrev => {
                 let new_focus = self.tree.focus_prev(layout, self.tree.selection(layout));
@@ -865,7 +930,11 @@ impl LayoutManager {
                 let raise_windows = new_focus
                     .map(|new| self.tree.select_returning_surfaced_windows(new))
                     .unwrap_or_default();
-                EventResponse { focus_window, raise_windows }
+                EventResponse {
+                    frame_overrides: vec![],
+                    focus_window,
+                    raise_windows,
+                }
             }
             LayoutCommand::Ascend => {
                 self.tree.ascend_selection(layout);
@@ -921,6 +990,7 @@ impl LayoutManager {
                         .flat_map(|n| self.tree.window_at(n))
                         .collect();
                     EventResponse {
+                        frame_overrides: vec![],
                         raise_windows: node_windows,
                         focus_window: None,
                     }
@@ -1259,7 +1329,11 @@ impl LayoutManager {
         self.clear_user_scrolling(space);
         let focus_window = self.tree.window_at(current);
         let raise_windows = self.tree.select_returning_surfaced_windows(current);
-        EventResponse { focus_window, raise_windows }
+        EventResponse {
+            frame_overrides: vec![],
+            focus_window,
+            raise_windows,
+        }
     }
 
     pub(crate) fn hit_test_scroll_edges(
@@ -1519,6 +1593,11 @@ impl LayoutManager {
         self.active_floating_windows.in_space(space).collect()
     }
 
+    #[cfg(test)]
+    pub(super) fn floating_restore_frame(&self, wid: WindowId) -> Option<CGRect> {
+        self.floating_restore_frames.get(&wid).map(|restore| restore.frame)
+    }
+
     /// Every window present in any layout. Used by the restore snapshot tests to
     /// confirm a deserialized layout retained its window mapping.
     #[cfg(test)]
@@ -1597,6 +1676,7 @@ mod tests {
 
     fn win_info() -> LayoutWindowInfo {
         LayoutWindowInfo {
+            frame: CGRect::ZERO,
             bundle_id: None,
             app_name: None,
             title: None,
@@ -2809,10 +2889,12 @@ mod tests {
     #[test]
     fn event_response_coalesce_downgrades_extra_focus_to_raise() {
         let response = EventResponse {
+            frame_overrides: vec![],
             raise_windows: vec![WindowId::new(1, 1)],
             focus_window: Some(WindowId::new(1, 2)),
         }
         .coalesce(EventResponse {
+            frame_overrides: vec![],
             raise_windows: vec![WindowId::new(1, 3)],
             focus_window: Some(WindowId::new(1, 4)),
         });
