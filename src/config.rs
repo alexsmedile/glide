@@ -361,12 +361,13 @@ impl ConfigPartial {
     }
 
     fn merge(low: Self, high: Self) -> Self {
-        let mut keys =
-            if high.settings.default_keys.unwrap_or(Config::default().settings.default_keys) {
-                low.keys.unwrap_or_default()
-            } else {
-                Default::default()
-            };
+        let include_default_keys = high.keys.is_none()
+            || high.settings.default_keys.unwrap_or(Config::default().settings.default_keys);
+        let mut keys = if include_default_keys {
+            low.keys.unwrap_or_default()
+        } else {
+            Default::default()
+        };
         keys.extend(high.keys.unwrap_or_default());
         Self {
             settings: SettingsPartial::merge(low.settings, high.settings),
@@ -608,6 +609,19 @@ mod tests {
 
         // Our custom key should be present
         assert!(config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + KeyQ"));
+    }
+
+    #[test]
+    fn missing_keys_section_includes_default_bindings() {
+        let config = Config::parse(
+            r#"
+            [settings]
+            animate = false
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.keys.len(), Config::default().keys.len());
     }
 
     #[test]
