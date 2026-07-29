@@ -1,6 +1,8 @@
 name: Tests
 
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: ["main"]
   pull_request:
@@ -11,6 +13,7 @@ env:
 
 jobs:
   check:
+    name: Rust check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +27,7 @@ jobs:
         run: cargo check --verbose --locked --target aarch64-apple-darwin
 
   build:
+    name: Rust build and test
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
