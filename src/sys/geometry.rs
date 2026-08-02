@@ -34,34 +34,6 @@ impl ToICrate<ic::CGRect> for cg::CGRect {
     }
 }
 
-pub trait ToCGType<T> {
-    fn to_cgtype(&self) -> T;
-}
-
-impl ToCGType<cg::CGPoint> for ic::CGPoint {
-    fn to_cgtype(&self) -> cg::CGPoint {
-        cg::CGPoint { x: self.x, y: self.y }
-    }
-}
-
-impl ToCGType<cg::CGSize> for ic::CGSize {
-    fn to_cgtype(&self) -> cg::CGSize {
-        cg::CGSize {
-            width: self.width,
-            height: self.height,
-        }
-    }
-}
-
-impl ToCGType<cg::CGRect> for ic::CGRect {
-    fn to_cgtype(&self) -> cg::CGRect {
-        cg::CGRect {
-            origin: self.origin.to_cgtype(),
-            size: self.size.to_cgtype(),
-        }
-    }
-}
-
 pub trait Round {
     fn round(&self) -> Self;
 }

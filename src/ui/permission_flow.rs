@@ -7,16 +7,13 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use accessibility_sys::{AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt};
-use core_foundation::base::TCFType;
-use core_foundation::boolean::CFBoolean;
-use core_foundation::string::CFString;
-use core_graphics::display::CFDictionary;
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSApplicationActivationOptions,
     NSButton, NSRunningApplication,
 };
+use objc2_core_foundation::{CFBoolean, CFDictionary};
 use objc2_foundation::{NSObject, NSString, ns_string};
 use tracing::{error, info, warn};
 
@@ -125,11 +122,11 @@ impl RequestAXPermissionsAction {
 }
 
 fn check_ax(prompt: bool) -> bool {
-    let options = CFDictionary::from_CFType_pairs(&[(
-        unsafe { CFString::wrap_under_create_rule(kAXTrustedCheckOptionPrompt) },
-        CFBoolean::from(prompt),
-    )]);
-    unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) }
+    // SAFETY: `kAXTrustedCheckOptionPrompt` is a valid static CFString.
+    let key = unsafe { kAXTrustedCheckOptionPrompt };
+    let options = CFDictionary::from_slices(&[key], &[CFBoolean::new(prompt)]);
+    // SAFETY: `options` is a valid dictionary of the expected type.
+    unsafe { AXIsProcessTrustedWithOptions(Some(options.as_ref())) }
 }
 
 fn raise_dialog() {
