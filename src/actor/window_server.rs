@@ -219,6 +219,10 @@ impl WindowServer {
         let attempt = self.screen_config_retry_attempt;
         let Some(&delay) = RETRY_DELAYS.get(attempt as usize) else {
             warn!(attempt, "Giving up on inconsistent screen configuration");
+            // Start over, so that the next inconsistent update gets its own
+            // retries. Otherwise the counter stays exhausted until some later
+            // update happens to succeed.
+            self.screen_config_retry_attempt = 0;
             return;
         };
         self.screen_config_retry_pending = true;
@@ -449,6 +453,19 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn giving_up_on_screen_config_resets_the_retry_counter() {
+        let mut h = TestHarness::new();
+        // Pretend the retries for one inconsistent update are exhausted. This
+        // takes the give-up branch, so no retry is scheduled.
+        h.ws.screen_config_retry_attempt = 3;
+        h.ws.schedule_screen_config_retry();
+        assert!(!h.ws.screen_config_retry_pending);
+        // The next inconsistent update should get its own retries rather than
+        // giving up immediately.
+        assert_eq!(h.ws.screen_config_retry_attempt, 0);
     }
 
     #[test]
