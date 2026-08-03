@@ -222,6 +222,11 @@ pub struct Reactor {
     active_screen_idx: Option<u16>,
     main_window_tracker: MainWindowTracker,
     in_drag: bool,
+    /// The window the user is currently resizing with the mouse, if any.
+    ///
+    /// We don't write frames to this window until the resize ends, since a
+    /// write mid-drag fights the user's mouse.
+    resizing_window: Option<WindowId>,
     record: Record,
     raise_manager_tx: raise::Sender,
     animation_tx: Option<animation::Sender>,
@@ -376,6 +381,7 @@ impl Reactor {
             active_screen_idx: None,
             main_window_tracker: MainWindowTracker::default(),
             in_drag: false,
+            resizing_window: None,
             record,
             raise_manager_tx,
             animation_tx: None,
@@ -524,6 +530,7 @@ impl Reactor {
             Event::WindowDestroyed(wid) => {
                 self.layout.cancel_interactive_state();
                 self.in_drag = false;
+                self.resizing_window = None;
                 if self.windows.remove(&wid).is_none() {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
@@ -531,6 +538,11 @@ impl Reactor {
                 self.send_layout_event(LayoutEvent::WindowRemoved(wid));
             }
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
+                if mouse_state == Some(MouseState::Up) {
+                    // The button is up, so any resize we were holding off on is
+                    // over, even if we never saw the MouseUp event.
+                    self.resizing_window = None;
+                }
                 let window = self.windows.get_mut(&wid).unwrap();
                 if last_seen != window.last_sent_txid {
                     // Ignore events that happened before the last time we
@@ -575,6 +587,9 @@ impl Reactor {
                         new_frame,
                         screens,
                     });
+                    if mouse_state == Some(MouseState::Down) {
+                        self.resizing_window = Some(wid);
+                    }
                     is_resize = true;
                 } else if mouse_state == Some(MouseState::Down) {
                     self.in_drag = true;
@@ -640,6 +655,7 @@ impl Reactor {
                 }
                 self.layout.cancel_interactive_state();
                 self.in_drag = false;
+                self.resizing_window = None;
                 info!("space changed");
                 for (space, screen) in spaces.iter().zip(&mut self.screens) {
                     screen.space = *space;
@@ -713,6 +729,7 @@ impl Reactor {
                     }
                 }
                 self.in_drag = false;
+                self.resizing_window = None;
                 // Now re-check the layout.
             }
             Event::MouseMovedOverWindow(wsid) => {
@@ -1130,6 +1147,13 @@ impl Reactor {
             targets.insert(wid, (frame, scale_factor));
         }
         for (wid, (target_frame, scale_factor)) in targets {
+            if self.resizing_window == Some(wid) {
+                // The user is dragging this window's edge; correct it on mouse
+                // up instead.
+                // TODO: A pending frame override for this window is dropped
+                // here rather than deferred to mouse up.
+                continue;
+            }
             let Some(window) = self.windows.get_mut(&wid) else {
                 // If we restored a saved state the window may not be available yet.
                 continue;
@@ -2140,6 +2164,150 @@ pub mod tests {
             apps.requests().is_empty(),
             "reactor shouldn't move windows mid-drag"
         );
+    }
+
+    /// Neighbors still follow along, and the window is corrected on mouse up.
+    #[test]
+    fn it_doesnt_write_to_a_window_the_user_is_resizing() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        let resized = WindowId::new(1, 1);
+        let neighbor = WindowId::new(1, 2);
+        let frame = apps.windows[&resized].frame;
+
+        // The user drags the shared edge left, shrinking window 1.
+        let new_frame = CGRect::new(
+            frame.origin,
+            CGSize::new(frame.size.width - 100., frame.size.height),
+        );
+        apps.windows.get_mut(&resized).unwrap().frame = new_frame;
+        reactor.handle_event(Event::WindowFrameChanged(
+            resized,
+            new_frame,
+            apps.windows[&resized].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Down),
+        ));
+
+        // The neighbor grows to fill the space, but we leave the dragged window
+        // alone.
+        let wids = written_wids(apps.requests());
+        assert!(wids.contains(&neighbor), "neighbor should follow: {wids:?}");
+        assert!(
+            !wids.contains(&resized),
+            "shouldn't write to the window being resized: {wids:?}"
+        );
+
+        // The app settles on a change in three directions at once, which the
+        // layout tree refuses to apply. The model and the window now disagree.
+        let odd_frame = CGRect::new(
+            CGPoint::new(new_frame.origin.x + 10., new_frame.origin.y + 10.),
+            CGSize::new(new_frame.size.width - 30., new_frame.size.height - 5.),
+        );
+        apps.windows.get_mut(&resized).unwrap().frame = odd_frame;
+        reactor.handle_event(Event::WindowFrameChanged(
+            resized,
+            odd_frame,
+            apps.windows[&resized].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Down),
+        ));
+        let wids = written_wids(apps.requests());
+        assert!(
+            !wids.contains(&resized),
+            "shouldn't write to the window being resized: {wids:?}"
+        );
+
+        // Releasing the mouse snaps it back to the layout's frame.
+        reactor.handle_event(Event::MouseUp);
+        let wids = written_wids(apps.requests());
+        assert!(
+            wids.contains(&resized),
+            "release should correct the window: {wids:?}"
+        );
+    }
+
+    /// The MouseUp event can be lost, e.g. if the event tap is disabled while
+    /// the button is down. The mouse state on the next frame change releases
+    /// the window instead.
+    #[test]
+    fn it_stops_suppressing_a_resize_when_the_mouse_up_is_missed() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        let resized = WindowId::new(1, 1);
+        let frame = apps.windows[&resized].frame;
+        let new_frame = CGRect::new(
+            frame.origin,
+            CGSize::new(frame.size.width - 100., frame.size.height),
+        );
+        apps.windows.get_mut(&resized).unwrap().frame = new_frame;
+        reactor.handle_event(Event::WindowFrameChanged(
+            resized,
+            new_frame,
+            apps.windows[&resized].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Down),
+        ));
+        let wids = written_wids(apps.requests());
+        assert!(!wids.contains(&resized), "should be suppressed: {wids:?}");
+
+        // No MouseUp arrives, but the next frame change reports the button up
+        // and asks for a change the tree can't apply, so the model and the
+        // window disagree.
+        let odd_frame = CGRect::new(
+            CGPoint::new(new_frame.origin.x + 10., new_frame.origin.y + 10.),
+            CGSize::new(new_frame.size.width - 30., new_frame.size.height - 5.),
+        );
+        apps.windows.get_mut(&resized).unwrap().frame = odd_frame;
+        reactor.handle_event(Event::WindowFrameChanged(
+            resized,
+            odd_frame,
+            apps.windows[&resized].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Up),
+        ));
+        let wids = written_wids(apps.requests());
+        assert!(
+            wids.contains(&resized),
+            "button up should release the window: {wids:?}"
+        );
+    }
+
+    fn written_wids(requests: Vec<Request>) -> Vec<WindowId> {
+        requests
+            .into_iter()
+            .flat_map(|request| match request {
+                Request::SetWindowFrame(wid, _, _) => vec![wid],
+                Request::AnimationFrame { wid, .. } => vec![wid],
+                _ => vec![],
+            })
+            .collect()
     }
 
     #[test]
