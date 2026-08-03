@@ -237,7 +237,7 @@ impl System for Actual {
 
 type CGDirectDisplayID = u32;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScreenInfo {
     pub visible_frame: CGRect,
     pub id: ScreenId,

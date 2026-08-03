@@ -14,7 +14,7 @@ use crate::actor::app::{self, AppInfo, AppThreadHandle, Quiet, WindowId, WindowI
 use crate::actor::{self, reactor, space_manager, wm_controller};
 use crate::collections::HashMap;
 use crate::sys::event::MouseState;
-use crate::sys::screen::{NSScreenInfo, ScreenCache};
+use crate::sys::screen::{NSScreenInfo, ScreenCache, ScreenInfo, SpaceId};
 use crate::sys::window_server::{
     self as sys_ws, SkylightConnection, SkylightNotifier, WindowServerId, WindowsOnScreen,
     kCGSWindowIsTerminated,
@@ -41,6 +41,8 @@ pub struct WindowServer {
     skylight_tx: SkylightSender,
     screen_config_retry_attempt: u8,
     screen_config_retry_pending: bool,
+    /// The screen configuration last sent downstream.
+    last_screen_config: Option<(Vec<ScreenInfo>, Vec<Option<SpaceId>>)>,
 }
 
 #[derive(Debug)]
@@ -103,6 +105,7 @@ impl WindowServer {
             skylight_tx,
             screen_config_retry_attempt: 0,
             screen_config_retry_pending: false,
+            last_screen_config: None,
         }
     }
 
@@ -181,12 +184,24 @@ impl WindowServer {
         };
         self.screen_config_retry_attempt = 0;
         self.screen_config_retry_pending = false;
+
+        // The system has been observed to send long runs of this notification
+        // with no actual change; drop them here so the rest of the system never
+        // sees them.
+        let config = (screens, self.screen_cache.get_screen_spaces());
+        if self.last_screen_config.as_ref() == Some(&config) {
+            debug!("Screen configuration is unchanged");
+            return;
+        }
+        self.last_screen_config = Some(config.clone());
+        let (screens, spaces) = config;
+
         let on_screen = self.get_windows_on_screen();
         self.sm_tx.send(space_manager::Event::ScreenParametersChanged {
             screens: screens.iter().map(|s| s.id).collect(),
             frames: screens.iter().map(|s| s.visible_frame).collect(),
             converter,
-            spaces: self.screen_cache.get_screen_spaces(),
+            spaces,
             scale_factors: screens.iter().map(|s| s.scale_factor).collect(),
             on_screen,
         });
