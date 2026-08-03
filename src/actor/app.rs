@@ -675,7 +675,7 @@ impl State {
                 // A raise we started may be waiting on the activation event
                 // that goes with this change. The app can report the new main
                 // window first, so use the marker the raise left behind.
-                let quiet_if = self.pending_quiet_window_change();
+                let quiet_if = self.take_pending_quiet_window_change();
                 self.on_main_window_changed(quiet_if);
             }
             kAXWindowCreatedNotification => {
@@ -913,12 +913,17 @@ impl State {
         Ok(())
     }
 
-    /// The window an in-flight raise expects to become the main window.
-    fn pending_quiet_window_change(&self) -> Option<WindowId> {
-        self.last_activated
-            .as_ref()
-            .filter(|(ts, ..)| ts.elapsed() < ACTIVATION_TIMEOUT)
-            .and_then(|&(_, _, quiet_window_change, _)| quiet_window_change)
+    /// Takes the window an in-flight raise expects to become the main window.
+    ///
+    /// Only applies to one main window change. A cancelled raise can leave this
+    /// set with no activation event coming to consume it, and the user may
+    /// focus the same window before it ages out.
+    fn take_pending_quiet_window_change(&mut self) -> Option<WindowId> {
+        let (ts, _, quiet_window_change, _) = self.last_activated.as_mut()?;
+        if ts.elapsed() >= ACTIVATION_TIMEOUT {
+            return None;
+        }
+        quiet_window_change.take()
     }
 
     fn on_main_window_changed(&mut self, quiet_if: Option<WindowId>) -> Option<WindowId> {
