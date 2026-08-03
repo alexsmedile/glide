@@ -88,6 +88,7 @@ impl MainWindowTracker {
             | Event::MouseUp
             | Event::MouseMovedOverWindow(..)
             | Event::RaiseCompleted { .. }
+            | Event::RaiseRequestFailed { .. }
             | Event::RaiseTimeout { .. }
             | Event::ScrollWheel { .. }
             | Event::LeftMouseDown(_)
@@ -269,6 +270,56 @@ mod tests {
         ));
         assert_eq!(Some(WindowId::new(1, 2)), reactor.main_window());
         assert_eq!(reactor.layout.selected_window(space), Some(WindowId::new(1, 2)));
+    }
+
+    #[test]
+    fn it_restores_the_layout_selection_when_a_focus_raise_fails() {
+        use Event::*;
+        use objc2_core_foundation::{CGPoint, CGSize};
+
+        use super::super::Command;
+        use crate::actor::layout::LayoutCommand;
+        use crate::model::Direction;
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space = SpaceId::new(1);
+        reactor.handle_event(ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::ZERO, CGSize::new(1000., 1000.))],
+            spaces: vec![Some(space)],
+
+            converter: CoordinateConverter::default(),
+            scale_factors: vec![2.0],
+            on_screen: Default::default(),
+        });
+
+        reactor.handle_event(ApplicationGloballyActivated(1));
+        reactor.handle_events(apps.make_app_with_opts(
+            1,
+            make_windows(2),
+            Some(WindowId::new(1, 1)),
+            true,
+        ));
+        assert_eq!(Some(WindowId::new(1, 1)), reactor.main_window());
+
+        reactor.handle_event(Event::Command(Command::Layout(LayoutCommand::MoveFocus(
+            Direction::Right,
+        ))));
+        assert_eq!(reactor.layout.selected_window(space), Some(WindowId::new(1, 2)));
+
+        // A quiet raise failing says nothing about where the focus is.
+        reactor.handle_event(RaiseRequestFailed {
+            windows: vec![WindowId::new(1, 2)],
+            sequence_id: 1,
+            quiet: Quiet::Yes,
+        });
+        assert_eq!(reactor.layout.selected_window(space), Some(WindowId::new(1, 2)));
+
+        reactor.handle_event(RaiseRequestFailed {
+            windows: vec![WindowId::new(1, 2)],
+            sequence_id: 1,
+            quiet: Quiet::No,
+        });
+        assert_eq!(reactor.layout.selected_window(space), Some(WindowId::new(1, 1)));
     }
 
     #[test]

@@ -42,7 +42,15 @@ pub struct WindowServer {
     screen_config_retry_attempt: u8,
     screen_config_retry_pending: bool,
     /// The screen configuration last sent downstream.
-    last_screen_config: Option<(Vec<ScreenInfo>, Vec<Option<SpaceId>>)>,
+    last_screen_config: Option<ScreenConfig>,
+}
+
+/// A screen configuration, along with the window order it was sent with.
+#[derive(Clone, PartialEq)]
+struct ScreenConfig {
+    screens: Vec<ScreenInfo>,
+    spaces: Vec<Option<SpaceId>>,
+    visible: Vec<WindowServerId>,
 }
 
 #[derive(Debug)]
@@ -187,16 +195,23 @@ impl WindowServer {
 
         // The system has been observed to send long runs of this notification
         // with no actual change; drop them here so the rest of the system never
-        // sees them.
-        let config = (screens, self.screen_cache.get_screen_spaces());
+        // sees them. The windows on screen have to be unchanged too: an
+        // identical configuration is also reported after the system restacks
+        // windows, and that is our cue to put them back. Compare the order
+        // alone, so windows that are merely moving don't count as a change.
+        let on_screen = self.get_windows_on_screen();
+        let config = ScreenConfig {
+            screens,
+            spaces: self.screen_cache.get_screen_spaces(),
+            visible: on_screen.visible.clone(),
+        };
         if self.last_screen_config.as_ref() == Some(&config) {
             debug!("Screen configuration is unchanged");
             return;
         }
         self.last_screen_config = Some(config.clone());
-        let (screens, spaces) = config;
+        let ScreenConfig { screens, spaces, .. } = config;
 
-        let on_screen = self.get_windows_on_screen();
         self.sm_tx.send(space_manager::Event::ScreenParametersChanged {
             screens: screens.iter().map(|s| s.id).collect(),
             frames: screens.iter().map(|s| s.visible_frame).collect(),
