@@ -377,11 +377,20 @@ impl State {
     async fn handle_raises(this: &RefCell<Self>, mut rx: Receiver<(Span, RaiseRequest)>) {
         while let Some((span, raise)) = rx.recv().await {
             let RaiseRequest(wids, token, sequence_id, quiet) = raise;
-            if let Err(e) = Self::handle_raise_request(this, wids, &token, sequence_id, quiet)
-                .instrument(span)
-                .await
+            if let Err(e) =
+                Self::handle_raise_request(this, wids.clone(), &token, sequence_id, quiet)
+                    .instrument(span)
+                    .await
             {
                 debug!("Raise request failed: {e}");
+                // Windows we didn't get to will never report completion, and
+                // the events the raise would have produced are suppressed, so
+                // tell the reactor the request is over.
+                this.borrow().send_event(Event::RaiseRequestFailed {
+                    windows: wids,
+                    sequence_id,
+                    quiet,
+                });
             }
         }
     }

@@ -28,6 +28,10 @@ pub enum Event {
         window_id: WindowId,
         sequence_id: u64,
     },
+    RaiseRequestFailed {
+        windows: Vec<WindowId>,
+        sequence_id: u64,
+    },
     RaiseTimeout {
         sequence_id: u64,
     },
@@ -164,6 +168,19 @@ impl RaiseManager {
                 if let Some(sequence) = &mut self.active_sequence {
                     if sequence.sequence_id == sequence_id {
                         sequence.pending_raises.remove(&window_id);
+                    }
+                }
+            }
+            Event::RaiseRequestFailed { windows, sequence_id } => {
+                debug!("Raise request failed for {windows:?} in sequence {sequence_id}");
+
+                // The app won't report completion for these, so stop waiting on
+                // them instead of holding the sequence until it times out.
+                if let Some(sequence) = &mut self.active_sequence {
+                    if sequence.sequence_id == sequence_id {
+                        for window_id in windows {
+                            sequence.pending_raises.remove(&window_id);
+                        }
                     }
                 }
             }
@@ -764,6 +781,66 @@ mod tests {
             // Verify all sequences completed
             assert!(raise_manager.active_sequence.is_none());
             assert!(collect_requests(&mut app_rx).is_empty());
+        });
+    }
+
+    #[test]
+    fn test_failed_raise_does_not_block_the_sequence() {
+        Executor::run(async {
+            let mut raise_manager = RaiseManager::new();
+            let (app_handles, mut app_rx) = create_test_app_handles();
+
+            let msg = create_layout_response(
+                vec![WindowId::new(1, 1)],
+                Some((WindowId::new(1, 2), None)),
+                app_handles.clone(),
+            );
+            raise_manager.handle_message(msg);
+
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], WindowId::new(1, 1), 1, Quiet::Yes);
+
+            // The regular raise fails, so the focus raise goes out anyway.
+            raise_manager.handle_message(Event::RaiseRequestFailed {
+                windows: vec![WindowId::new(1, 1)],
+                sequence_id: 1,
+            });
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], WindowId::new(1, 2), 1, Quiet::No);
+
+            // The focus raise fails too, ending the sequence.
+            raise_manager.handle_message(Event::RaiseRequestFailed {
+                windows: vec![WindowId::new(1, 2)],
+                sequence_id: 1,
+            });
+            assert!(raise_manager.active_sequence.is_none());
+        });
+    }
+
+    #[test]
+    fn test_failed_raise_from_an_old_sequence_is_ignored() {
+        Executor::run(async {
+            let mut raise_manager = RaiseManager::new();
+            let (app_handles, mut app_rx) = create_test_app_handles();
+
+            let msg = create_layout_response(
+                vec![WindowId::new(1, 1)],
+                Some((WindowId::new(1, 2), None)),
+                app_handles.clone(),
+            );
+            raise_manager.handle_message(msg);
+            _ = collect_requests(&mut app_rx);
+
+            raise_manager.handle_message(Event::RaiseRequestFailed {
+                windows: vec![WindowId::new(1, 1)],
+                sequence_id: 0,
+            });
+
+            let sequence = raise_manager.active_sequence.as_ref().unwrap();
+            assert_eq!(sequence.sequence_id, 1);
+            assert!(sequence.pending_raises.contains(&WindowId::new(1, 1)));
         });
     }
 
