@@ -1059,36 +1059,32 @@ impl Reactor {
         mut response: layout::EventResponse,
         mut visible_window_order: &[WindowServerId],
     ) -> layout::EventResponse {
-        // For now, just optimize the case where the response is a no-op.
         if let Some(focus) = response.focus_window {
+            // Attempt to match out the focus window with the top visible window.
             if let Some(&first) = visible_window_order.first()
                 && focus.wsid() == Some(first)
             {
-                // Note that we keep the focus window in the request unless
+                // Note that we keep the focus window in the request, unless
                 // there are no raise windows.
                 visible_window_order = &visible_window_order[1..];
             } else {
                 return response;
             }
-        }
+        };
         let desired_visible_wsids = response
             .raise_windows
             .iter()
-            .flat_map(|wid| {
-                self.windows
-                    .get(wid)
-                    .and_then(|window| window.window_server_id)
-                    .filter(|wsid| self.visible_windows.contains(wsid))
-                    .filter(|wsid| self.should_compare_visible_window(*wsid))
-            })
+            .flat_map(|wid| self.windows.get(wid).and_then(|window| window.window_server_id))
             .collect::<HashSet<_>>();
         let current_top_wsids = visible_window_order
             .iter()
             .copied()
+            // Filter out off-screen windows and windows on non-zero layers.
             .filter(|wsid| self.should_compare_visible_window(*wsid))
             .take(desired_visible_wsids.len())
             .collect::<HashSet<_>>();
 
+        // Optimize the case where the response is a no-op.
         if current_top_wsids == desired_visible_wsids {
             response.focus_window.take();
             response.raise_windows.clear();
@@ -1538,6 +1534,70 @@ pub mod tests {
             reactor.layout.selected_window(SpaceId::new(1)),
             Some(WindowId::new(1, 1))
         );
+    }
+
+    #[test]
+    fn it_surfaces_on_screen_change_when_the_snapshot_is_empty() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
+        reactor.raise_manager_tx = raise_manager_tx;
+        let space = SpaceId::new(1);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(1, make_windows(2), None, false));
+        let _events = apps.simulate_events();
+        while raise_manager_rx.try_recv().is_ok() {}
+
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        assert!(raise_manager_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn it_surfaces_on_screen_change_when_the_snapshot_omits_the_windows() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
+        reactor.raise_manager_tx = raise_manager_tx;
+        let space = SpaceId::new(1);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(1, make_windows(2), None, false));
+        let _events = apps.simulate_events();
+        while raise_manager_rx.try_recv().is_ok() {}
+
+        // The snapshot lists only a window we don't manage, so it says nothing
+        // about where the windows we want to raise are.
+        let on_screen = vec![WindowServerInfo {
+            id: WindowServerId::new(999),
+            pid: 2,
+            layer: 0,
+            frame: CGRect::new(CGPoint::new(0., 0.), CGSize::new(100., 100.)),
+        }];
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: WindowsOnScreen::new(on_screen),
+        });
+        assert!(raise_manager_rx.try_recv().is_ok());
     }
 
     #[test]
