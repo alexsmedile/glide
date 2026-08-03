@@ -156,6 +156,7 @@ mod tests {
 
             converter: CoordinateConverter::default(),
             scale_factors: vec![2.0],
+            on_screen: Default::default(),
         });
         assert_eq!(None, reactor.main_window());
 
@@ -218,6 +219,7 @@ mod tests {
 
             converter: CoordinateConverter::default(),
             scale_factors: vec![2.0],
+            on_screen: Default::default(),
         });
 
         reactor.handle_event(ApplicationGloballyActivated(1));
@@ -283,6 +285,7 @@ mod tests {
 
             converter: CoordinateConverter::default(),
             scale_factors: vec![2.0],
+            on_screen: Default::default(),
         });
 
         reactor.handle_events(apps.make_app_with_opts(
