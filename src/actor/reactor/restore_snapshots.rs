@@ -41,6 +41,7 @@ fn canonical_serialized() -> String {
         spaces: vec![Some(SpaceId::new(1))],
         scale_factors: vec![2.0],
         converter: CoordinateConverter::default(),
+        on_screen: Default::default(),
     });
     reactor.handle_events(apps.make_app(1, make_windows(3)));
     reactor.handle_events(apps.make_app(2, make_windows(2)));

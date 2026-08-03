@@ -85,6 +85,16 @@ Each window has a `TransactionId` tracking the last write. Stale reads from app 
 - **Incrementalism** – avoid global initialization/discovery steps; adapt to new info from each app as it becomes available
 - **Policy decisions in LayoutManager** – refutable policy decisions, e.g. defaulting certain windows to floating, go through LayoutManager's classification, not scattered across Reactor/App
 
+## Comments
+
+Comments say what the code does. Explain why only when the reason isn't clear
+from the surrounding code and this document, or when the logic is subtle enough
+that a reader would otherwise assume it's wrong.
+
+Don't argue for a change in a comment. A comment is read by someone who has only
+ever seen the current code, so justifying it against what was there before, or
+against an alternative that was considered, is noise.
+
 ## Testing Patterns
 
 - **Model tests**: Construct a tree, perform operations, assert exact pixel-level frames. No mocking or timing needed.
@@ -116,5 +126,10 @@ Fixes #12345.
 ```
 
 Features should include a short user-facing blurb for the release notes summarizing the feature and how to use it.
+
+Keep the body short: what was wrong and what the change does. Defend the change
+only when it reverses an earlier decision, or when it's subtle enough that a
+reviewer would otherwise think it's wrong. Weighing alternatives, restating what
+the diff plainly shows, and noting the absence of tests are all noise.
 
 Non user-facing changes can use `refactor`, `internal`, `chore`, `build`, `ci`, `style`, `test`, or skip the prefix if none apply.

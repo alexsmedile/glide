@@ -133,9 +133,8 @@ impl SpaceManager {
                     spaces: self.active_spaces(),
                     converter,
                     scale_factors,
+                    on_screen,
                 });
-                self.reactor_tx
-                    .send(reactor::Event::WindowsOnScreenUpdated { pid: None, on_screen });
                 self.status_tx.send(status::Event::SpaceChanged(spaces));
                 self.send_space_enabled_status();
                 self.mouse_tx.send(mouse::Request::ScreenParametersChanged(frames, converter));

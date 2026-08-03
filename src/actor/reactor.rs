@@ -70,6 +70,7 @@ pub enum Event {
         spaces: Vec<Option<SpaceId>>,
         scale_factors: Vec<f64>,
         converter: CoordinateConverter,
+        on_screen: WindowsOnScreen,
     },
 
     /// The current space changed.
@@ -234,6 +235,20 @@ struct AppState {
     #[allow(unused)]
     pub info: AppInfo,
     pub handle: AppThreadHandle,
+}
+
+/// Extra information about the event a layout response came from.
+#[derive(Default)]
+struct ResponseContext {
+    /// The windows visible on screen, front to back, from a snapshot taken with
+    /// the event. `None` if the event didn't come with one.
+    ///
+    /// Only valid for the event it arrived with: raising windows changes the
+    /// order and the window server doesn't report the result.
+    visible_window_order: Option<Vec<WindowServerId>>,
+    /// Whether the event came from the mouse moving, in which case we don't
+    /// warp the mouse to the newly focused window.
+    from_mouse: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -570,18 +585,38 @@ impl Reactor {
                 spaces,
                 converter,
                 scale_factors,
+                on_screen,
             } => {
                 info!("screen parameters changed");
+                let visible_window_order = on_screen.visible.clone();
+                self.update_complete_window_server_info(on_screen);
                 self.screens = frames
                     .into_iter()
                     .zip(spaces.clone())
                     .zip(scale_factors)
                     .map(|((frame, space), scale_factor)| Screen { frame, space, scale_factor })
                     .collect();
-                let screens = self.screens.clone();
-                for screen in screens {
-                    let Some(space) = screen.space else { continue };
-                    self.send_layout_event(LayoutEvent::SpaceExposed(space, screen.frame.size));
+                let response = self
+                    .screens
+                    .iter()
+                    .filter_map(|screen| screen.space.map(|space| (space, screen.frame.size)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|(space, size)| {
+                        self.layout.handle_event(LayoutEvent::SpaceExposed(space, size))
+                    })
+                    .reduce(layout::EventResponse::coalesce);
+                if let Some(response) = response {
+                    self.handle_layout_response_with_context(
+                        response,
+                        ResponseContext {
+                            visible_window_order: Some(visible_window_order),
+                            ..Default::default()
+                        },
+                    );
+                    for space in self.screens.iter().flat_map(|screen| screen.space) {
+                        self.layout.debug_tree_desc(space, "after event", false);
+                    }
                 }
                 self.update_active_screen();
                 // FIXME: Update visible windows if space changed.
@@ -593,7 +628,7 @@ impl Reactor {
                     .send(group_bars::Event::ScreenParametersChanged(spaces, converter));
             }
             Event::SpaceChanged(spaces, on_screen) => {
-                let visible_window_order = on_screen.visible.iter().copied().collect::<Vec<_>>();
+                let visible_window_order = on_screen.visible.clone();
                 self.update_complete_window_server_info(on_screen);
                 if spaces.len() != self.screens.len() {
                     warn!(
@@ -618,10 +653,12 @@ impl Reactor {
                     })
                     .reduce(layout::EventResponse::coalesce);
                 if let Some(response) = response {
-                    self.handle_layout_response_with_visible_window_order(
+                    self.handle_layout_response_with_context(
                         response,
-                        Some(&visible_window_order),
-                        false,
+                        ResponseContext {
+                            visible_window_order: Some(visible_window_order),
+                            ..Default::default()
+                        },
                     );
                     for space in self.screens.iter().flat_map(|screen| screen.space) {
                         self.layout.debug_tree_desc(space, "after event", false);
@@ -689,12 +726,15 @@ impl Reactor {
                     (Some(space), Some(id)) => Some((space, id)),
                     _ => None,
                 };
-                self.send_layout_event_from_mouse(
+                self.send_layout_event_with_context(
                     LayoutEvent::MouseMovedOverWindow {
                         over: (to_space, wid),
                         current_main,
                     },
-                    true,
+                    ResponseContext {
+                        from_mouse: true,
+                        ..Default::default()
+                    },
                 );
             }
             Event::RaiseCompleted { window_id, sequence_id } => {
@@ -941,62 +981,31 @@ impl Reactor {
     }
 
     fn send_layout_event(&mut self, event: LayoutEvent) {
-        self.send_layout_event_with_visible_window_order(event, &[]);
+        self.send_layout_event_with_context(event, ResponseContext::default());
     }
 
-    fn send_layout_event_with_visible_window_order(
-        &mut self,
-        event: LayoutEvent,
-        visible_window_order: &[WindowServerId],
-    ) {
-        self.send_layout_event_with_visible_window_order_from_mouse(
-            event,
-            visible_window_order,
-            false,
-        );
-    }
-
-    fn send_layout_event_from_mouse(&mut self, event: LayoutEvent, from_mouse: bool) {
-        self.send_layout_event_with_visible_window_order_from_mouse(event, &[], from_mouse);
-    }
-
-    fn send_layout_event_with_visible_window_order_from_mouse(
-        &mut self,
-        event: LayoutEvent,
-        visible_window_order: &[WindowServerId],
-        from_mouse: bool,
-    ) {
+    fn send_layout_event_with_context(&mut self, event: LayoutEvent, context: ResponseContext) {
         let response = self.layout.handle_event(event);
-        self.handle_layout_response_with_visible_window_order(
-            response,
-            (!visible_window_order.is_empty()).then_some(visible_window_order),
-            from_mouse,
-        );
+        self.handle_layout_response_with_context(response, context);
         for space in self.screens.iter().flat_map(|screen| screen.space) {
             self.layout.debug_tree_desc(space, "after event", false);
         }
     }
 
     fn handle_layout_response(&mut self, response: layout::EventResponse) {
-        self.handle_layout_response_from_mouse(response, false);
+        self.handle_layout_response_with_context(response, ResponseContext::default());
     }
 
-    fn handle_layout_response_from_mouse(
-        &mut self,
-        response: layout::EventResponse,
-        from_mouse: bool,
-    ) {
-        self.handle_layout_response_with_visible_window_order(response, None, from_mouse);
-    }
-
-    fn handle_layout_response_with_visible_window_order(
+    fn handle_layout_response_with_context(
         &mut self,
         mut response: layout::EventResponse,
-        visible_window_order: Option<&[WindowServerId]>,
-        from_mouse: bool,
+        ResponseContext {
+            visible_window_order,
+            from_mouse,
+        }: ResponseContext,
     ) {
         if let Some(visible_window_order) = visible_window_order {
-            response = self.filter_response(response, visible_window_order);
+            response = self.filter_response(response, &visible_window_order);
         }
 
         let layout::EventResponse {
@@ -1050,36 +1059,32 @@ impl Reactor {
         mut response: layout::EventResponse,
         mut visible_window_order: &[WindowServerId],
     ) -> layout::EventResponse {
-        // For now, just optimize the case where the response is a no-op.
         if let Some(focus) = response.focus_window {
+            // Attempt to match out the focus window with the top visible window.
             if let Some(&first) = visible_window_order.first()
                 && focus.wsid() == Some(first)
             {
-                // Note that we keep the focus window in the request unless
+                // Note that we keep the focus window in the request, unless
                 // there are no raise windows.
                 visible_window_order = &visible_window_order[1..];
             } else {
                 return response;
             }
-        }
+        };
         let desired_visible_wsids = response
             .raise_windows
             .iter()
-            .flat_map(|wid| {
-                self.windows
-                    .get(wid)
-                    .and_then(|window| window.window_server_id)
-                    .filter(|wsid| self.visible_windows.contains(wsid))
-                    .filter(|wsid| self.should_compare_visible_window(*wsid))
-            })
+            .flat_map(|wid| self.windows.get(wid).and_then(|window| window.window_server_id))
             .collect::<HashSet<_>>();
         let current_top_wsids = visible_window_order
             .iter()
             .copied()
+            // Filter out off-screen windows and windows on non-zero layers.
             .filter(|wsid| self.should_compare_visible_window(*wsid))
             .take(desired_visible_wsids.len())
             .collect::<HashSet<_>>();
 
+        // Optimize the case where the response is a no-op.
         if current_top_wsids == desired_visible_wsids {
             response.focus_window.take();
             response.raise_windows.clear();
@@ -1190,6 +1195,7 @@ pub mod tests {
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         reactor.handle_events(apps.make_app(1, make_windows(2)));
@@ -1221,6 +1227,7 @@ pub mod tests {
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         reactor.handle_events(apps.make_app(1, make_windows(2)));
@@ -1250,6 +1257,7 @@ pub mod tests {
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor.handle_events(apps.make_app_with_opts(1, make_windows(1), Some(wid), true));
         reactor.handle_event(Event::ApplicationGloballyActivated(1));
@@ -1305,6 +1313,7 @@ pub mod tests {
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor.handle_events(apps.make_app_with_opts(1, make_windows(1), Some(wid), true));
         reactor.handle_event(Event::ApplicationGloballyActivated(1));
@@ -1336,6 +1345,7 @@ pub mod tests {
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         reactor.handle_events(apps.make_app(1, make_windows(2)));
@@ -1374,6 +1384,7 @@ pub mod tests {
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         reactor.handle_events(apps.make_app(1, make_windows(2)));
@@ -1416,6 +1427,7 @@ pub mod tests {
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         reactor.handle_events(apps.make_app(1, make_windows(3)));
@@ -1465,6 +1477,7 @@ pub mod tests {
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         reactor.handle_events(apps.make_app(1, make_windows(1)));
@@ -1495,6 +1508,7 @@ pub mod tests {
             spaces: vec![None],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor.handle_event(Event::WindowsOnScreenUpdated {
             pid: None,
@@ -1523,6 +1537,154 @@ pub mod tests {
     }
 
     #[test]
+    fn it_surfaces_on_screen_change_when_the_snapshot_is_empty() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
+        reactor.raise_manager_tx = raise_manager_tx;
+        let space = SpaceId::new(1);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(1, make_windows(2), None, false));
+        let _events = apps.simulate_events();
+        while raise_manager_rx.try_recv().is_ok() {}
+
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        assert!(raise_manager_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn it_surfaces_on_screen_change_when_the_snapshot_omits_the_windows() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
+        reactor.raise_manager_tx = raise_manager_tx;
+        let space = SpaceId::new(1);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(1, make_windows(2), None, false));
+        let _events = apps.simulate_events();
+        while raise_manager_rx.try_recv().is_ok() {}
+
+        // The snapshot lists only a window we don't manage, so it says nothing
+        // about where the windows we want to raise are.
+        let on_screen = vec![WindowServerInfo {
+            id: WindowServerId::new(999),
+            pid: 2,
+            layer: 0,
+            frame: CGRect::new(CGPoint::new(0., 0.), CGSize::new(100., 100.)),
+        }];
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: WindowsOnScreen::new(on_screen),
+        });
+        assert!(raise_manager_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn it_skips_surface_on_screen_change_when_top_layer_order_matches() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
+        reactor.raise_manager_tx = raise_manager_tx;
+        let space = SpaceId::new(1);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(1, make_windows(2), None, false));
+        let _events = apps.simulate_events();
+        while raise_manager_rx.try_recv().is_ok() {}
+
+        // A screen change that doesn't disturb the stacking shouldn't restack.
+        let desired = reactor
+            .layout
+            .handle_event(LayoutEvent::SpaceExposed(space, CGSize::new(1000., 900.)))
+            .raise_windows;
+        let on_screen = desired
+            .iter()
+            .map(|wid| WindowServerInfo {
+                id: reactor.windows[wid].window_server_id.unwrap(),
+                pid: wid.pid,
+                layer: 0,
+                frame: reactor.windows[wid].frame_monotonic,
+            })
+            .collect();
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: WindowsOnScreen::new(on_screen),
+        });
+        assert!(raise_manager_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn it_surfaces_on_screen_change_when_another_window_is_in_front() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
+        reactor.raise_manager_tx = raise_manager_tx;
+        let space = SpaceId::new(1);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(1, make_windows(2), None, false));
+        let _events = apps.simulate_events();
+        while raise_manager_rx.try_recv().is_ok() {}
+
+        // An unmanaged window is in front of the ones the layout wants on top,
+        // so the restack is still needed.
+        let mut on_screen = vec![WindowServerInfo {
+            id: WindowServerId::new(999),
+            pid: 2,
+            layer: 0,
+            frame: CGRect::new(CGPoint::new(0., 0.), CGSize::new(100., 100.)),
+        }];
+        on_screen.extend(reactor.windows.iter().map(|(wid, window)| WindowServerInfo {
+            id: window.window_server_id.unwrap(),
+            pid: wid.pid,
+            layer: 0,
+            frame: window.frame_monotonic,
+        }));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: WindowsOnScreen::new(on_screen),
+        });
+        assert!(raise_manager_rx.try_recv().is_ok());
+    }
+
+    #[test]
     fn it_skips_surface_when_top_layer_order_matches() {
         let mut apps = Apps::new();
         let mut reactor = Reactor::new_for_test(LayoutManager::new());
@@ -1534,6 +1696,7 @@ pub mod tests {
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor.handle_events(apps.make_app_with_opts(1, make_windows(2), None, false));
         let _events = apps.simulate_events();
@@ -1572,6 +1735,7 @@ pub mod tests {
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor.handle_events(apps.make_app_with_opts(1, make_windows(2), None, false));
         let _events = apps.simulate_events();
@@ -1611,6 +1775,7 @@ pub mod tests {
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor.handle_events(apps.make_app_with_opts(1, make_windows(2), None, false));
         let _events = apps.simulate_events();
@@ -1752,6 +1917,7 @@ pub mod tests {
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor.handle_events(apps.make_app_with_opts(1, make_windows(2), None, false));
         let _events = apps.simulate_events();
@@ -1799,6 +1965,7 @@ pub mod tests {
             spaces: vec![None],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         reactor.handle_events(apps.make_app(1, make_windows(1)));
@@ -1828,6 +1995,7 @@ pub mod tests {
             spaces: vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         let mut windows = make_windows(2);
@@ -1858,6 +2026,7 @@ pub mod tests {
             spaces: vec![Some(space1), Some(space2)],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         // Both windows start on screen1 / space1.
@@ -1934,6 +2103,7 @@ pub mod tests {
             spaces: vec![Some(space1), Some(space2)],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         reactor.handle_events(apps.make_app(1, make_windows(2)));
@@ -1982,6 +2152,7 @@ pub mod tests {
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor.handle_event(Event::WindowsOnScreenUpdated {
             pid: None,
@@ -2023,6 +2194,7 @@ pub mod tests {
             spaces: vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         reactor.handle_events(apps.make_app(1, make_windows(2)));
@@ -2105,6 +2277,7 @@ pub mod tests {
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         reactor.handle_events(apps.make_app_with_opts(
@@ -2131,12 +2304,14 @@ pub mod tests {
             spaces: vec![None],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor.handle_event(Event::WindowsOnScreenUpdated {
             pid: None,
@@ -2190,6 +2365,7 @@ pub mod tests {
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         reactor.handle_events(apps.make_app(1, make_windows(1)));
@@ -2211,6 +2387,7 @@ pub mod tests {
             spaces: vec![Some(SpaceId::new(1)), None],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor.handle_event(Event::WindowsOnScreenUpdated {
             pid: None,
@@ -2245,6 +2422,7 @@ pub mod tests {
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         assert_eq!(None, reactor.main_window());
 
@@ -2277,6 +2455,7 @@ pub mod tests {
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor.handle_event(ApplicationGloballyActivated(1));
         reactor.handle_events(apps.make_app_with_opts(
@@ -2319,6 +2498,7 @@ pub mod tests {
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         reactor1.handle_events(apps.make_app(1, make_windows(2)));
         reactor1.handle_events(apps.make_app(2, make_windows(2)));
@@ -2342,6 +2522,7 @@ pub mod tests {
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
         // Only apps 1 and 3 launch during restore (app 2 was terminated between save and restore)
         reactor2.handle_events(apps2.make_app(1, make_windows(2)));
@@ -2386,6 +2567,7 @@ pub mod tests {
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
         });
 
         let mut apps = Apps::new();
