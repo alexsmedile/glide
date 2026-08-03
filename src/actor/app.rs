@@ -172,6 +172,10 @@ struct RaiseRequest(Vec<WindowId>, CancellationToken, u64, Quiet);
 /// wait indefinitely.
 const ACTIVATION_TIMEOUT: Duration = Duration::from_millis(1000);
 
+/// How long we keep attributing an activation to a raise after the raise was
+/// cancelled. The activation is already in flight at that point.
+const CANCELLED_ACTIVATION_GRACE: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum Quiet {
     Yes,
@@ -202,6 +206,8 @@ struct State {
     windows: HashMap<WindowId, WindowState>,
     last_window_idx: u32,
     main_window: Option<WindowId>,
+    /// An activation we asked for, until the deadline by which we stop
+    /// attributing activation and main window events to it.
     last_activated: Option<(Instant, Quiet, Option<WindowId>, oneshot::Sender<()>)>,
     is_frontmost: bool,
     raises_tx: Sender<(Span, RaiseRequest)>,
@@ -377,20 +383,30 @@ impl State {
     async fn handle_raises(this: &RefCell<Self>, mut rx: Receiver<(Span, RaiseRequest)>) {
         while let Some((span, raise)) = rx.recv().await {
             let RaiseRequest(wids, token, sequence_id, quiet) = raise;
-            if let Err(e) =
-                Self::handle_raise_request(this, wids.clone(), &token, sequence_id, quiet)
-                    .instrument(span)
-                    .await
+            match Self::handle_raise_request(this, wids.clone(), &token, sequence_id, quiet)
+                .instrument(span)
+                .await
             {
-                debug!("Raise request failed: {e}");
-                // Windows we didn't get to will never report completion, and
-                // the events the raise would have produced are suppressed, so
-                // tell the reactor the request is over.
-                this.borrow().send_event(Event::RaiseRequestFailed {
-                    windows: wids,
-                    sequence_id,
-                    quiet,
-                });
+                Ok(()) => {}
+                Err(RaiseError::RaiseCancelled) => {
+                    // Only the raise manager cancels, and it drops the pending
+                    // raises when it does. Reporting the failure would tell the
+                    // reactor the focus is where it was before the raise, which
+                    // is wrong if the activation we already asked for lands.
+                    debug!("Raise request cancelled");
+                    this.borrow_mut().expire_pending_activation();
+                }
+                Err(e) => {
+                    debug!("Raise request failed: {e}");
+                    // Windows we didn't get to will never report completion,
+                    // and the events the raise would have produced are
+                    // suppressed, so tell the reactor the request is over.
+                    this.borrow().send_event(Event::RaiseRequestFailed {
+                        windows: wids,
+                        sequence_id,
+                        quiet,
+                    });
+                }
             }
         }
     }
@@ -928,11 +944,24 @@ impl State {
     /// set with no activation event coming to consume it, and the user may
     /// focus the same window before it ages out.
     fn take_pending_quiet_window_change(&mut self) -> Option<WindowId> {
-        let (ts, _, quiet_window_change, _) = self.last_activated.as_mut()?;
-        if ts.elapsed() >= ACTIVATION_TIMEOUT {
+        let (deadline, _, quiet_window_change, _) = self.last_activated.as_mut()?;
+        if Instant::now() >= *deadline {
             return None;
         }
         quiet_window_change.take()
+    }
+
+    /// Shortens the window in which an activation is attributed to a raise that
+    /// was cancelled.
+    ///
+    /// The activation we asked for is already on its way, so it arrives well
+    /// within the grace period. If it never arrives, the app can still be
+    /// activated by the user, and that activation is not ours to quiet.
+    fn expire_pending_activation(&mut self) {
+        let Some((deadline, ..)) = self.last_activated.as_mut() else {
+            return;
+        };
+        *deadline = (*deadline).min(Instant::now() + CANCELLED_ACTIVATION_GRACE);
     }
 
     fn on_main_window_changed(&mut self, quiet_if: Option<WindowId>) -> Option<WindowId> {
@@ -1013,12 +1042,12 @@ impl State {
                 // reason, we are stuck with using a timeout so we don't
                 // suppress real events in the future.
                 //
-                // This is independent of the raise request cancellation,
-                // which can be caused by outside factors. If last_activated was
-                // set, it's because we initiated an activation event, so we
-                // still want to mark it as quiet if applicable.
-                Some((ts, quiet_activation, quiet_window_change, tx))
-                    if ts.elapsed() < ACTIVATION_TIMEOUT =>
+                // A cancelled raise only shortens the deadline. If
+                // last_activated was set, it's because we initiated an
+                // activation event, so we still want to mark it as quiet if
+                // applicable.
+                Some((deadline, quiet_activation, quiet_window_change, tx))
+                    if Instant::now() < deadline =>
                 {
                     // Initiated by us.
                     trace!("by us");
@@ -1053,7 +1082,12 @@ impl State {
         token: &CancellationToken,
     ) -> Result<(), RaiseError> {
         let (tx, rx) = oneshot::channel();
-        this.last_activated = Some((Instant::now(), quiet_activation, quiet_window_change, tx));
+        this.last_activated = Some((
+            Instant::now() + ACTIVATION_TIMEOUT,
+            quiet_activation,
+            quiet_window_change,
+            tx,
+        ));
         drop(this); // Don't use RefCell across await.
         trace!("Awaiting activation");
         select! {
