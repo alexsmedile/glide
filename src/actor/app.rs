@@ -874,8 +874,9 @@ impl State {
                 mutex_guard.take();
                 (quiet == Quiet::Yes).then_some(wid)
             } else {
-                // `quiet` only applies to the last window.
-                None
+                // `quiet` only applies to the last window. The ones below it
+                // should always be quiet.
+                Some(wid)
             };
 
             // Observe the main window change and send the event if applicable.
