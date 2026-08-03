@@ -44,6 +44,14 @@ pub struct RaiseRequest {
     pub app_handles: HashMap<i32, AppThreadHandle>,
 }
 
+impl RaiseRequest {
+    /// Whether this request asks for the same thing as `other`. App handles
+    /// aren't compared; they don't affect what the request does.
+    fn matches(&self, other: &RaiseRequest) -> bool {
+        self.raise_windows == other.raise_windows && self.focus_window == other.focus_window
+    }
+}
+
 pub struct RaiseManager {
     /// The currently active sequence, if any
     active_sequence: Option<ActiveSequence>,
@@ -136,22 +144,18 @@ impl RaiseManager {
 
     fn handle_message(&mut self, msg: Event) {
         match msg {
-            Event::RaiseRequest(RaiseRequest {
-                raise_windows,
-                focus_window,
-                app_handles,
-            }) => {
+            Event::RaiseRequest(request) => {
                 debug!(
                     "Processing layout response with {} raise_windows",
-                    raise_windows.len()
+                    request.raise_windows.len()
                 );
 
-                // Always queue the sequence
-                self.queued_sequences.push_back(RaiseRequest {
-                    raise_windows,
-                    focus_window,
-                    app_handles,
-                });
+                // Drop duplicate requests that have no effect.
+                if self.queued_sequences.back().is_some_and(|last| last.matches(&request)) {
+                    debug!("Dropping raise request identical to the queued one");
+                } else {
+                    self.queued_sequences.push_back(request);
+                }
             }
             Event::RaiseCompleted { window_id, sequence_id } => {
                 trace!("Raise completed for {:?} in sequence {}", window_id, sequence_id);
@@ -364,6 +368,20 @@ mod tests {
             focus_window,
             app_handles,
         })
+    }
+
+    /// What each queued request will do, oldest first.
+    fn queued(raise_manager: &RaiseManager) -> Vec<(Vec<Vec<WindowId>>, Option<WindowId>)> {
+        raise_manager
+            .queued_sequences
+            .iter()
+            .map(|request| {
+                (
+                    request.raise_windows.clone(),
+                    request.focus_window.map(|(wid, _)| wid),
+                )
+            })
+            .collect()
     }
 
     fn collect_requests(app_rx: &mut mpsc::UnboundedReceiver<(Span, Request)>) -> Vec<Request> {
@@ -632,6 +650,35 @@ mod tests {
                 sequence_id: 1,
             });
             assert!(raise_manager.active_sequence.is_none());
+        });
+    }
+
+    #[test]
+    fn test_identical_requests_collapse_to_one_queued() {
+        Executor::run(async {
+            let mut raise_manager = RaiseManager::new();
+            let (app_handles, _app_rx) = create_test_app_handles();
+            let request = || {
+                create_layout_response(
+                    vec![WindowId::new(1, 1), WindowId::new(1, 2)],
+                    Some((WindowId::new(1, 3), None)),
+                    app_handles.clone(),
+                )
+            };
+
+            // The first becomes active; the rest would pile up behind it.
+            for _ in 0..10 {
+                raise_manager.handle_message(request());
+            }
+
+            assert_eq!(raise_manager.active_sequence.as_ref().unwrap().sequence_id, 1);
+            assert_eq!(
+                queued(&raise_manager),
+                vec![(
+                    vec![vec![WindowId::new(1, 1)], vec![WindowId::new(1, 2)]],
+                    Some(WindowId::new(1, 3))
+                )]
+            );
         });
     }
 
