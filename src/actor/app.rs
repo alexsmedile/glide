@@ -167,6 +167,11 @@ pub enum Request {
 
 struct RaiseRequest(Vec<WindowId>, CancellationToken, u64, Quiet);
 
+/// How long after starting an activation we still attribute activation and main
+/// window events to it. Activations can silently fail to happen, so we can't
+/// wait indefinitely.
+const ACTIVATION_TIMEOUT: Duration = Duration::from_millis(1000);
+
 #[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum Quiet {
     Yes,
@@ -667,7 +672,11 @@ impl State {
                 _ = self.on_activation_changed();
             }
             kAXMainWindowChangedNotification => {
-                self.on_main_window_changed(None);
+                // A raise we started may be waiting on the activation event
+                // that goes with this change. The app can report the new main
+                // window first, so use the marker the raise left behind.
+                let quiet_if = self.pending_quiet_window_change();
+                self.on_main_window_changed(quiet_if);
             }
             kAXWindowCreatedNotification => {
                 if self.id(&elem).is_ok() {
@@ -904,6 +913,14 @@ impl State {
         Ok(())
     }
 
+    /// The window an in-flight raise expects to become the main window.
+    fn pending_quiet_window_change(&self) -> Option<WindowId> {
+        self.last_activated
+            .as_ref()
+            .filter(|(ts, ..)| ts.elapsed() < ACTIVATION_TIMEOUT)
+            .and_then(|&(_, _, quiet_window_change, _)| quiet_window_change)
+    }
+
     fn on_main_window_changed(&mut self, quiet_if: Option<WindowId>) -> Option<WindowId> {
         // Always read back the main window instead of getting it from an event,
         // in case the event is stale. This is necessary because we sometimes
@@ -987,7 +1004,7 @@ impl State {
                 // set, it's because we initiated an activation event, so we
                 // still want to mark it as quiet if applicable.
                 Some((ts, quiet_activation, quiet_window_change, tx))
-                    if ts.elapsed() < Duration::from_millis(1000) =>
+                    if ts.elapsed() < ACTIVATION_TIMEOUT =>
                 {
                     // Initiated by us.
                     trace!("by us");
