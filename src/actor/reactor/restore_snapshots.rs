@@ -35,7 +35,7 @@ fn snapshot_dir() -> PathBuf {
 /// inputs always produce byte-identical output, so a format change is visible.
 fn canonical_serialized() -> String {
     let mut apps = Apps::new();
-    let mut reactor = Reactor::new_for_test(LayoutManager::new());
+    let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
     reactor.handle_event(Event::ScreenParametersChanged {
         frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
         spaces: vec![Some(SpaceId::new(1))],

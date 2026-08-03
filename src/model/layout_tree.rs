@@ -727,8 +727,9 @@ impl LayoutTree {
         self.tree.data.window.swap_windows(node_a, node_b);
     }
 
-    pub fn resize(&mut self, node: NodeId, screen_ratio: f64, direction: Direction) -> bool {
-        // Pick an ancestor to resize that has a sibling in the given direction.
+    /// Picks the ancestor of `node` (possibly `node` itself) to resize, along
+    /// with the sibling it exchanges space with.
+    fn resize_target(&self, node: NodeId, direction: Direction) -> Option<(NodeId, NodeId)> {
         let can_resize = |&node: &NodeId| -> bool {
             let Some(parent) = node.parent(&self.tree.map) else {
                 return false;
@@ -736,10 +737,70 @@ impl LayoutTree {
             !self.tree.data.size.kind(parent).is_group()
                 && self.move_over(node, direction).is_some()
         };
-        let Some(resizing_node) = node.ancestors(&self.tree.map).filter(can_resize).next() else {
+        let resizing_node = node.ancestors(&self.tree.map).filter(can_resize).next()?;
+        let sibling = self.move_over(resizing_node, direction).unwrap();
+        Some((resizing_node, sibling))
+    }
+
+    /// The number of pixels one unit of `parent`'s total weight is worth.
+    ///
+    /// Returns `None` if `parent` is not laid out on `screen`.
+    fn pixels_per_weight(&self, parent: NodeId, screen: CGRect, config: &Config) -> Option<f64> {
+        let root = parent.ancestors(&self.tree.map).last().unwrap();
+        let parent_rect = self.tree.data.size.get_node_rect(
+            &self.tree.map,
+            &self.tree.data.window,
+            &self.tree.data.selection,
+            config,
+            root,
+            screen,
+            self.is_scroll_root(root),
+            parent,
+        )?;
+        Some(self.tree.data.size.pixels_per_weight(
+            &self.tree.map,
+            parent,
+            parent_rect,
+            config,
+            self.is_scroll_root(parent),
+        ))
+    }
+
+    /// Resizes `node` by `delta` pixels along `direction`.
+    ///
+    /// This is not the same as [`Self::resize`] with `delta` as a fraction of
+    /// the screen: gaps take up screen space that is not distributed by weight,
+    /// so a fraction of the screen is worth fewer pixels in the layout.
+    ///
+    /// The resulting frame can still land a pixel away from the requested one,
+    /// since each child's frame is rounded independently and positions follow
+    /// the rounded edge of the previous sibling.
+    pub fn resize_by_pixels(
+        &mut self,
+        node: NodeId,
+        delta: f64,
+        direction: Direction,
+        screen: CGRect,
+        config: &Config,
+    ) -> bool {
+        let Some((resizing_node, sibling)) = self.resize_target(node, direction) else {
             return false;
         };
-        let sibling = self.move_over(resizing_node, direction).unwrap();
+        let parent = resizing_node.parent(&self.tree.map).unwrap();
+        let Some(px_per_weight) = self.pixels_per_weight(parent, screen, config) else {
+            return false;
+        };
+        if px_per_weight <= 0.0 {
+            return false;
+        }
+        self.apply_resize(resizing_node, sibling, parent, delta / px_per_weight);
+        true
+    }
+
+    pub fn resize(&mut self, node: NodeId, screen_ratio: f64, direction: Direction) -> bool {
+        let Some((resizing_node, sibling)) = self.resize_target(node, direction) else {
+            return false;
+        };
 
         // Compute the share of resizing_node's parent that needs to be taken
         // from the sibling.
@@ -757,17 +818,30 @@ impl LayoutTree {
         });
         let parent = resizing_node.parent(&self.tree.map).unwrap();
         let parent_total = self.tree.data.size.total(parent);
-        let is_scroll_column = self.is_scroll_root(parent);
-        let local_ratio = if is_scroll_column {
-            f64::from(screen_ratio) / exchange_rate
+        let local_ratio = if self.is_scroll_root(parent) {
+            screen_ratio / exchange_rate
         } else {
-            f64::from(screen_ratio) * parent_total / exchange_rate
+            screen_ratio * parent_total / exchange_rate
         };
-        if is_scroll_column {
+        self.apply_resize(resizing_node, sibling, parent, local_ratio);
+
+        true
+    }
+
+    /// Moves `delta_weight` units of `parent`'s total weight to
+    /// `resizing_node`, taking it from `sibling`.
+    fn apply_resize(
+        &mut self,
+        resizing_node: NodeId,
+        sibling: NodeId,
+        parent: NodeId,
+        delta_weight: f64,
+    ) {
+        if self.is_scroll_root(parent) {
             let current_weight = self.tree.data.size.weight(resizing_node);
             self.tree.data.size.set_weight(
                 resizing_node,
-                current_weight + local_ratio as f32,
+                current_weight + delta_weight as f32,
                 &self.tree.map,
             );
         } else {
@@ -775,11 +849,9 @@ impl LayoutTree {
                 &self.tree.map,
                 resizing_node,
                 sibling,
-                local_ratio as f32,
+                delta_weight as f32,
             );
         }
-
-        true
     }
 
     /// Call this during a user resize to have the model respond appropriately.
@@ -791,12 +863,13 @@ impl LayoutTree {
         old_frame: CGRect,
         new_frame: CGRect,
         screen: CGRect,
+        config: &Config,
     ) {
         let mut check_or_resize = |resize: bool| {
             let mut count = 0;
             let mut first_direction: Option<Direction> = None;
             let mut good = true;
-            let mut check_and_resize = |direction: Direction, delta, whole| {
+            let mut check_and_resize = |direction: Direction, delta| {
                 if delta != 0.0 {
                     count += 1;
                     if count > 2 {
@@ -810,30 +883,14 @@ impl LayoutTree {
                         first_direction = Some(direction);
                     }
                     if resize {
-                        self.resize(node, f64::from(delta) / f64::from(whole), direction);
+                        self.resize_by_pixels(node, delta, direction, screen, config);
                     }
                 }
             };
-            check_and_resize(
-                Direction::Left,
-                old_frame.min().x - new_frame.min().x,
-                screen.size.width,
-            );
-            check_and_resize(
-                Direction::Right,
-                new_frame.max().x - old_frame.max().x,
-                screen.size.width,
-            );
-            check_and_resize(
-                Direction::Up,
-                old_frame.min().y - new_frame.min().y,
-                screen.size.height,
-            );
-            check_and_resize(
-                Direction::Down,
-                new_frame.max().y - old_frame.max().y,
-                screen.size.height,
-            );
+            check_and_resize(Direction::Left, old_frame.min().x - new_frame.min().x);
+            check_and_resize(Direction::Right, new_frame.max().x - old_frame.max().x);
+            check_and_resize(Direction::Up, old_frame.min().y - new_frame.min().y);
+            check_and_resize(Direction::Down, new_frame.max().y - old_frame.max().y);
             good
         };
         if !check_or_resize(false) {
@@ -1605,10 +1662,17 @@ mod tests {
             rect(1000, 1000, 500, 1000),
             rect(1000, 1100, 500, 1000),
             screen,
+            config,
         );
         assert_frames_are(tree.calculate_layout(layout, screen, config), orig.clone());
 
-        tree.set_frame_from_resize(a1, rect(0, 0, 1000, 3000), rect(0, 0, 1010, 3000), screen);
+        tree.set_frame_from_resize(
+            a1,
+            rect(0, 0, 1000, 3000),
+            rect(0, 0, 1010, 3000),
+            screen,
+            config,
+        );
         assert_frames_are(
             tree.calculate_layout(layout, screen, config),
             [
@@ -1621,7 +1685,13 @@ mod tests {
             ],
         );
 
-        tree.set_frame_from_resize(a1, rect(0, 0, 1010, 3000), rect(0, 0, 1000, 3000), screen);
+        tree.set_frame_from_resize(
+            a1,
+            rect(0, 0, 1010, 3000),
+            rect(0, 0, 1000, 3000),
+            screen,
+            config,
+        );
         assert_frames_are(tree.calculate_layout(layout, screen, config), orig.clone());
 
         tree.set_frame_from_resize(
@@ -1629,6 +1699,7 @@ mod tests {
             rect(1000, 1000, 500, 1000),
             rect(900, 900, 600, 1100),
             screen,
+            config,
         );
         assert_frames_are(
             tree.calculate_layout(layout, screen, config),
@@ -1645,6 +1716,62 @@ mod tests {
                 (WindowId::new(1, 3), rect(2000, 0, 1000, 3000)),
             ],
         );
+    }
+
+    /// A drag moves the edge by as many pixels as the user dragged it, whatever
+    /// the gap settings. Regression test for #227.
+    #[test]
+    fn set_frame_from_resize_tracks_the_user_with_gaps() {
+        for gap in [0.0, 8.0, 40.0] {
+            for &vertical in &[false, true] {
+                let mut tree = LayoutTree::new();
+                let layout = tree.create_layout();
+                let root = tree.root(layout);
+                if vertical {
+                    tree.set_container_kind(root, ContainerKind::Vertical);
+                }
+                let _a = tree.add_window_under(layout, root, WindowId::new(1, 1));
+                let _b = tree.add_window_under(layout, root, WindowId::new(1, 2));
+                let _c = tree.add_window_under(layout, root, WindowId::new(1, 3));
+                let screen = rect(0, 39, 1800, 1130);
+                let mut config = Config::default();
+                config.settings.outer_gap = gap;
+                config.settings.inner_gap = gap;
+                let node = tree.window_node(layout, WindowId::new(1, 2)).unwrap();
+
+                let frame_of = |tree: &LayoutTree, wid| {
+                    tree.calculate_layout(layout, screen, &config)
+                        .into_iter()
+                        .find(|&(w, _)| w == wid)
+                        .unwrap()
+                        .1
+                };
+
+                // Drag the middle window's leading edge in increments, as a
+                // stream of AXWindowResized notifications would report it.
+                let mut cur = frame_of(&tree, WindowId::new(1, 2));
+                for _ in 0..5 {
+                    let new = if vertical {
+                        CGRect::new(
+                            CGPoint::new(cur.origin.x, cur.origin.y + 17.),
+                            CGSize::new(cur.size.width, cur.size.height - 17.),
+                        )
+                    } else {
+                        CGRect::new(
+                            CGPoint::new(cur.origin.x + 34., cur.origin.y),
+                            CGSize::new(cur.size.width - 34., cur.size.height),
+                        )
+                    };
+                    tree.set_frame_from_resize(node, cur, new, screen, &config);
+                    assert_eq!(
+                        frame_of(&tree, WindowId::new(1, 2)),
+                        new,
+                        "gap={gap} vertical={vertical}: layout disagrees with the user's frame"
+                    );
+                    cur = new;
+                }
+            }
+        }
     }
 
     #[test]

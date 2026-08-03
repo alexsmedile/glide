@@ -6,6 +6,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -249,6 +250,8 @@ pub struct LayoutManager {
     interactive_resize: Option<InteractiveScrollResize>,
     #[serde(skip)]
     interactive_move: Option<InteractiveScrollMove>,
+    #[serde(skip, default = "default_config")]
+    config: Arc<Config>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -346,8 +349,12 @@ fn classify_window(rules: &[WindowRule], info: &LayoutWindowInfo) -> WindowClass
     }
 }
 
+fn default_config() -> Arc<Config> {
+    Arc::new(Config::default())
+}
+
 impl LayoutManager {
-    pub fn new() -> Self {
+    pub fn new(config: Arc<Config>) -> Self {
         LayoutManager {
             tree: LayoutTree::new(),
             layout_mapping: Default::default(),
@@ -363,11 +370,13 @@ impl LayoutManager {
             window_rules: Vec::new(),
             interactive_resize: None,
             interactive_move: None,
+            config,
         }
     }
 
-    pub fn set_config(&mut self, config: &Config) {
-        // TODO: store a reference to Config instead of cloning fields
+    pub fn set_config(&mut self, config: &Arc<Config>) {
+        // TODO: read these through self.config instead of cloning them out
+        self.config = config.clone();
         self.scroll_cfg = config.settings.experimental.scroll.clone().validated();
         self.scroll_enabled = self.scroll_cfg.enable;
         self.window_rules = config.window_rules.clone();
@@ -704,7 +713,13 @@ impl LayoutManager {
                     } else {
                         // n.b.: old_frame should reflect the current size in
                         // the layout tree so it can be accurately updated.
-                        self.tree.set_frame_from_resize(node, old_frame, new_frame, screen);
+                        self.tree.set_frame_from_resize(
+                            node,
+                            old_frame,
+                            new_frame,
+                            screen,
+                            &self.config,
+                        );
                     }
                 }
             }
@@ -1557,10 +1572,14 @@ impl LayoutManager {
         self.tree.visible_windows_under(self.tree.root(layout))
     }
 
-    pub fn load(path: PathBuf) -> anyhow::Result<Self> {
+    pub fn load(path: PathBuf, config: Arc<Config>) -> anyhow::Result<Self> {
         let mut buf = String::new();
         File::open(path)?.read_to_string(&mut buf)?;
-        Ok(ron::from_str(&buf)?)
+        let mut manager: Self = ron::from_str(&buf)?;
+        // Only the field, not `set_config`: the caller applies the config, and
+        // `set_config` also converts layouts the config no longer allows.
+        manager.config = config;
+        Ok(manager)
     }
 
     pub fn save(&self, path: PathBuf) -> std::io::Result<()> {
@@ -1658,6 +1677,13 @@ fn detect_edges(point: CGPoint, frame: CGRect) -> ResizeEdge {
 }
 
 #[cfg(test)]
+impl LayoutManager {
+    pub(crate) fn new_for_test() -> Self {
+        Self::new(default_config())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use objc2_core_foundation::CGPoint;
     use pretty_assertions::assert_eq;
@@ -1688,11 +1714,11 @@ mod tests {
         }
     }
 
-    fn config_with_scroll(enable: bool, default_layout_kind: LayoutKind) -> Config {
+    fn config_with_scroll(enable: bool, default_layout_kind: LayoutKind) -> Arc<Config> {
         let mut config = Config::default();
         config.settings.experimental.scroll.enable = enable;
         config.settings.default_layout_kind = default_layout_kind;
-        config
+        Arc::new(config)
     }
 
     #[test]
@@ -1869,7 +1895,7 @@ mod tests {
     fn it_maintains_separate_layouts_for_each_screen_size() {
         use LayoutCommand::*;
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space = SpaceId::new(1);
         let pid = 1;
         let windows = make_windows(pid, 3);
@@ -1943,7 +1969,7 @@ mod tests {
     fn it_culls_unmodified_layouts() {
         use LayoutCommand::*;
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space = SpaceId::new(1);
         let pid = 1;
         let windows = make_windows(pid, 3);
@@ -2062,7 +2088,7 @@ mod tests {
     fn floating_windows() {
         use LayoutCommand::*;
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space = SpaceId::new(1);
         let pid = 1;
         let config = &Config::default();
@@ -2119,7 +2145,7 @@ mod tests {
     fn floating_windows_space_disabled() {
         use LayoutCommand::*;
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space = SpaceId::new(1);
         let pid = 1;
         let config = &Config::default();
@@ -2169,7 +2195,7 @@ mod tests {
     fn space_exposed_does_not_bury_focused_floating_window() {
         use LayoutCommand::*;
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space = SpaceId::new(1);
         let pid = 1;
 
@@ -2197,7 +2223,7 @@ mod tests {
     fn it_adds_new_windows_behind_selection() {
         use LayoutCommand::*;
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space = SpaceId::new(1);
         let pid = 1;
         let windows = make_windows(pid, 5);
@@ -2303,7 +2329,7 @@ mod tests {
     #[test]
     fn add_remove_add() {
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space = SpaceId::new(1);
         let pid = 1;
 
@@ -2343,7 +2369,7 @@ mod tests {
     #[test]
     fn resize_to_full_screen_and_back_preserves_layout() {
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space = SpaceId::new(1);
         let pid = 1;
 
@@ -2402,7 +2428,7 @@ mod tests {
     #[test]
     fn resize_to_system_full_screen_and_back_preserves_layout() {
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space = SpaceId::new(1);
         let pid = 1;
 
@@ -2446,7 +2472,7 @@ mod tests {
     fn flip_between_screens() {
         use LayoutCommand::*;
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space1 = SpaceId::new(1);
         let space2 = SpaceId::new(2);
         let pid = 1;
@@ -2524,7 +2550,7 @@ mod tests {
     fn move_node_between_spaces_keeps_window_mapping_consistent() {
         use LayoutCommand::*;
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space1 = SpaceId::new(1);
         let space2 = SpaceId::new(2);
         let pid = 1;
@@ -2579,7 +2605,7 @@ mod tests {
     fn floating_window_space_change_stays_floating() {
         use LayoutCommand::*;
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space1 = SpaceId::new(1);
         let space2 = SpaceId::new(2);
         let pid = 1;
@@ -2622,7 +2648,7 @@ mod tests {
     #[test]
     fn window_dragged_into_scroll_space_joins_a_column() {
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         mgr.set_config(&config_with_scroll(true, LayoutKind::Scroll));
         let space1 = SpaceId::new(1);
         let space2 = SpaceId::new(2);
@@ -2660,7 +2686,7 @@ mod tests {
     fn focus_next_prev() {
         use LayoutCommand::*;
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space = SpaceId::new(1);
         let pid = 1;
 
@@ -2707,7 +2733,7 @@ mod tests {
     fn it_resizes_windows_with_resize_command() {
         use LayoutCommand::*;
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let space = SpaceId::new(1);
         let pid = 1;
         let windows = make_windows(pid, 2);
@@ -2762,7 +2788,7 @@ mod tests {
     #[test]
     fn space_exposed_forces_tree_when_scroll_gate_disabled() {
         use LayoutEvent::*;
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let config = config_with_scroll(false, LayoutKind::Scroll);
         mgr.set_config(&config);
 
@@ -2777,7 +2803,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let config = config_with_scroll(false, LayoutKind::Tree);
         mgr.set_config(&config);
 
@@ -2794,7 +2820,7 @@ mod tests {
     fn active_scroll_layout_converts_to_tree_when_gate_disabled() {
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let config_on = config_with_scroll(true, LayoutKind::Scroll);
         mgr.set_config(&config_on);
 
@@ -2815,7 +2841,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let config_on = config_with_scroll(true, LayoutKind::Scroll);
         mgr.set_config(&config_on);
 
@@ -2839,7 +2865,7 @@ mod tests {
     fn scroll_wheel_is_ignored_when_scroll_gate_disabled() {
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let config_on = config_with_scroll(true, LayoutKind::Scroll);
         mgr.set_config(&config_on);
 
@@ -2864,7 +2890,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new();
+        let mut mgr = LayoutManager::new_for_test();
         let config_on = config_with_scroll(true, LayoutKind::Scroll);
         mgr.set_config(&config_on);
 

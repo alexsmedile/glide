@@ -109,14 +109,14 @@ fn main() {
     NSApp(mtm).finishLaunching();
 
     if opt.validate {
-        LayoutManager::load(restore_file()).unwrap();
+        LayoutManager::load(restore_file(), config.clone()).unwrap();
         return;
     }
 
     let layout = if opt.restore {
-        LayoutManager::load(restore_file()).unwrap()
+        LayoutManager::load(restore_file(), config.clone()).unwrap()
     } else {
-        LayoutManager::new()
+        LayoutManager::new(config.clone())
     };
     let (mouse_tx, mouse_rx) = channel();
     let (status_tx, status_rx) = channel();

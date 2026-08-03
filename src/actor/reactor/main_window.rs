@@ -148,7 +148,7 @@ mod tests {
     fn it_tracks_frontmost_app_and_main_window_correctly() {
         use Event::*;
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
             frames: vec![CGRect::ZERO],
@@ -211,7 +211,7 @@ mod tests {
     fn it_does_not_update_layout_for_quiet_raises() {
         use Event::*;
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
             frames: vec![CGRect::ZERO],
@@ -275,7 +275,7 @@ mod tests {
     fn it_selects_main_window_when_space_is_enabled() {
         use Event::*;
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let pid = 3;
         let windows = make_windows(2);
         let space = SpaceId::new(1);

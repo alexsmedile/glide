@@ -222,6 +222,11 @@ pub struct Reactor {
     active_screen_idx: Option<u16>,
     main_window_tracker: MainWindowTracker,
     in_drag: bool,
+    /// The window the user is currently resizing with the mouse, if any.
+    ///
+    /// We don't write frames to this window until the resize ends, since a
+    /// write mid-drag fights the user's mouse.
+    resizing_window: Option<WindowId>,
     record: Record,
     raise_manager_tx: raise::Sender,
     animation_tx: Option<animation::Sender>,
@@ -376,6 +381,7 @@ impl Reactor {
             active_screen_idx: None,
             main_window_tracker: MainWindowTracker::default(),
             in_drag: false,
+            resizing_window: None,
             record,
             raise_manager_tx,
             animation_tx: None,
@@ -524,6 +530,7 @@ impl Reactor {
             Event::WindowDestroyed(wid) => {
                 self.layout.cancel_interactive_state();
                 self.in_drag = false;
+                self.resizing_window = None;
                 if self.windows.remove(&wid).is_none() {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
@@ -531,6 +538,11 @@ impl Reactor {
                 self.send_layout_event(LayoutEvent::WindowRemoved(wid));
             }
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
+                if mouse_state == Some(MouseState::Up) {
+                    // The button is up, so any resize we were holding off on is
+                    // over, even if we never saw the MouseUp event.
+                    self.resizing_window = None;
+                }
                 let window = self.windows.get_mut(&wid).unwrap();
                 if last_seen != window.last_sent_txid {
                     // Ignore events that happened before the last time we
@@ -575,6 +587,9 @@ impl Reactor {
                         new_frame,
                         screens,
                     });
+                    if mouse_state == Some(MouseState::Down) {
+                        self.resizing_window = Some(wid);
+                    }
                     is_resize = true;
                 } else if mouse_state == Some(MouseState::Down) {
                     self.in_drag = true;
@@ -640,6 +655,7 @@ impl Reactor {
                 }
                 self.layout.cancel_interactive_state();
                 self.in_drag = false;
+                self.resizing_window = None;
                 info!("space changed");
                 for (space, screen) in spaces.iter().zip(&mut self.screens) {
                     screen.space = *space;
@@ -713,6 +729,7 @@ impl Reactor {
                     }
                 }
                 self.in_drag = false;
+                self.resizing_window = None;
                 // Now re-check the layout.
             }
             Event::MouseMovedOverWindow(wsid) => {
@@ -1130,6 +1147,13 @@ impl Reactor {
             targets.insert(wid, (frame, scale_factor));
         }
         for (wid, (target_frame, scale_factor)) in targets {
+            if self.resizing_window == Some(wid) {
+                // The user is dragging this window's edge; correct it on mouse
+                // up instead.
+                // TODO: A pending frame override for this window is dropped
+                // here rather than deferred to mouse up.
+                continue;
+            }
             let Some(window) = self.windows.get_mut(&wid) else {
                 // If we restored a saved state the window may not be available yet.
                 continue;
@@ -1189,7 +1213,7 @@ pub mod tests {
     #[test]
     fn it_ignores_stale_resize_events() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
@@ -1221,7 +1245,7 @@ pub mod tests {
     fn it_sends_layout_animation_to_manager() {
         let mut apps = Apps::new();
         let (mut reactor, mut animation_rx) =
-            Reactor::new_for_test_with_animation(LayoutManager::new(), true);
+            Reactor::new_for_test_with_animation(LayoutManager::new_for_test(), true);
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
@@ -1248,7 +1272,7 @@ pub mod tests {
         use LayoutCommand::ToggleWindowFloating;
 
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let wid = WindowId::new(1, 1);
@@ -1304,7 +1328,7 @@ pub mod tests {
 
         let mut apps = Apps::new();
         let (mut reactor, mut animation_rx) =
-            Reactor::new_for_test_with_animation(LayoutManager::new(), true);
+            Reactor::new_for_test_with_animation(LayoutManager::new_for_test(), true);
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let wid = WindowId::new(1, 1);
@@ -1339,7 +1363,7 @@ pub mod tests {
     #[test]
     fn it_sends_writes_when_stale_read_state_looks_same_as_written_state() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
@@ -1378,7 +1402,7 @@ pub mod tests {
     #[test]
     fn sends_writes_same_as_last_written_state_if_changed_externally() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
@@ -1421,7 +1445,7 @@ pub mod tests {
     #[test]
     fn it_responds_to_resizes() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
@@ -1470,7 +1494,7 @@ pub mod tests {
     #[test]
     fn it_manages_windows_on_enabled_spaces() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
@@ -1493,7 +1517,7 @@ pub mod tests {
     #[test]
     fn it_selects_the_main_window_on_space_enable() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let ws_info = (1..=2)
             .map(|id| WindowServerInfo {
@@ -1539,7 +1563,7 @@ pub mod tests {
     #[test]
     fn it_surfaces_on_screen_change_when_the_snapshot_is_empty() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1567,7 +1591,7 @@ pub mod tests {
     #[test]
     fn it_surfaces_on_screen_change_when_the_snapshot_omits_the_windows() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1603,7 +1627,7 @@ pub mod tests {
     #[test]
     fn it_skips_surface_on_screen_change_when_top_layer_order_matches() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1645,7 +1669,7 @@ pub mod tests {
     #[test]
     fn it_surfaces_on_screen_change_when_another_window_is_in_front() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1687,7 +1711,7 @@ pub mod tests {
     #[test]
     fn it_skips_surface_when_top_layer_order_matches() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1726,7 +1750,7 @@ pub mod tests {
     #[test]
     fn it_skips_surface_when_top_layer_windows_are_reordered() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1766,7 +1790,7 @@ pub mod tests {
     #[test]
     fn it_surfaces_top_layer_windows_when_top_managed_set_differs() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1818,7 +1842,7 @@ pub mod tests {
 
     #[test]
     fn filter_response_clears_matching_focus_and_raise_windows() {
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.screens = vec![Screen {
             frame: CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.)),
             space: Some(SpaceId::new(1)),
@@ -1888,7 +1912,7 @@ pub mod tests {
 
     #[test]
     fn filter_response_keeps_response_when_focus_is_not_frontmost() {
-        let reactor = Reactor::new_for_test(LayoutManager::new());
+        let reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let w1 = WindowId::with_wsid(1, WindowServerId::new(1));
         let w2 = WindowId::with_wsid(1, WindowServerId::new(2));
 
@@ -1908,7 +1932,7 @@ pub mod tests {
     #[test]
     fn it_ignores_unmanaged_and_nonzero_layer_windows_when_comparing_space_order() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1958,7 +1982,7 @@ pub mod tests {
     #[test]
     fn it_ignores_windows_on_disabled_spaces() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
@@ -1987,7 +2011,7 @@ pub mod tests {
     #[test]
     fn it_keeps_discovered_windows_on_their_initial_screen() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
@@ -2016,7 +2040,7 @@ pub mod tests {
     #[test]
     fn it_moves_windows_dragged_between_spaces() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
         let space1 = SpaceId::new(1);
@@ -2093,7 +2117,7 @@ pub mod tests {
     #[test]
     fn it_keeps_windows_in_space_on_intra_space_drag() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
         let space1 = SpaceId::new(1);
@@ -2142,10 +2166,154 @@ pub mod tests {
         );
     }
 
+    /// Neighbors still follow along, and the window is corrected on mouse up.
+    #[test]
+    fn it_doesnt_write_to_a_window_the_user_is_resizing() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        let resized = WindowId::new(1, 1);
+        let neighbor = WindowId::new(1, 2);
+        let frame = apps.windows[&resized].frame;
+
+        // The user drags the shared edge left, shrinking window 1.
+        let new_frame = CGRect::new(
+            frame.origin,
+            CGSize::new(frame.size.width - 100., frame.size.height),
+        );
+        apps.windows.get_mut(&resized).unwrap().frame = new_frame;
+        reactor.handle_event(Event::WindowFrameChanged(
+            resized,
+            new_frame,
+            apps.windows[&resized].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Down),
+        ));
+
+        // The neighbor grows to fill the space, but we leave the dragged window
+        // alone.
+        let wids = written_wids(apps.requests());
+        assert!(wids.contains(&neighbor), "neighbor should follow: {wids:?}");
+        assert!(
+            !wids.contains(&resized),
+            "shouldn't write to the window being resized: {wids:?}"
+        );
+
+        // The app settles on a change in three directions at once, which the
+        // layout tree refuses to apply. The model and the window now disagree.
+        let odd_frame = CGRect::new(
+            CGPoint::new(new_frame.origin.x + 10., new_frame.origin.y + 10.),
+            CGSize::new(new_frame.size.width - 30., new_frame.size.height - 5.),
+        );
+        apps.windows.get_mut(&resized).unwrap().frame = odd_frame;
+        reactor.handle_event(Event::WindowFrameChanged(
+            resized,
+            odd_frame,
+            apps.windows[&resized].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Down),
+        ));
+        let wids = written_wids(apps.requests());
+        assert!(
+            !wids.contains(&resized),
+            "shouldn't write to the window being resized: {wids:?}"
+        );
+
+        // Releasing the mouse snaps it back to the layout's frame.
+        reactor.handle_event(Event::MouseUp);
+        let wids = written_wids(apps.requests());
+        assert!(
+            wids.contains(&resized),
+            "release should correct the window: {wids:?}"
+        );
+    }
+
+    /// The MouseUp event can be lost, e.g. if the event tap is disabled while
+    /// the button is down. The mouse state on the next frame change releases
+    /// the window instead.
+    #[test]
+    fn it_stops_suppressing_a_resize_when_the_mouse_up_is_missed() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        let resized = WindowId::new(1, 1);
+        let frame = apps.windows[&resized].frame;
+        let new_frame = CGRect::new(
+            frame.origin,
+            CGSize::new(frame.size.width - 100., frame.size.height),
+        );
+        apps.windows.get_mut(&resized).unwrap().frame = new_frame;
+        reactor.handle_event(Event::WindowFrameChanged(
+            resized,
+            new_frame,
+            apps.windows[&resized].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Down),
+        ));
+        let wids = written_wids(apps.requests());
+        assert!(!wids.contains(&resized), "should be suppressed: {wids:?}");
+
+        // No MouseUp arrives, but the next frame change reports the button up
+        // and asks for a change the tree can't apply, so the model and the
+        // window disagree.
+        let odd_frame = CGRect::new(
+            CGPoint::new(new_frame.origin.x + 10., new_frame.origin.y + 10.),
+            CGSize::new(new_frame.size.width - 30., new_frame.size.height - 5.),
+        );
+        apps.windows.get_mut(&resized).unwrap().frame = odd_frame;
+        reactor.handle_event(Event::WindowFrameChanged(
+            resized,
+            odd_frame,
+            apps.windows[&resized].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Up),
+        ));
+        let wids = written_wids(apps.requests());
+        assert!(
+            wids.contains(&resized),
+            "button up should release the window: {wids:?}"
+        );
+    }
+
+    fn written_wids(requests: Vec<Request>) -> Vec<WindowId> {
+        requests
+            .into_iter()
+            .flat_map(|request| match request {
+                Request::SetWindowFrame(wid, _, _) => vec![wid],
+                Request::AnimationFrame { wid, .. } => vec![wid],
+                _ => vec![],
+            })
+            .collect()
+    }
+
     #[test]
     fn it_ignores_windows_on_nonzero_layers() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
@@ -2183,7 +2351,7 @@ pub mod tests {
     #[test]
     fn handle_layout_response_groups_windows_by_app_and_screen() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
 
@@ -2241,7 +2409,7 @@ pub mod tests {
     #[test]
     fn handle_layout_response_includes_handles_for_raise_and_focus_windows() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
 
@@ -2269,7 +2437,7 @@ pub mod tests {
     fn it_preserves_layout_after_login_screen() {
         // TODO: This would be better tested with a more complete simulation.
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
@@ -2358,7 +2526,7 @@ pub mod tests {
     #[test]
     fn it_fixes_window_sizes_after_screen_config_changes() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
@@ -2415,7 +2583,7 @@ pub mod tests {
         use super::Command::*;
         use super::Reactor;
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
             frames: vec![CGRect::ZERO],
@@ -2448,7 +2616,7 @@ pub mod tests {
         use super::Reactor;
 
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
             frames: vec![CGRect::ZERO],
@@ -2492,7 +2660,7 @@ pub mod tests {
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
 
         // First reactor: simulate the state before shutdown with three apps running
-        let mut reactor1 = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor1 = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor1.handle_event(ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(space)],
@@ -2559,7 +2727,7 @@ pub mod tests {
 
     #[test]
     fn no_scroll_animation_when_idle() {
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
