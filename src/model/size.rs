@@ -273,9 +273,72 @@ impl Size {
             is_scroll,
             sizes: &mut sizes,
             groups: None,
+            target: None,
+            target_rect: None,
         }
         .visit(root, screen);
         sizes
+    }
+
+    /// Returns the rect the layout assigns to `node`.
+    ///
+    /// `node` must be reachable from `root`.
+    pub(super) fn get_node_rect(
+        &self,
+        map: &NodeMap,
+        window: &super::window::Window,
+        selection: &Selection,
+        config: &Config,
+        root: NodeId,
+        screen: CGRect,
+        is_scroll: bool,
+        node: NodeId,
+    ) -> Option<CGRect> {
+        let mut sizes = vec![];
+        Visitor {
+            map,
+            size: self,
+            window,
+            selection,
+            fullscreen_nodes: &[],
+            config,
+            screen,
+            is_scroll,
+            sizes: &mut sizes,
+            groups: None,
+            target: Some(node),
+            target_rect: None,
+        }
+        .visit(root, screen)
+    }
+
+    /// The extent, along `parent`'s orientation, that one unit of `parent`'s
+    /// total weight is worth in its children's frames.
+    ///
+    /// The inner gaps between children are subtracted first, since they are not
+    /// distributed by weight.
+    pub(super) fn pixels_per_weight(
+        &self,
+        map: &NodeMap,
+        parent: NodeId,
+        parent_rect: CGRect,
+        config: &Config,
+        is_scroll_root: bool,
+    ) -> f64 {
+        let extent = match self.kind(parent).orientation() {
+            Orientation::Horizontal => parent_rect.size.width,
+            Orientation::Vertical => parent_rect.size.height,
+        };
+        let total = self.total(parent);
+        // Mirrors the inputs `Visitor` gives to `solve_sizes`.
+        let available = if is_scroll_root {
+            total * extent
+        } else {
+            extent
+        };
+        let count = parent.children(map).count() as f64;
+        let usable = available - config.settings.inner_gap * (count - 1.0).max(0.0);
+        usable / total
     }
 
     pub(super) fn get_sizes_and_groups(
@@ -305,6 +368,8 @@ impl Size {
             is_scroll,
             sizes: &mut sizes,
             groups: Some(&mut groups),
+            target: None,
+            target_rect: None,
         }
         .visit(root, screen);
         (sizes, groups)
@@ -322,15 +387,19 @@ struct Visitor<'a, 'out> {
     is_scroll: bool,
     sizes: &'out mut Vec<(WindowId, CGRect)>,
     groups: Option<&'out mut Vec<GroupBarInfo>>,
+    /// If set, the rect assigned to this node is recorded in `target_rect`.
+    target: Option<NodeId>,
+    target_rect: Option<CGRect>,
 }
 
 impl<'a, 'out> Visitor<'a, 'out> {
-    fn visit(mut self, root: NodeId, rect: CGRect) {
+    fn visit(mut self, root: NodeId, rect: CGRect) -> Option<CGRect> {
         // Usually this should be false, except in the uncommon case where root
         // is fullscreen.
         let parent_visible = self.fullscreen_nodes.contains(&root);
         let rect = rect.inset(self.config.settings.outer_gap);
         self.visit_node(root, rect, true, parent_visible, true);
+        self.target_rect
     }
 
     fn visit_node(
@@ -347,6 +416,10 @@ impl<'a, 'out> Visitor<'a, 'out> {
         } else {
             rect
         };
+
+        if self.target == Some(node) {
+            self.target_rect = Some(rect);
+        }
 
         if let Some(wid) = self.window.at(node) {
             debug_assert!(

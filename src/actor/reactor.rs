@@ -1189,7 +1189,7 @@ pub mod tests {
     #[test]
     fn it_ignores_stale_resize_events() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
@@ -1221,7 +1221,7 @@ pub mod tests {
     fn it_sends_layout_animation_to_manager() {
         let mut apps = Apps::new();
         let (mut reactor, mut animation_rx) =
-            Reactor::new_for_test_with_animation(LayoutManager::new(), true);
+            Reactor::new_for_test_with_animation(LayoutManager::new_for_test(), true);
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
@@ -1248,7 +1248,7 @@ pub mod tests {
         use LayoutCommand::ToggleWindowFloating;
 
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let wid = WindowId::new(1, 1);
@@ -1304,7 +1304,7 @@ pub mod tests {
 
         let mut apps = Apps::new();
         let (mut reactor, mut animation_rx) =
-            Reactor::new_for_test_with_animation(LayoutManager::new(), true);
+            Reactor::new_for_test_with_animation(LayoutManager::new_for_test(), true);
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let wid = WindowId::new(1, 1);
@@ -1339,7 +1339,7 @@ pub mod tests {
     #[test]
     fn it_sends_writes_when_stale_read_state_looks_same_as_written_state() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
@@ -1378,7 +1378,7 @@ pub mod tests {
     #[test]
     fn sends_writes_same_as_last_written_state_if_changed_externally() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
@@ -1421,7 +1421,7 @@ pub mod tests {
     #[test]
     fn it_responds_to_resizes() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
@@ -1470,7 +1470,7 @@ pub mod tests {
     #[test]
     fn it_manages_windows_on_enabled_spaces() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
@@ -1493,7 +1493,7 @@ pub mod tests {
     #[test]
     fn it_selects_the_main_window_on_space_enable() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let ws_info = (1..=2)
             .map(|id| WindowServerInfo {
@@ -1539,7 +1539,7 @@ pub mod tests {
     #[test]
     fn it_surfaces_on_screen_change_when_the_snapshot_is_empty() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1567,7 +1567,7 @@ pub mod tests {
     #[test]
     fn it_surfaces_on_screen_change_when_the_snapshot_omits_the_windows() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1603,7 +1603,7 @@ pub mod tests {
     #[test]
     fn it_skips_surface_on_screen_change_when_top_layer_order_matches() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1645,7 +1645,7 @@ pub mod tests {
     #[test]
     fn it_surfaces_on_screen_change_when_another_window_is_in_front() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1687,7 +1687,7 @@ pub mod tests {
     #[test]
     fn it_skips_surface_when_top_layer_order_matches() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1726,7 +1726,7 @@ pub mod tests {
     #[test]
     fn it_skips_surface_when_top_layer_windows_are_reordered() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1766,7 +1766,7 @@ pub mod tests {
     #[test]
     fn it_surfaces_top_layer_windows_when_top_managed_set_differs() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1818,7 +1818,7 @@ pub mod tests {
 
     #[test]
     fn filter_response_clears_matching_focus_and_raise_windows() {
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.screens = vec![Screen {
             frame: CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.)),
             space: Some(SpaceId::new(1)),
@@ -1888,7 +1888,7 @@ pub mod tests {
 
     #[test]
     fn filter_response_keeps_response_when_focus_is_not_frontmost() {
-        let reactor = Reactor::new_for_test(LayoutManager::new());
+        let reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let w1 = WindowId::with_wsid(1, WindowServerId::new(1));
         let w2 = WindowId::with_wsid(1, WindowServerId::new(2));
 
@@ -1908,7 +1908,7 @@ pub mod tests {
     #[test]
     fn it_ignores_unmanaged_and_nonzero_layer_windows_when_comparing_space_order() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
@@ -1958,7 +1958,7 @@ pub mod tests {
     #[test]
     fn it_ignores_windows_on_disabled_spaces() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
@@ -1987,7 +1987,7 @@ pub mod tests {
     #[test]
     fn it_keeps_discovered_windows_on_their_initial_screen() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
@@ -2016,7 +2016,7 @@ pub mod tests {
     #[test]
     fn it_moves_windows_dragged_between_spaces() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
         let space1 = SpaceId::new(1);
@@ -2093,7 +2093,7 @@ pub mod tests {
     #[test]
     fn it_keeps_windows_in_space_on_intra_space_drag() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
         let space1 = SpaceId::new(1);
@@ -2145,7 +2145,7 @@ pub mod tests {
     #[test]
     fn it_ignores_windows_on_nonzero_layers() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
@@ -2183,7 +2183,7 @@ pub mod tests {
     #[test]
     fn handle_layout_response_groups_windows_by_app_and_screen() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
 
@@ -2241,7 +2241,7 @@ pub mod tests {
     #[test]
     fn handle_layout_response_includes_handles_for_raise_and_focus_windows() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
         reactor.raise_manager_tx = raise_manager_tx;
 
@@ -2269,7 +2269,7 @@ pub mod tests {
     fn it_preserves_layout_after_login_screen() {
         // TODO: This would be better tested with a more complete simulation.
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
@@ -2358,7 +2358,7 @@ pub mod tests {
     #[test]
     fn it_fixes_window_sizes_after_screen_config_changes() {
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
@@ -2415,7 +2415,7 @@ pub mod tests {
         use super::Command::*;
         use super::Reactor;
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
             frames: vec![CGRect::ZERO],
@@ -2448,7 +2448,7 @@ pub mod tests {
         use super::Reactor;
 
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
             frames: vec![CGRect::ZERO],
@@ -2492,7 +2492,7 @@ pub mod tests {
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
 
         // First reactor: simulate the state before shutdown with three apps running
-        let mut reactor1 = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor1 = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor1.handle_event(ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(space)],
@@ -2559,7 +2559,7 @@ pub mod tests {
 
     #[test]
     fn no_scroll_animation_when_idle() {
-        let mut reactor = Reactor::new_for_test(LayoutManager::new());
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
