@@ -207,6 +207,18 @@ unsafe extern "C" {
     ) -> accessibility_sys::AXError;
 }
 
+/// Returns the process the window server considers frontmost.
+///
+/// Returns None if the window server could not be asked.
+pub fn get_front_process_pid() -> Option<pid_t> {
+    let mut psn = ProcessSerialNumber::default();
+    // SAFETY: The out parameter is a valid pointer.
+    if unsafe { _SLPSGetFrontProcess(&mut psn) } != 0 {
+        return None;
+    }
+    psn.pid().ok()
+}
+
 /// Returns the process the window server routes keyboard events to.
 ///
 /// This is not always the frontmost process. A non-activating panel, like the
@@ -261,6 +273,8 @@ unsafe extern "C" {
     ) -> CGError;
 
     fn SLPSPostEventRecordTo(psn: *const ProcessSerialNumber, bytes: *const u8) -> CGError;
+
+    fn _SLPSGetFrontProcess(psn: *mut ProcessSerialNumber) -> CGError;
 
     /// Reads the process the window server routes keyboard events to. The
     /// second parameter is an out flag that is 1 when that process is the

@@ -7,7 +7,7 @@ use std::env::VarError;
 use std::future::Future;
 use std::path::PathBuf;
 use std::ptr::{self, NonNull};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use accessibility::{AXUIElement, AXUIElementAttributes};
 use accessibility_sys::pid_t;
@@ -21,7 +21,9 @@ use glide_wm::sys::screen::{self, ScreenCache};
 use glide_wm::sys::window_server::{self, WindowServerId, get_window};
 use glide_wm::sys::{self};
 use livesplit_hotkey::{ConsumePreference, Modifiers};
-use objc2_app_kit::{NSRunningApplication, NSScreen, NSWindow, NSWindowNumberListOptions};
+use objc2_app_kit::{
+    NSRunningApplication, NSScreen, NSWindow, NSWindowNumberListOptions, NSWorkspace,
+};
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{
     CGDisplayBounds, CGMainDisplayID, CGWindowID, CGWindowListCopyWindowInfo, CGWindowListOption,
@@ -58,6 +60,14 @@ enum Command {
     Mouse(Mouse),
     #[command()]
     Inspect,
+    /// Print every signal the system exposes about which app and window has
+    /// keyboard focus, whenever one of them changes.
+    #[command()]
+    Focus {
+        /// Sampling interval in milliseconds.
+        #[arg(long, default_value_t = 200)]
+        interval_ms: u64,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -275,8 +285,180 @@ async fn main() -> anyhow::Result<()> {
             std::io::stdin().read_line(&mut String::new())?;
         }
         Command::Inspect => inspect(MainThreadMarker::new().unwrap()),
+        Command::Focus { interval_ms } => watch_focus(Duration::from_millis(interval_ms)),
     }
     Ok(())
+}
+
+/// Polls each source of "what has keyboard focus" and prints them when any of
+/// them changes.
+fn watch_focus(interval: Duration) {
+    use core_foundation::runloop::{CFRunLoop, kCFRunLoopDefaultMode};
+
+    let system_wide = AXUIElement::system_wide();
+    // A hung app must not stall the probe.
+    _ = system_wide.set_messaging_timeout(0.25);
+    let workspace = NSWorkspace::sharedWorkspace();
+
+    println!("Watching focus. Open Spotlight, a launcher, a menu, etc. Ctrl-C to exit.");
+    let start = Instant::now();
+    let mut last = String::new();
+    let mut query_times = Vec::new();
+    let mut last_summary = Instant::now();
+    loop {
+        let (sample, timings) = sample_focus(&workspace, &system_wide);
+        query_times.push(timings.ax_query);
+        if sample != last {
+            println!(
+                "\n[{:>7.2}s] (sls.key_focus {:.2}ms, ax.focus_query {:.2}ms)\n{sample}",
+                start.elapsed().as_secs_f64(),
+                timings.key_focus.as_secs_f64() * 1000.,
+                timings.ax_query.as_secs_f64() * 1000.,
+            );
+            last = sample;
+        }
+        if last_summary.elapsed() > Duration::from_secs(5) {
+            query_times.sort();
+            println!(
+                "ax.focus_query over {} samples: min {:.2}ms median {:.2}ms max {:.2}ms",
+                query_times.len(),
+                query_times[0].as_secs_f64() * 1000.,
+                query_times[query_times.len() / 2].as_secs_f64() * 1000.,
+                query_times[query_times.len() - 1].as_secs_f64() * 1000.,
+            );
+            query_times.clear();
+            last_summary = Instant::now();
+        }
+        // NSWorkspace learns about activation from the run loop.
+        CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, interval, false);
+    }
+}
+
+struct Timings {
+    key_focus: Duration,
+    ax_query: Duration,
+}
+
+/// Returns the sample, and how long the window server and accessibility
+/// queries took. The timings are separate so that they don't count as a change
+/// in the sample.
+fn sample_focus(workspace: &NSWorkspace, system_wide: &AXUIElement) -> (String, Timings) {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let app = |app: Option<objc2::rc::Retained<NSRunningApplication>>| match app {
+        None => "<none>".to_string(),
+        Some(app) => describe_pid(app.pid()),
+    };
+    _ = writeln!(
+        out,
+        "  ws.frontmost      = {}",
+        app(workspace.frontmostApplication())
+    );
+    _ = writeln!(
+        out,
+        "  ws.menu_bar_owner = {}",
+        app(workspace.menuBarOwningApplication())
+    );
+    let pid = |pid: Option<pid_t>| match pid {
+        None => "<error>".to_string(),
+        Some(pid) => describe_pid(pid),
+    };
+    _ = writeln!(
+        out,
+        "  sls.front_process = {}",
+        pid(window_server::get_front_process_pid())
+    );
+    let sls_start = Instant::now();
+    let key_focus = window_server::get_key_focus_pid();
+    let sls_time = sls_start.elapsed();
+    _ = writeln!(out, "  sls.key_focus     = {}", pid(key_focus));
+
+    // The chain a real implementation would use to answer "which window has
+    // keyboard focus", timed on its own.
+    let ax_start = Instant::now();
+    let focused_wsid = system_wide
+        .focused_application()
+        .and_then(|app| app.focused_window())
+        .and_then(|window| Ok(WindowServerId::try_from(&*window)?));
+    let ax_time = ax_start.elapsed();
+    _ = writeln!(
+        out,
+        "  ax.focus_query    = {}",
+        match focused_wsid {
+            Ok(wsid) => format!("wsid={}", wsid.as_u32()),
+            Err(e) => format!("<error: {e}>"),
+        }
+    );
+
+    match system_wide.focused_application() {
+        Err(e) => _ = writeln!(out, "  ax.focused_app    = <error: {e}>"),
+        Ok(focused_app) => {
+            _ = writeln!(
+                out,
+                "  ax.focused_app    = {} (AXFrontmost {})",
+                match focused_app.pid() {
+                    Ok(pid) => describe_pid(pid),
+                    Err(e) => format!("<error: {e}>"),
+                },
+                focused_app
+                    .frontmost()
+                    .map(|b| b.value().to_string())
+                    .unwrap_or_else(|e| format!("<error: {e}>")),
+            );
+            _ = writeln!(
+                out,
+                "  ax.focused_window = {}",
+                describe_window(focused_app.focused_window())
+            );
+            _ = writeln!(
+                out,
+                "  ax.main_window    = {}",
+                describe_window(focused_app.main_window())
+            );
+        }
+    }
+    let focused_element_window = system_wide.focused_ui_element().and_then(|elem| elem.window());
+    _ = writeln!(
+        out,
+        "  ax.focused_elem   = {}",
+        describe_window(focused_element_window)
+    );
+    (
+        out,
+        Timings {
+            key_focus: sls_time,
+            ax_query: ax_time,
+        },
+    )
+}
+
+fn describe_pid(pid: pid_t) -> String {
+    let bundle_id = NSRunningApplication::with_process_id(pid)
+        .and_then(|app| app.bundle_id())
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "<no bundle id>".to_string());
+    format!("{pid} {bundle_id}")
+}
+
+fn describe_window(window: Result<CFRetained<AXUIElement>, accessibility::Error>) -> String {
+    let window = match window {
+        Ok(window) => window,
+        Err(e) => return format!("<error: {e}>"),
+    };
+    let attr = |value: Result<CFRetained<objc2_core_foundation::CFString>, _>| {
+        value.map(|v| v.to_string()).unwrap_or_else(|_| "<none>".to_string())
+    };
+    let wsid = WindowServerId::try_from(&*window);
+    let level = wsid.as_ref().ok().and_then(|id| get_window(*id)).map(|info| info.layer);
+    format!(
+        "wsid={} level={} role={}/{} title={:?}",
+        wsid.map(|id| id.as_u32().to_string()).unwrap_or_else(|_| "<none>".to_string()),
+        level.map(|l| l.to_string()).unwrap_or_else(|| "<none>".to_string()),
+        attr(window.role()),
+        attr(window.subrole()),
+        attr(window.title()),
+    )
 }
 
 async fn run_app_actor(pid_or_bundle: String) -> anyhow::Result<()> {

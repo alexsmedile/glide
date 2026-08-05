@@ -4,14 +4,18 @@
 //! Interfaces to macOS APIs for interacting with other applications.
 
 use std::fmt::{Debug, Formatter};
+use std::ptr::NonNull;
 
-use accessibility::{AXAttribute, AXError, AXUIElement, AXUIElementAttributes};
+use accessibility::{AXAttribute, AXAttributeValue, AXError, AXUIElement, AXUIElementAttributes};
 pub use accessibility_sys::pid_t;
-use accessibility_sys::{kAXStandardWindowSubrole, kAXWindowRole};
+use accessibility_sys::{
+    kAXFocusedApplicationAttribute, kAXFocusedUIElementAttribute, kAXStandardWindowSubrole,
+    kAXWindowRole,
+};
 use objc2::rc::Retained;
 use objc2::{class, msg_send};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
-use objc2_core_foundation::{CFBoolean, CFString, CFType, CGRect};
+use objc2_core_foundation::{CFBoolean, CFRetained, CFString, CFType, CGRect};
 use objc2_foundation::NSString;
 use redact::Secret;
 use serde::{Deserialize, Serialize};
@@ -137,6 +141,20 @@ pub trait AXUIElementExt {
     fn enhanced_user_interface(&self) -> Result<bool, accessibility::Error>;
     fn set_enhanced_user_interface(&self, enabled: bool) -> Result<(), accessibility::Error>;
 
+    /// The process the element belongs to.
+    fn pid(&self) -> Result<pid_t, accessibility::Error>;
+
+    /// The application with keyboard focus, which is only available on the
+    /// system-wide element.
+    ///
+    /// This follows keyboard focus and not the frontmost application, so it
+    /// points at a non-activating panel like Spotlight's while one is open.
+    fn focused_application(&self) -> Result<CFRetained<AXUIElement>, accessibility::Error>;
+
+    /// The element with keyboard focus, which is only available on the
+    /// system-wide element.
+    fn focused_ui_element(&self) -> Result<CFRetained<AXUIElement>, accessibility::Error>;
+
     fn privacy_sensitive_inspect(&self) -> Inspect<'_>;
 }
 
@@ -148,6 +166,26 @@ impl AXUIElementExt for AXUIElement {
         self.set_attribute(&enhanced_ui(), CFBoolean::new(enabled))
     }
 
+    fn pid(&self) -> Result<pid_t, accessibility::Error> {
+        let mut pid = 0;
+        // SAFETY: The out parameter is a valid pointer.
+        let res = unsafe { self.as_sys().pid(NonNull::from(&mut pid)) };
+        if let Some(err) = AXError::from_raw(res) {
+            return Err(accessibility::Error::Ax(err));
+        }
+        Ok(pid)
+    }
+
+    fn focused_application(&self) -> Result<CFRetained<AXUIElement>, accessibility::Error> {
+        AXUIElement::downcast(
+            self.attribute(&system_wide_attribute(kAXFocusedApplicationAttribute))?,
+        )
+    }
+
+    fn focused_ui_element(&self) -> Result<CFRetained<AXUIElement>, accessibility::Error> {
+        AXUIElement::downcast(self.attribute(&system_wide_attribute(kAXFocusedUIElementAttribute))?)
+    }
+
     fn privacy_sensitive_inspect(&self) -> Inspect<'_> {
         Inspect(self)
     }
@@ -155,6 +193,10 @@ impl AXUIElementExt for AXUIElement {
 
 fn enhanced_ui() -> AXAttribute<CFType> {
     AXAttribute::new(&CFString::from_static_str("AXEnhancedUserInterface"))
+}
+
+fn system_wide_attribute(name: &'static str) -> AXAttribute<CFType> {
+    AXAttribute::new(&CFString::from_static_str(name))
 }
 
 pub struct Inspect<'a>(&'a AXUIElement);
