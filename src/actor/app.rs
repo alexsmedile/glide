@@ -43,7 +43,7 @@ use tracing::{Instrument, Span, debug, error, info, info_span, instrument, trace
 
 use crate::actor::reactor::{Event, Requested, TransactionId};
 use crate::actor::{window_server, wm_controller};
-use crate::collections::HashMap;
+use crate::collections::{HashMap, HashSet};
 use crate::sys::app::{AXUIElementExt, NSRunningApplicationExt, ProcessInfo};
 pub use crate::sys::app::{AppInfo, WindowInfo, pid_t};
 use crate::sys::event;
@@ -418,6 +418,27 @@ impl State {
         info: AppInfo,
         _startup: Option<wm_controller::StartupToken>,
     ) -> bool {
+        static IGNORE_APPS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+            const APPS: &[&str] = &[
+                "com.apple.AuthenticationServicesCore.AuthenticationServicesAgent",
+                "com.apple.WindowManager",
+                "com.apple.chronod",
+                "com.apple.dock",
+                "com.apple.universalcontrol",
+            ];
+            let mut set = HashSet::default();
+            for app in APPS {
+                set.insert(*app);
+            }
+            set
+        });
+        if let Some(id) = info.bundle_id.as_deref()
+            && IGNORE_APPS.contains(id)
+        {
+            debug!(?self.pid, ?info, "Ignoring known app");
+            return false;
+        }
+
         if !self.register_app_notifs(&info) {
             info!(?self.pid, ?info,"Failed to register app notifications");
             return false;
@@ -1367,7 +1388,7 @@ fn trace<T>(
 }
 
 thread_local! {
-    static WARNINGS_SEEN: RefCell<crate::collections::HashSet<(&'static str, String)>> = RefCell::new(Default::default());
+    static WARNINGS_SEEN: RefCell<HashSet<(&'static str, String)>> = RefCell::new(Default::default());
 }
 
 /// Converts AXError::NoValue to None.
