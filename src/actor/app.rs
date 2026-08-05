@@ -504,7 +504,7 @@ impl State {
                     Duration::from_secs(60)
                 }
 
-                _ => Duration::ZERO,
+                _ => Duration::from_secs(2),
             };
         let mut sleep_dur = Duration::from_millis(20);
         let mut sleep = || {
