@@ -39,11 +39,11 @@ use tokio::sync::mpsc::{
 use tokio::sync::oneshot;
 use tokio::{join, select};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
+use tracing::{Instrument, Span, debug, error, info, info_span, instrument, trace, warn};
 
 use crate::actor::reactor::{Event, Requested, TransactionId};
 use crate::actor::{window_server, wm_controller};
-use crate::collections::HashMap;
+use crate::collections::{HashMap, HashSet};
 use crate::sys::app::{AXUIElementExt, NSRunningApplicationExt, ProcessInfo};
 pub use crate::sys::app::{AppInfo, WindowInfo, pid_t};
 use crate::sys::event;
@@ -411,7 +411,6 @@ impl State {
         }
     }
 
-    #[instrument(skip_all, fields(?info))]
     #[must_use]
     fn init(
         &mut self,
@@ -419,10 +418,33 @@ impl State {
         info: AppInfo,
         _startup: Option<wm_controller::StartupToken>,
     ) -> bool {
-        if !self.register_app_notifs(&info) {
-            debug!("Failed to register for app notifications");
+        static IGNORE_APPS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+            const APPS: &[&str] = &[
+                "com.apple.AuthenticationServicesCore.AuthenticationServicesAgent",
+                "com.apple.WindowManager",
+                "com.apple.chronod",
+                "com.apple.dock",
+                "com.apple.universalcontrol",
+            ];
+            let mut set = HashSet::default();
+            for app in APPS {
+                set.insert(*app);
+            }
+            set
+        });
+        if let Some(id) = info.bundle_id.as_deref()
+            && IGNORE_APPS.contains(id)
+        {
+            debug!(?self.pid, ?info, "Ignoring known app");
             return false;
         }
+
+        if !self.register_app_notifs(&info) {
+            info!(?self.pid, ?info,"Failed to register app notifications");
+            return false;
+        }
+
+        let _span = info_span!("init", ?info).entered();
 
         // Now that we will observe new window events, read the list of windows.
         let Ok(initial_window_elements) = self.app.windows() else {
@@ -467,16 +489,22 @@ impl State {
     fn register_app_notifs(&mut self, info: &AppInfo) -> bool {
         // Some apps do not respond to AX requests on startup. For these we
         // implement exponential backoff with a timeout.
-        let extended_timeout_prefixes = ["com.jetbrains.", "org.gnu.Emacs"];
+        const EXTENDED_TIMEOUT_PREFIXES: &[&str] = &[
+            "com.apple.dt.Xcode",
+            "com.google.android.studio",
+            "com.jetbrains.",
+            "com.microsoft.teams",
+            "org.gnu.Emacs",
+        ];
         let timeout = Instant::now()
             + match info.bundle_id.as_deref() {
                 Some(id)
-                    if extended_timeout_prefixes.iter().any(|prefix| id.starts_with(prefix)) =>
+                    if EXTENDED_TIMEOUT_PREFIXES.iter().any(|prefix| id.starts_with(prefix)) =>
                 {
                     Duration::from_secs(60)
                 }
 
-                _ => Duration::ZERO,
+                _ => Duration::from_secs(2),
             };
         let mut sleep_dur = Duration::from_millis(20);
         let mut sleep = || {
@@ -1242,7 +1270,7 @@ fn app_thread_main(
         // extra work and noise. Worse, Apple's QuickLookUIService reports
         // having standard windows (these seem to be for Finder previews), but
         // they are non-standard and unmanageable.
-        info!(?pid, ?bundle_id, "Filtering out XPC process");
+        debug!(?pid, ?bundle_id, "Filtering out XPC process");
         return;
     }
 
@@ -1360,7 +1388,7 @@ fn trace<T>(
 }
 
 thread_local! {
-    static WARNINGS_SEEN: RefCell<crate::collections::HashSet<(&'static str, String)>> = RefCell::new(Default::default());
+    static WARNINGS_SEEN: RefCell<HashSet<(&'static str, String)>> = RefCell::new(Default::default());
 }
 
 /// Converts AXError::NoValue to None.
