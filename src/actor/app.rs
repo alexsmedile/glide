@@ -39,7 +39,7 @@ use tokio::sync::mpsc::{
 use tokio::sync::oneshot;
 use tokio::{join, select};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
+use tracing::{Instrument, Span, debug, error, info, info_span, instrument, trace, warn};
 
 use crate::actor::reactor::{Event, Requested, TransactionId};
 use crate::actor::{window_server, wm_controller};
@@ -411,7 +411,6 @@ impl State {
         }
     }
 
-    #[instrument(skip_all, fields(?info))]
     #[must_use]
     fn init(
         &mut self,
@@ -420,9 +419,11 @@ impl State {
         _startup: Option<wm_controller::StartupToken>,
     ) -> bool {
         if !self.register_app_notifs(&info) {
-            debug!("Failed to register for app notifications");
+            info!(?self.pid, ?info,"Failed to register app notifications");
             return false;
         }
+
+        let _span = info_span!("init", ?info).entered();
 
         // Now that we will observe new window events, read the list of windows.
         let Ok(initial_window_elements) = self.app.windows() else {
@@ -1248,7 +1249,7 @@ fn app_thread_main(
         // extra work and noise. Worse, Apple's QuickLookUIService reports
         // having standard windows (these seem to be for Finder previews), but
         // they are non-standard and unmanageable.
-        info!(?pid, ?bundle_id, "Filtering out XPC process");
+        debug!(?pid, ?bundle_id, "Filtering out XPC process");
         return;
     }
 
