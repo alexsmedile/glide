@@ -233,6 +233,15 @@ impl ProcessSerialNumber {
             Err(())
         }
     }
+
+    pub(super) fn pid(&self) -> Result<pid_t, ()> {
+        let mut pid = 0;
+        if unsafe { GetProcessPID(self, &mut pid) } == 0 {
+            Ok(pid)
+        } else {
+            Err(())
+        }
+    }
 }
 
 type OSErr = i16;
@@ -242,6 +251,9 @@ type OSStatus = i32;
 unsafe extern "C" {
     // Deprecated in macOS 10.9.
     fn GetProcessForPID(pid: pid_t, psn: *mut ProcessSerialNumber) -> OSStatus;
+
+    // Deprecated in macOS 10.9.
+    fn GetProcessPID(psn: *const ProcessSerialNumber, pid: *mut pid_t) -> OSStatus;
 
     // Deprecated in macOS 10.9.
     fn GetProcessInformation(psn: *const ProcessSerialNumber, info: *mut ProcessInfoRec) -> OSErr;

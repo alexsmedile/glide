@@ -156,7 +156,11 @@ pub enum Event {
     MouseUp,
     /// The mouse cursor moved over a new window. Only sent if focus-follows-
     /// mouse is enabled.
-    MouseMovedOverWindow(WindowServerId),
+    ///
+    /// The second field is the process the window server was routing keyboard
+    /// events to when the mouse moved, if it could be read. It is read in the
+    /// mouse actor so it describes the same moment as the mouse position.
+    MouseMovedOverWindow(WindowServerId, Option<pid_t>),
 
     /// A raise request completed. Used by the raise manager to track when
     /// all raise requests in a sequence have finished.
@@ -743,7 +747,7 @@ impl Reactor {
                 self.resizing_window = None;
                 // Now re-check the layout.
             }
-            Event::MouseMovedOverWindow(wsid) => {
+            Event::MouseMovedOverWindow(wsid, key_focus_pid) => {
                 let Some(&wid) = self.window_ids.get(&wsid) else { return };
                 let Some(window) = self.windows.get(&wid) else { return };
                 let Some(to_space) = self.best_space_for_window(&window.frame_monotonic) else {
@@ -754,9 +758,25 @@ impl Reactor {
                     (Some(space), Some(id)) => Some((space, id)),
                     _ => None,
                 };
+                // Spotlight and similar apps can take keyboard focus without
+                // activating, which leaves the main window unchanged. We don't
+                // manage these windows and should avoid stealing focus from them.
+                if let Some(key_focus_pid) = key_focus_pid
+                    && current_main.is_some_and(|(_, main)| main.pid != key_focus_pid)
+                {
+                    debug!(
+                        ?key_focus_pid,
+                        ?current_main,
+                        "Ignoring mouse move; keyboard focus is elsewhere"
+                    );
+                    return;
+                }
                 self.send_layout_event_with_context(
                     LayoutEvent::MouseMovedOverWindow {
                         over: (to_space, wid),
+                        // TODO: Track focused window and use it here rather
+                        // than main, to avoid stealing focus from a panel (of
+                        // the main app; otherwise we would have returned above).
                         current_main,
                     },
                     ResponseContext {
@@ -2672,6 +2692,60 @@ pub mod tests {
             panic!("unexpected raise event: {event:?}");
         };
         assert_eq!(focus_window.map(|(wid, _)| wid), Some(WindowId::new(1, 2)));
+    }
+
+    #[test]
+    fn it_follows_the_mouse_only_when_the_main_window_has_keyboard_focus() {
+        use Event::*;
+
+        let mut apps = Apps::new();
+        let space = SpaceId::new(1);
+        let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        reactor.handle_event(ScreenParametersChanged {
+            frames: vec![full_screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_event(ApplicationGloballyActivated(1));
+        reactor.handle_events(apps.make_app_with_opts(
+            1,
+            make_windows(2),
+            Some(WindowId::new(1, 1)),
+            true,
+        ));
+        reactor.handle_events(apps.simulate_events());
+        assert_eq!(reactor.main_window(), Some(WindowId::new(1, 1)));
+
+        let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
+        reactor.raise_manager_tx = raise_manager_tx;
+
+        // Another process has keyboard focus, as when Spotlight is open.
+        reactor.handle_event(MouseMovedOverWindow(WindowServerId::new(2), Some(2)));
+        assert!(
+            raise_manager_rx.try_recv().is_err(),
+            "mouse move should be ignored while another process has keyboard focus"
+        );
+
+        // The main window's app has keyboard focus.
+        reactor.handle_event(MouseMovedOverWindow(WindowServerId::new(2), Some(1)));
+        let event = raise_manager_rx
+            .try_recv()
+            .expect("mouse move should produce a raise request")
+            .1;
+        let raise::Event::RaiseRequest(RaiseRequest { focus_window, .. }) = event else {
+            panic!("unexpected raise event: {event:?}");
+        };
+        assert_eq!(focus_window.map(|(wid, _)| wid), Some(WindowId::new(1, 2)));
+
+        // The key focus process could not be read.
+        reactor.handle_event(MouseMovedOverWindow(WindowServerId::new(1), None));
+        assert!(
+            raise_manager_rx.try_recv().is_ok(),
+            "mouse move should be followed when the key focus process is unknown"
+        );
     }
 
     #[test]

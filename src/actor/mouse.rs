@@ -179,7 +179,8 @@ impl Mouse {
                 #[cfg(false)]
                 tracing::trace!("Mouse moved {loc:?}");
                 if let Some(wsid) = state.track_mouse_move(loc.to_icrate(), mtm) {
-                    self.events_tx.send(Event::MouseMovedOverWindow(wsid));
+                    let key_focus_pid = window_server::get_key_focus_pid();
+                    self.events_tx.send(Event::MouseMovedOverWindow(wsid, key_focus_pid));
                 }
             }
             CGEventType::ScrollWheel => {
