@@ -207,6 +207,35 @@ unsafe extern "C" {
     ) -> accessibility_sys::AXError;
 }
 
+/// Returns the process the window server considers frontmost.
+///
+/// Returns None if the window server could not be asked.
+pub fn get_front_process_pid() -> Option<pid_t> {
+    let mut psn = ProcessSerialNumber::default();
+    // SAFETY: The out parameter is a valid pointer.
+    if unsafe { _SLPSGetFrontProcess(&mut psn) } != 0 {
+        return None;
+    }
+    psn.pid().ok()
+}
+
+/// Returns the process the window server routes keyboard events to.
+///
+/// This is not always the frontmost process. A non-activating panel, like the
+/// one Spotlight uses, takes keyboard focus without activating the application
+/// it belongs to.
+///
+/// Returns None if the window server could not be asked.
+pub fn get_key_focus_pid() -> Option<pid_t> {
+    let mut psn = ProcessSerialNumber::default();
+    let mut is_front = 0;
+    // SAFETY: Both out parameters are valid pointers.
+    if unsafe { SLPSGetKeyFocusProcess(&mut psn, &mut is_front) } != 0 {
+        return None;
+    }
+    psn.pid().ok()
+}
+
 /// Set the key window of the window server and application.
 pub fn make_key_window(pid: pid_t, wsid: WindowServerId) -> Result<(), ()> {
     // See https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468.
@@ -244,6 +273,13 @@ unsafe extern "C" {
     ) -> CGError;
 
     fn SLPSPostEventRecordTo(psn: *const ProcessSerialNumber, bytes: *const u8) -> CGError;
+
+    fn _SLPSGetFrontProcess(psn: *mut ProcessSerialNumber) -> CGError;
+
+    /// Reads the process the window server routes keyboard events to. The
+    /// second parameter is an out flag that is 1 when that process is the
+    /// front process.
+    fn SLPSGetKeyFocusProcess(psn: *mut ProcessSerialNumber, is_front: *mut u8) -> CGError;
 
     // safe fn SLSMainConnectionID() -> SLSConnectionID;
     safe fn SLSDefaultConnectionForThread() -> SLSConnectionID;
