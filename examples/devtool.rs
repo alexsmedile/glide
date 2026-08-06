@@ -3,22 +3,26 @@
 
 //! This tool is used to exercise glide and system APIs during development.
 
+use std::cell::{Cell, RefCell};
 use std::env::VarError;
 use std::future::Future;
 use std::path::PathBuf;
 use std::ptr::{self, NonNull};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use accessibility::{AXUIElement, AXUIElementAttributes};
 use accessibility_sys::pid_t;
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use glide_wm::actor::{self, reactor};
 use glide_wm::sys::app::{AXUIElementExt, AppInfo, NSRunningApplicationExt, WindowInfo};
 use glide_wm::sys::event::{self, get_mouse_pos};
 use glide_wm::sys::executor::Executor;
 use glide_wm::sys::screen::{self, ScreenCache};
-use glide_wm::sys::window_server::{self, WindowServerId, get_window};
+use glide_wm::sys::window_server::{
+    self, SkylightConnection, WindowServerId, get_window, kCGSWindowCreated,
+};
 use glide_wm::sys::{self};
 use livesplit_hotkey::{ConsumePreference, Modifiers};
 use objc2_app_kit::{
@@ -111,6 +115,49 @@ enum WindowServer {
     },
     #[command()]
     Get { id: u32 },
+    /// Subscribe to a range of window server notification events and print
+    /// each one as it arrives, to find which event a system action produces.
+    #[command()]
+    Watch {
+        #[arg(long, default_value_t = 1)]
+        from: u32,
+        #[arg(long, default_value_t = 2000)]
+        to: u32,
+        /// Events to leave unregistered, for when one of them is noisy.
+        #[arg(long, value_delimiter = ',')]
+        skip: Vec<u32>,
+        /// Which windows to request notifications for.
+        #[arg(long, value_enum, default_value_t = NotifyWindows::All)]
+        windows: NotifyWindows,
+        /// Additional window ids to request notifications for.
+        #[arg(long, value_delimiter = ',')]
+        window: Vec<u32>,
+    },
+}
+
+/// Which windows to request notifications for. Most per-window events are only
+/// delivered for windows the connection has requested; a few, notably window
+/// creation, arrive for every window either way.
+#[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
+enum NotifyWindows {
+    /// Only the windows named by --window.
+    None,
+    /// Windows that are on screen when the command starts.
+    Existing,
+    /// Windows created while the command runs.
+    New,
+    /// Both existing and new windows.
+    All,
+}
+
+impl NotifyWindows {
+    fn existing(self) -> bool {
+        matches!(self, NotifyWindows::Existing | NotifyWindows::All)
+    }
+
+    fn new(self) -> bool {
+        matches!(self, NotifyWindows::New | NotifyWindows::All)
+    }
 }
 
 #[derive(Parser, Clone)]
@@ -243,6 +290,20 @@ async fn main() -> anyhow::Result<()> {
                 None => println!("Could not find window {id}"),
             }
         }
+        Command::WindowServer(WindowServer::Watch {
+            from,
+            to,
+            skip,
+            windows,
+            window,
+        }) => watch_notifications(
+            from,
+            to,
+            &skip,
+            windows,
+            &window,
+            MainThreadMarker::new().unwrap(),
+        ),
         Command::Replay(Replay { path }) => {
             reactor::replay(&path, |_span, request| {
                 info!(?request);
@@ -288,6 +349,101 @@ async fn main() -> anyhow::Result<()> {
         Command::Focus { interval_ms } => watch_focus(Duration::from_millis(interval_ms)),
     }
     Ok(())
+}
+
+/// Subscribes to every window server notification event in a range and prints
+/// them as they arrive.
+fn watch_notifications(
+    from: u32,
+    to: u32,
+    skip: &[u32],
+    windows: NotifyWindows,
+    extra_windows: &[u32],
+    mtm: MainThreadMarker,
+) {
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+
+    // Notifications are only delivered once AppKit is running its event loop.
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
+
+    let connection = Rc::new(RefCell::new(SkylightConnection::new(mtm)));
+    let requested = Rc::new(Cell::new(0));
+    let request = {
+        let (connection, requested) = (connection.clone(), requested.clone());
+        move |wsid: WindowServerId| match connection.borrow_mut().add_window(wsid) {
+            Ok(()) => requested.set(requested.get() + 1),
+            Err(e) => println!("Could not request notifications for {wsid:?}: {e}"),
+        }
+    };
+
+    for window in extra_windows {
+        request(WindowServerId::new(*window));
+    }
+    if windows.existing() {
+        for window in window_server::get_visible_window_ids() {
+            request(window);
+        }
+    }
+    let new_window_notifier = windows.new().then(|| {
+        window_server::on_global_event(kCGSWindowCreated, move |_, data| {
+            if let Some(wsid) = notification_window(data) {
+                request(wsid);
+            }
+        })
+        .expect("Subscribing to window creation")
+    });
+
+    let start = Instant::now();
+    let print = move |source: &str, event: u32, data: &[u8]| {
+        let bytes = data.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let window = match notification_window(data) {
+            Some(wsid) => wsid.as_u32().to_string(),
+            None => "-".to_string(),
+        };
+        println!(
+            "[{:>7.2}s] {source} event={event} window={window} len={} bytes={bytes}",
+            start.elapsed().as_secs_f64(),
+            data.len(),
+        );
+    };
+    let mut notifiers = Vec::new();
+    let mut connection_notifiers = Vec::new();
+    for event in from..=to {
+        if skip.contains(&event) {
+            continue;
+        }
+        if let Ok(notifier) =
+            window_server::on_global_event(event, move |event, data| print("global", event, data))
+        {
+            notifiers.push(notifier);
+        }
+        if let Ok(notifier) = connection
+            .borrow()
+            .on_event(event, move |event, data| print("connection", event, data))
+        {
+            connection_notifiers.push(notifier);
+        }
+    }
+    println!(
+        "Subscribed to {} global and {} connection events in {from}..={to}, \
+         requesting notifications for {} window(s){}. Ctrl-C to exit.",
+        notifiers.len(),
+        connection_notifiers.len(),
+        requested.get(),
+        if new_window_notifier.is_some() {
+            " plus new ones"
+        } else {
+            ""
+        },
+    );
+    app.run();
+}
+
+/// Reads the window id out of a notification payload that carries one.
+fn notification_window(data: &[u8]) -> Option<WindowServerId> {
+    let id = u32::from_ne_bytes(<[u8; 4]>::try_from(data).ok()?);
+    Some(WindowServerId::new(id))
 }
 
 /// Polls each source of "what has keyboard focus" and prints them when any of
