@@ -326,6 +326,11 @@ impl LayoutTree {
             .find(|node| node.ancestors(self.map()).last() == Some(root))
     }
 
+    /// Whether the window is in any layout.
+    pub fn has_window(&self, wid: WindowId) -> bool {
+        self.tree.data.window.nodes_for(wid).next().is_some()
+    }
+
     pub fn window_at(&self, node: NodeId) -> Option<WindowId> {
         self.tree.data.window.at(node)
     }

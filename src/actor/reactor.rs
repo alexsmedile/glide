@@ -522,23 +522,10 @@ impl Reactor {
             Event::WindowBecameVisible(wid) => {
                 if self.window_is_tracked(wid)
                     && let Some(window) = self.windows.get(&wid)
-                    && let ws_info =
-                        window.window_server_id.and_then(|id| self.window_server_info.get(&id))
                     && let Some(space) = self.best_space_for_window(&window.frame_monotonic)
-                    && let Some(app) = self.apps.get(&wid.pid)
+                    && let Some(info) = self.layout_window_info(wid)
                 {
                     animation_focus_wids.push(wid);
-                    let info = LayoutWindowInfo {
-                        frame: window.frame_monotonic,
-                        bundle_id: app.info.bundle_id.clone(),
-                        app_name: app.info.localized_name.clone(),
-                        title: window.title.clone().into(),
-                        layer: ws_info.map(|i| i.layer),
-                        is_standard: window.is_ax_standard,
-                        is_resizable: window.is_resizable,
-                        ax_role: window.ax_role.clone(),
-                        ax_subrole: window.ax_subrole.clone(),
-                    };
                     self.send_layout_event(LayoutEvent::WindowAdded(space, wid, info));
                 }
             }
@@ -582,11 +569,13 @@ impl Reactor {
                 if let Some(old) = old_screen
                     && let Some(new) = new_screen
                     && old != new
+                    && let Some(info) = self.layout_window_info(wid)
                 {
                     self.send_layout_event(LayoutEvent::WindowSpaceChanged {
                         wid,
                         added: self.screens[new].space,
                         removed: self.screens[old].space,
+                        info,
                     });
                 }
                 if old_frame.size != new_frame.size {
@@ -958,7 +947,6 @@ impl Reactor {
             .extend(new.iter().flat_map(|(wid, info)| info.sys_id.map(|wsid| (wsid, *wid))));
         self.windows.extend(new.into_iter().map(|(wid, info)| (wid, info.into())));
         let mut app_windows: BTreeMap<SpaceId, Vec<(WindowId, LayoutWindowInfo)>> = BTreeMap::new();
-        let app = self.apps.get(&pid);
         for wid in self
             .visible_windows
             .iter()
@@ -970,19 +958,8 @@ impl Reactor {
             let Some(space) = self.best_space_for_window(&window.frame_monotonic) else {
                 continue;
             };
-            let layout_info = LayoutWindowInfo {
-                frame: window.frame_monotonic,
-                bundle_id: app.and_then(|a| a.info.bundle_id.clone()),
-                app_name: app.and_then(|a| a.info.localized_name.clone()),
-                title: window.title.clone().into(),
-                layer: window
-                    .window_server_id
-                    .and_then(|wsid| self.window_server_info.get(&wsid))
-                    .map(|info| info.layer),
-                is_standard: window.is_ax_standard,
-                is_resizable: window.is_resizable,
-                ax_role: window.ax_role.clone(),
-                ax_subrole: window.ax_subrole.clone(),
+            let Some(layout_info) = self.layout_window_info(wid) else {
+                continue;
             };
             app_windows.entry(space).or_default().push((wid, layout_info));
         }
@@ -1015,6 +992,26 @@ impl Reactor {
 
     fn best_space_for_window(&self, frame: &CGRect) -> Option<SpaceId> {
         self.screens[self.best_screen_idx_for_window(frame)?].space
+    }
+
+    /// Gathers the window properties the layout uses to classify a window.
+    fn layout_window_info(&self, wid: WindowId) -> Option<LayoutWindowInfo> {
+        let window = self.windows.get(&wid)?;
+        let app = self.apps.get(&wid.pid);
+        Some(LayoutWindowInfo {
+            frame: window.frame_monotonic,
+            bundle_id: app.and_then(|a| a.info.bundle_id.clone()),
+            app_name: app.and_then(|a| a.info.localized_name.clone()),
+            title: window.title.clone().into(),
+            layer: window
+                .window_server_id
+                .and_then(|wsid| self.window_server_info.get(&wsid))
+                .map(|info| info.layer),
+            is_standard: window.is_ax_standard,
+            is_resizable: window.is_resizable,
+            ax_role: window.ax_role.clone(),
+            ax_subrole: window.ax_subrole.clone(),
+        })
     }
 
     fn update_active_screen(&mut self) {
