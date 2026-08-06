@@ -18,7 +18,7 @@ mod testing;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{mem, thread};
 
 use animation::{Animation, AnimationManager, Message as AnimationMessage};
@@ -242,12 +242,27 @@ pub struct Reactor {
     /// We don't write frames to this window until the resize ends, since a
     /// write mid-drag fights the user's mouse.
     resizing_window: Option<WindowId>,
+    /// Recent attempts to write a frame to a window, used to stop fighting apps
+    /// that move their windows back.
+    frame_attempts: HashMap<WindowId, FrameAttempt>,
     record: Record,
     raise_manager_tx: raise::Sender,
     animation_tx: Option<animation::Sender>,
     mouse_tx: Option<mouse::Sender>,
     status_tx: Option<status::Sender>,
     group_indicators_tx: group_bars::Sender,
+}
+
+/// How many times in a row we write the same frame to a window before giving
+/// up, and how long a pause resets the count.
+const MAX_FRAME_ATTEMPTS: u32 = 5;
+const FRAME_ATTEMPT_RESET: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+struct FrameAttempt {
+    target: CGRect,
+    count: u32,
+    last: Instant,
 }
 
 #[derive(Debug)]
@@ -397,6 +412,7 @@ impl Reactor {
             main_window_tracker: MainWindowTracker::default(),
             in_drag: false,
             resizing_window: None,
+            frame_attempts: HashMap::default(),
             record,
             raise_manager_tx,
             animation_tx: None,
@@ -536,6 +552,7 @@ impl Reactor {
                 if self.windows.remove(&wid).is_none() {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
+                self.frame_attempts.remove(&wid);
                 //animation_focus_wid = self.window_order.last().cloned();
                 self.send_layout_event(LayoutEvent::WindowRemoved(wid));
             }
@@ -1210,6 +1227,32 @@ impl Reactor {
             if target_frame.same_as(current_frame) {
                 continue;
             }
+            // Some apps move a window back after we place it, which turns into
+            // an event that makes us place it again. Stop writing the frame
+            // once it's clear the app won't keep it.
+            let now = Instant::now();
+            let attempt = self.frame_attempts.entry(wid).or_insert(FrameAttempt {
+                target: target_frame,
+                count: 0,
+                last: now,
+            });
+            if !attempt.target.same_as(target_frame)
+                || now.duration_since(attempt.last) > FRAME_ATTEMPT_RESET
+            {
+                *attempt = FrameAttempt {
+                    target: target_frame,
+                    count: 0,
+                    last: now,
+                };
+            }
+            attempt.last = now;
+            attempt.count = attempt.count.saturating_add(1);
+            if attempt.count > MAX_FRAME_ATTEMPTS {
+                if attempt.count == MAX_FRAME_ATTEMPTS + 1 {
+                    warn!(?wid, ?current_frame, ?target_frame, "Giving up on window frame");
+                }
+                continue;
+            }
             let Some(app) = self.apps.get(&wid.pid) else {
                 continue;
             };
@@ -1559,6 +1602,53 @@ pub mod tests {
             full_screen,
             apps.windows.get(&WindowId::new(1, 1)).expect("Window was not resized").frame,
         );
+    }
+
+    #[test]
+    fn it_stops_writing_a_frame_the_app_keeps_undoing() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![full_screen],
+            spaces: vec![Some(SpaceId::new(1))],
+            scale_factors: vec![1.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(1)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        // The app moves the window off its tiled position after every write.
+        let wid = WindowId::new(1, 1);
+        let moved_back = CGRect::new(CGPoint::new(100., 100.), full_screen.size);
+        let mut writes = 0;
+        let mut writes_in_last_round = 0;
+        for _ in 0..MAX_FRAME_ATTEMPTS + 5 {
+            reactor.handle_event(Event::WindowFrameChanged(
+                wid,
+                moved_back,
+                apps.windows[&wid].last_seen_txid,
+                Requested(false),
+                None,
+            ));
+            let requests = apps.requests();
+            writes_in_last_round = requests
+                .iter()
+                .filter(|request| {
+                    matches!(
+                        request,
+                        Request::SetWindowFrame(..) | Request::AnimationFrame { .. }
+                    )
+                })
+                .count();
+            writes += writes_in_last_round;
+            _ = apps.simulate_events_for_requests(requests);
+        }
+        // The initial placement counts toward the limit.
+        assert!(writes <= MAX_FRAME_ATTEMPTS as usize, "{writes} writes");
+        assert_eq!(0, writes_in_last_round);
     }
 
     #[test]
