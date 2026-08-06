@@ -298,6 +298,18 @@ unsafe extern "C" {
         context: *mut c_void,
     ) -> CGError;
 
+    safe fn SLSRegisterNotifyProc(
+        callback: GlobalNotifierCallback,
+        event: u32,
+        context: *mut c_void,
+    ) -> CGError;
+
+    safe fn SLSRemoveNotifyProc(
+        callback: GlobalNotifierCallback,
+        event: u32,
+        context: *mut c_void,
+    ) -> CGError;
+
     fn SLSRequestNotificationsForWindows(
         cid: SLSConnectionID,
         window_list: *const CGWindowID,
@@ -377,6 +389,22 @@ fn check(err: CGError) -> Result<(), CGError> {
     if err == 0 { Ok(()) } else { Err(err) }
 }
 
+/// Reads the payload of a window server notification.
+///
+/// Some notifications have no payload and pass a null pointer, sometimes with a
+/// nonzero length.
+///
+/// # Safety
+///
+/// If `data` is non-null it must point to `data_len` initialized bytes that
+/// outlive the returned slice.
+unsafe fn notification_data<'a>(data: *mut c_void, data_len: usize) -> &'a [u8] {
+    if data.is_null() {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(data.cast::<u8>(), data_len) }
+}
+
 unsafe fn destruct<T>(ptr: *mut ()) {
     let _ = unsafe { Box::from_raw(ptr as *mut T) };
 }
@@ -397,7 +425,7 @@ impl SkylightNotifier {
             // SAFETY: Pointer is from Box<F>::into_raw.
             let callback: &F = unsafe { &*context.cast() };
             // SAFETY: We assume the API is sound.
-            let data = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), data_len) };
+            let data = unsafe { notification_data(data, data_len) };
             callback(event, data)
         }
         let callback = Box::into_raw(Box::new(callback));
@@ -428,6 +456,76 @@ impl Drop for SkylightNotifier {
         ) && e != 0
         {
             warn!("Failed to release SLS connection {cid}: {e}", cid = self.cid);
+            return; // so we don't free data referred to by the callback
+        }
+        // SAFETY: destruct<F> takes a pointer to F.
+        unsafe {
+            (self.dtor)(self.callback);
+        }
+    }
+}
+
+/// Subscribes to a window server notification event for the whole session.
+///
+/// Unlike [`SkylightConnection::on_event`], this is not limited to the windows
+/// a connection has requested notifications for.
+pub fn on_global_event(
+    event: u32,
+    callback: impl Fn(u32, &[u8]) + 'static,
+) -> Result<GlobalNotifier, CGError> {
+    GlobalNotifier::new_for_event(event, callback)
+}
+
+#[derive(Debug)]
+pub struct GlobalNotifier {
+    event: u32,
+    internal_callback: GlobalNotifierCallback,
+    callback: *mut (),
+    dtor: unsafe fn(*mut ()),
+}
+
+type GlobalNotifierCallback =
+    extern "C-unwind" fn(event: u32, data: *mut c_void, data_len: usize, context: *mut c_void);
+
+impl GlobalNotifier {
+    fn new_for_event<F: Fn(u32, &[u8]) + 'static>(
+        event: u32,
+        callback: F,
+    ) -> Result<Self, CGError> {
+        extern "C-unwind" fn internal_callback<F: Fn(u32, &[u8]) + 'static>(
+            event: u32,
+            data: *mut c_void,
+            data_len: usize,
+            context: *mut c_void,
+        ) {
+            // SAFETY: Pointer is from Box<F>::into_raw.
+            let callback: &F = unsafe { &*context.cast() };
+            // SAFETY: We assume the API is sound.
+            let data = unsafe { notification_data(data, data_len) };
+            callback(event, data)
+        }
+        let callback = Box::into_raw(Box::new(callback));
+        check(SLSRegisterNotifyProc(
+            internal_callback::<F>,
+            event,
+            callback.cast(),
+        ))?;
+        Ok(Self {
+            event,
+            internal_callback: internal_callback::<F>,
+            callback: callback.cast(),
+            dtor: destruct::<F>,
+        })
+    }
+}
+
+impl Drop for GlobalNotifier {
+    fn drop(&mut self) {
+        #[allow(irrefutable_let_patterns)]
+        if let e = SLSRemoveNotifyProc(self.internal_callback, self.event, self.callback.cast())
+            && e != 0
+        {
+            warn!("Failed to remove notify proc for event {}: {e}", self.event);
             return; // so we don't free data referred to by the callback
         }
         // SAFETY: destruct<F> takes a pointer to F.
