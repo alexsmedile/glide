@@ -982,12 +982,19 @@ impl Reactor {
         }
     }
 
+    /// The screen the window overlaps the most, or None if it is not on any
+    /// screen. Apps park windows far off screen to hide them, and those belong
+    /// to no screen at all.
     fn best_screen_idx_for_window(&self, frame: &CGRect) -> Option<usize> {
         self.screens
             .iter()
             .enumerate()
-            .max_by_key(|(_, s)| s.frame.intersection(frame).area() as i64)
+            .map(|(idx, screen)| (idx, screen.frame.intersection(frame).area()))
+            .filter(|&(_, area)| area > 0.0)
+            .max_by_key(|&(_, area)| area as i64)
             .map(|(idx, _)| idx)
+            // A window with no area intersects nothing, so place it by its midpoint.
+            .or_else(|| self.screens.iter().position(|screen| screen.frame.contains(frame.mid())))
     }
 
     fn best_space_for_window(&self, frame: &CGRect) -> Option<SpaceId> {
@@ -1552,6 +1559,28 @@ pub mod tests {
             full_screen,
             apps.windows.get(&WindowId::new(1, 1)).expect("Window was not resized").frame,
         );
+    }
+
+    #[test]
+    fn windows_parked_off_screen_belong_to_no_screen() {
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![full_screen],
+            spaces: vec![Some(SpaceId::new(1))],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+
+        let off_screen = CGRect::new(CGPoint::new(0., -2000.), CGSize::new(1000., 500.));
+        assert_eq!(None, reactor.best_screen_idx_for_window(&off_screen));
+
+        let partly_on_screen = CGRect::new(CGPoint::new(0., -100.), CGSize::new(1000., 500.));
+        assert_eq!(Some(0), reactor.best_screen_idx_for_window(&partly_on_screen));
+
+        let no_area = CGRect::new(CGPoint::new(500., 500.), CGSize::new(0., 0.));
+        assert_eq!(Some(0), reactor.best_screen_idx_for_window(&no_area));
     }
 
     #[test]
@@ -2626,7 +2655,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
-            frames: vec![CGRect::ZERO],
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2659,7 +2688,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
-            frames: vec![CGRect::ZERO],
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
