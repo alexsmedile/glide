@@ -538,6 +538,11 @@ impl Drop for GlobalNotifier {
 #[expect(non_upper_case_globals)]
 pub const kCGSWindowIsTerminated: u32 = 804;
 
+/// Sent for every window in the session as it is created, whether or not
+/// notifications were requested for it.
+#[expect(non_upper_case_globals)]
+pub const kCGSWindowCreated: u32 = 811;
+
 /// This must be called to allow hiding the mouse from a background application.
 ///
 /// It relies on a private API, so not guaranteed to continue working, but it is
