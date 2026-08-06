@@ -160,7 +160,7 @@ pub enum Event {
     /// The second field is the process the window server was routing keyboard
     /// events to when the mouse moved, if it could be read. It is read in the
     /// mouse actor so it describes the same moment as the mouse position.
-    MouseMovedOverWindow(WindowServerId, Option<pid_t>),
+    MouseMovedOverWindow(WindowServerId, #[serde(default)] Option<pid_t>),
 
     /// A raise request completed. Used by the raise manager to track when
     /// all raise requests in a sequence have finished.
