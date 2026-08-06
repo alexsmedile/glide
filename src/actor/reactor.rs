@@ -18,7 +18,7 @@ mod testing;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{mem, thread};
 
 use animation::{Animation, AnimationManager, Message as AnimationMessage};
@@ -160,7 +160,7 @@ pub enum Event {
     /// The second field is the process the window server was routing keyboard
     /// events to when the mouse moved, if it could be read. It is read in the
     /// mouse actor so it describes the same moment as the mouse position.
-    MouseMovedOverWindow(WindowServerId, Option<pid_t>),
+    MouseMovedOverWindow(WindowServerId, #[serde(default)] Option<pid_t>),
 
     /// A raise request completed. Used by the raise manager to track when
     /// all raise requests in a sequence have finished.
@@ -242,12 +242,27 @@ pub struct Reactor {
     /// We don't write frames to this window until the resize ends, since a
     /// write mid-drag fights the user's mouse.
     resizing_window: Option<WindowId>,
+    /// Recent attempts to write a frame to a window, used to stop fighting apps
+    /// that move their windows back.
+    frame_attempts: HashMap<WindowId, FrameAttempt>,
     record: Record,
     raise_manager_tx: raise::Sender,
     animation_tx: Option<animation::Sender>,
     mouse_tx: Option<mouse::Sender>,
     status_tx: Option<status::Sender>,
     group_indicators_tx: group_bars::Sender,
+}
+
+/// How many times in a row we write the same frame to a window before giving
+/// up, and how long a pause resets the count.
+const MAX_FRAME_ATTEMPTS: u32 = 5;
+const FRAME_ATTEMPT_RESET: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+struct FrameAttempt {
+    target: CGRect,
+    count: u32,
+    last: Instant,
 }
 
 #[derive(Debug)]
@@ -397,6 +412,7 @@ impl Reactor {
             main_window_tracker: MainWindowTracker::default(),
             in_drag: false,
             resizing_window: None,
+            frame_attempts: HashMap::default(),
             record,
             raise_manager_tx,
             animation_tx: None,
@@ -522,23 +538,10 @@ impl Reactor {
             Event::WindowBecameVisible(wid) => {
                 if self.window_is_tracked(wid)
                     && let Some(window) = self.windows.get(&wid)
-                    && let ws_info =
-                        window.window_server_id.and_then(|id| self.window_server_info.get(&id))
                     && let Some(space) = self.best_space_for_window(&window.frame_monotonic)
-                    && let Some(app) = self.apps.get(&wid.pid)
+                    && let Some(info) = self.layout_window_info(wid)
                 {
                     animation_focus_wids.push(wid);
-                    let info = LayoutWindowInfo {
-                        frame: window.frame_monotonic,
-                        bundle_id: app.info.bundle_id.clone(),
-                        app_name: app.info.localized_name.clone(),
-                        title: window.title.clone().into(),
-                        layer: ws_info.map(|i| i.layer),
-                        is_standard: window.is_ax_standard,
-                        is_resizable: window.is_resizable,
-                        ax_role: window.ax_role.clone(),
-                        ax_subrole: window.ax_subrole.clone(),
-                    };
                     self.send_layout_event(LayoutEvent::WindowAdded(space, wid, info));
                 }
             }
@@ -549,6 +552,7 @@ impl Reactor {
                 if self.windows.remove(&wid).is_none() {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
+                self.frame_attempts.remove(&wid);
                 //animation_focus_wid = self.window_order.last().cloned();
                 self.send_layout_event(LayoutEvent::WindowRemoved(wid));
             }
@@ -582,11 +586,13 @@ impl Reactor {
                 if let Some(old) = old_screen
                     && let Some(new) = new_screen
                     && old != new
+                    && let Some(info) = self.layout_window_info(wid)
                 {
                     self.send_layout_event(LayoutEvent::WindowSpaceChanged {
                         wid,
                         added: self.screens[new].space,
                         removed: self.screens[old].space,
+                        info,
                     });
                 }
                 if old_frame.size != new_frame.size {
@@ -958,7 +964,6 @@ impl Reactor {
             .extend(new.iter().flat_map(|(wid, info)| info.sys_id.map(|wsid| (wsid, *wid))));
         self.windows.extend(new.into_iter().map(|(wid, info)| (wid, info.into())));
         let mut app_windows: BTreeMap<SpaceId, Vec<(WindowId, LayoutWindowInfo)>> = BTreeMap::new();
-        let app = self.apps.get(&pid);
         for wid in self
             .visible_windows
             .iter()
@@ -970,19 +975,8 @@ impl Reactor {
             let Some(space) = self.best_space_for_window(&window.frame_monotonic) else {
                 continue;
             };
-            let layout_info = LayoutWindowInfo {
-                frame: window.frame_monotonic,
-                bundle_id: app.and_then(|a| a.info.bundle_id.clone()),
-                app_name: app.and_then(|a| a.info.localized_name.clone()),
-                title: window.title.clone().into(),
-                layer: window
-                    .window_server_id
-                    .and_then(|wsid| self.window_server_info.get(&wsid))
-                    .map(|info| info.layer),
-                is_standard: window.is_ax_standard,
-                is_resizable: window.is_resizable,
-                ax_role: window.ax_role.clone(),
-                ax_subrole: window.ax_subrole.clone(),
+            let Some(layout_info) = self.layout_window_info(wid) else {
+                continue;
             };
             app_windows.entry(space).or_default().push((wid, layout_info));
         }
@@ -1005,16 +999,43 @@ impl Reactor {
         }
     }
 
+    /// The screen the window overlaps the most, or None if it is not on any
+    /// screen. Apps park windows far off screen to hide them, and those belong
+    /// to no screen at all.
     fn best_screen_idx_for_window(&self, frame: &CGRect) -> Option<usize> {
         self.screens
             .iter()
             .enumerate()
-            .max_by_key(|(_, s)| s.frame.intersection(frame).area() as i64)
+            .map(|(idx, screen)| (idx, screen.frame.intersection(frame).area()))
+            .filter(|&(_, area)| area > 0.0)
+            .max_by_key(|&(_, area)| area as i64)
             .map(|(idx, _)| idx)
+            // A window with no area intersects nothing, so place it by its midpoint.
+            .or_else(|| self.screens.iter().position(|screen| screen.frame.contains(frame.mid())))
     }
 
     fn best_space_for_window(&self, frame: &CGRect) -> Option<SpaceId> {
         self.screens[self.best_screen_idx_for_window(frame)?].space
+    }
+
+    /// Gathers the window properties the layout uses to classify a window.
+    fn layout_window_info(&self, wid: WindowId) -> Option<LayoutWindowInfo> {
+        let window = self.windows.get(&wid)?;
+        let app = self.apps.get(&wid.pid);
+        Some(LayoutWindowInfo {
+            frame: window.frame_monotonic,
+            bundle_id: app.and_then(|a| a.info.bundle_id.clone()),
+            app_name: app.and_then(|a| a.info.localized_name.clone()),
+            title: window.title.clone().into(),
+            layer: window
+                .window_server_id
+                .and_then(|wsid| self.window_server_info.get(&wsid))
+                .map(|info| info.layer),
+            is_standard: window.is_ax_standard,
+            is_resizable: window.is_resizable,
+            ax_role: window.ax_role.clone(),
+            ax_subrole: window.ax_subrole.clone(),
+        })
     }
 
     fn update_active_screen(&mut self) {
@@ -1204,6 +1225,32 @@ impl Reactor {
             let target_frame = round_to_physical(target_frame, scale_factor);
             let current_frame = window.frame_monotonic;
             if target_frame.same_as(current_frame) {
+                continue;
+            }
+            // Some apps move a window back after we place it, which turns into
+            // an event that makes us place it again. Stop writing the frame
+            // once it's clear the app won't keep it.
+            let now = Instant::now();
+            let attempt = self.frame_attempts.entry(wid).or_insert(FrameAttempt {
+                target: target_frame,
+                count: 0,
+                last: now,
+            });
+            if !attempt.target.same_as(target_frame)
+                || now.duration_since(attempt.last) > FRAME_ATTEMPT_RESET
+            {
+                *attempt = FrameAttempt {
+                    target: target_frame,
+                    count: 0,
+                    last: now,
+                };
+            }
+            attempt.last = now;
+            attempt.count = attempt.count.saturating_add(1);
+            if attempt.count > MAX_FRAME_ATTEMPTS {
+                if attempt.count == MAX_FRAME_ATTEMPTS + 1 {
+                    warn!(?wid, ?current_frame, ?target_frame, "Giving up on window frame");
+                }
                 continue;
             }
             let Some(app) = self.apps.get(&wid.pid) else {
@@ -1555,6 +1602,75 @@ pub mod tests {
             full_screen,
             apps.windows.get(&WindowId::new(1, 1)).expect("Window was not resized").frame,
         );
+    }
+
+    #[test]
+    fn it_stops_writing_a_frame_the_app_keeps_undoing() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![full_screen],
+            spaces: vec![Some(SpaceId::new(1))],
+            scale_factors: vec![1.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(1)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        // The app moves the window off its tiled position after every write.
+        let wid = WindowId::new(1, 1);
+        let moved_back = CGRect::new(CGPoint::new(100., 100.), full_screen.size);
+        let mut writes = 0;
+        let mut writes_in_last_round = 0;
+        for _ in 0..MAX_FRAME_ATTEMPTS + 5 {
+            reactor.handle_event(Event::WindowFrameChanged(
+                wid,
+                moved_back,
+                apps.windows[&wid].last_seen_txid,
+                Requested(false),
+                None,
+            ));
+            let requests = apps.requests();
+            writes_in_last_round = requests
+                .iter()
+                .filter(|request| {
+                    matches!(
+                        request,
+                        Request::SetWindowFrame(..) | Request::AnimationFrame { .. }
+                    )
+                })
+                .count();
+            writes += writes_in_last_round;
+            _ = apps.simulate_events_for_requests(requests);
+        }
+        // The initial placement counts toward the limit.
+        assert!(writes <= MAX_FRAME_ATTEMPTS as usize, "{writes} writes");
+        assert_eq!(0, writes_in_last_round);
+    }
+
+    #[test]
+    fn windows_parked_off_screen_belong_to_no_screen() {
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![full_screen],
+            spaces: vec![Some(SpaceId::new(1))],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+
+        let off_screen = CGRect::new(CGPoint::new(0., -2000.), CGSize::new(1000., 500.));
+        assert_eq!(None, reactor.best_screen_idx_for_window(&off_screen));
+
+        let partly_on_screen = CGRect::new(CGPoint::new(0., -100.), CGSize::new(1000., 500.));
+        assert_eq!(Some(0), reactor.best_screen_idx_for_window(&partly_on_screen));
+
+        let no_area = CGRect::new(CGPoint::new(500., 500.), CGSize::new(0., 0.));
+        assert_eq!(Some(0), reactor.best_screen_idx_for_window(&no_area));
     }
 
     #[test]
@@ -2629,7 +2745,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
-            frames: vec![CGRect::ZERO],
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2662,7 +2778,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
-            frames: vec![CGRect::ZERO],
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),

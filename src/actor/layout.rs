@@ -72,6 +72,7 @@ pub enum LayoutEvent {
         wid: WindowId,
         added: Option<SpaceId>,
         removed: Option<SpaceId>,
+        info: LayoutWindowInfo,
     },
     WindowFocused(Vec<SpaceId>, WindowId),
     WindowResized {
@@ -634,28 +635,47 @@ impl LayoutManager {
                     self.floating_restore_frames.insert(wid, FloatingRestoreFrame { frame });
                 }
             }
-            LayoutEvent::WindowSpaceChanged { wid, added, removed } => {
+            LayoutEvent::WindowSpaceChanged { wid, added, removed, info } => {
                 if self.floating_windows.contains(&wid) {
                     // Floating windows live outside the tree, tracked per space
-                    // in active_floating_windows. Move that bookkeeping rather
-                    // than tiling the window into the destination layout.
-                    if let Some(removed) = removed {
-                        self.active_floating_windows.remove(removed, wid);
-                    }
+                    // in active_floating_windows.
                     if let Some(added) = added {
                         self.add_floating_window(wid, Some(added));
                     }
+                    if let Some(removed) = removed {
+                        self.active_floating_windows.remove(removed, wid);
+                    }
                 } else {
+                    if let Some(added) = added {
+                        let class = if self.tree.has_window(wid) {
+                            // A window we already tile keeps its placement.
+                            WindowClass::Regular
+                        } else {
+                            // We may not have seen this window before, which can
+                            // happen if it was off screen before.
+                            classify_window(&self.window_rules, &info)
+                        };
+                        match class {
+                            WindowClass::Untracked => (),
+                            WindowClass::FloatByDefault => {
+                                self.add_floating_window(wid, Some(added))
+                            }
+                            WindowClass::Regular => {
+                                let layout = self.layout(added);
+                                if self.tree.is_scroll_layout(layout) {
+                                    self.add_scroll_window(layout, wid);
+                                } else {
+                                    self.tree.add_window_after(
+                                        layout,
+                                        self.tree.selection(layout),
+                                        wid,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if let Some(removed) = removed {
                         self.tree.remove_window_from(self.layout(removed), wid);
-                    }
-                    if let Some(added) = added {
-                        let layout = self.layout(added);
-                        if self.tree.is_scroll_layout(layout) {
-                            self.add_scroll_window(layout, wid);
-                        } else {
-                            self.tree.add_window_after(layout, self.tree.selection(layout), wid);
-                        }
                     }
                 }
             }
@@ -2628,6 +2648,7 @@ mod tests {
             wid: floated,
             added: Some(space2),
             removed: Some(space1),
+            info: win_info(),
         });
 
         // It must remain floating, tracked under space2 and not space1. It must
@@ -2643,6 +2664,42 @@ mod tests {
         };
         assert!(!tiled(&mgr, space1, screen1).contains(&floated));
         assert!(!tiled(&mgr, space2, screen2).contains(&floated));
+    }
+
+    #[test]
+    fn window_entering_a_space_for_the_first_time_is_classified() {
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let pid = 1;
+
+        let screen = rect(0, 0, 300, 30);
+        _ = mgr.handle_event(SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, make_windows(pid, 2)));
+
+        // A window that was off screen when we first saw it never went through
+        // classification, so a space change is its first layout event.
+        let nonstandard = WindowId::new(pid, 3);
+        _ = mgr.handle_event(WindowSpaceChanged {
+            wid: nonstandard,
+            added: Some(space),
+            removed: None,
+            info: LayoutWindowInfo {
+                is_standard: false,
+                ..win_info()
+            },
+        });
+
+        assert_eq!(
+            BTreeSet::from([nonstandard]),
+            mgr.floating_windows_in_space(space)
+        );
+        let tiled = mgr
+            .layout_sorted(space, screen)
+            .into_iter()
+            .map(|(wid, _)| wid)
+            .collect::<Vec<_>>();
+        assert!(!tiled.contains(&nonstandard));
     }
 
     #[test]
@@ -2668,6 +2725,7 @@ mod tests {
             wid: moved,
             added: Some(space2),
             removed: Some(space1),
+            info: win_info(),
         });
 
         // In a scroll layout windows live inside column containers, never as a

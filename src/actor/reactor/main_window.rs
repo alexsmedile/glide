@@ -137,7 +137,7 @@ impl MainWindowTracker {
 
 #[cfg(test)]
 mod tests {
-    use objc2_core_foundation::CGRect;
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use test_log::test;
 
     use super::super::testing::{Apps, make_windows};
@@ -152,7 +152,7 @@ mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
-            frames: vec![CGRect::ZERO],
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
 
             converter: CoordinateConverter::default(),
@@ -215,7 +215,7 @@ mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
-            frames: vec![CGRect::ZERO],
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
 
             converter: CoordinateConverter::default(),
@@ -331,7 +331,7 @@ mod tests {
         let windows = make_windows(2);
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
-            frames: vec![CGRect::ZERO],
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
 
             converter: CoordinateConverter::default(),
