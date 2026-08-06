@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.2.15](https://github.com/tmandry/glide/compare/v0.2.14...v0.2.15) (2026-08-06)
+
+
+### Bug Fixes
+
+* Always toggle the focused space from the status menu ([e172f5a](https://github.com/tmandry/glide/commit/e172f5af969208153eadd53040876655c879f44a))
+* Classify windows that enter a space instead of always tiling them ([9e94dfd](https://github.com/tmandry/glide/commit/9e94dfd12ae6d2c3d5c4e3d478366fe6f7154feb))
+* Detect Android Studio, Microsoft Teams, and Xcode on launch ([8af4257](https://github.com/tmandry/glide/commit/8af42576cb2168897764b0fd8d48404ab350a78f))
+* Don't assign off-screen windows to the nearest screen ([6be2c43](https://github.com/tmandry/glide/commit/6be2c43f29aa75bb90237c7b47119c9d6b61b502))
+* Don't let a cancelled raise speak for the focus ([768d983](https://github.com/tmandry/glide/commit/768d9833de4c524a642e68d6bbf54c1426dd430f))
+* Don't report a raised window as focused when its app reports it first ([7105146](https://github.com/tmandry/glide/commit/710514657afd872329586be9d1836b0f3fafbe93))
+* Don't report intermediate raises as focus changes ([7f01f4c](https://github.com/tmandry/glide/commit/7f01f4c7edc72460a633b6286b1202192eef3ad5))
+* Don't resize a window while the user is dragging its edge ([2def935](https://github.com/tmandry/glide/commit/2def935c28803e8849f7971b9e306bbeba5c2803))
+* Don't skip a restack when the window snapshot says nothing about it ([5700b66](https://github.com/tmandry/glide/commit/5700b66898dfdaffd0996c21012f36fee24809fc))
+* Drop raise requests identical to the one already queued ([911c99c](https://github.com/tmandry/glide/commit/911c99c7667096b6bd17defdf28ecc0ae713c445))
+* Fix an issue where the "Stop Managing Space" toggle could get stuck ([415c6f3](https://github.com/tmandry/glide/commit/415c6f3428bc8a15f0d724df647af0e2c5d6f038))
+* Fix oscillation when resizing a window with the mouse ([9f92417](https://github.com/tmandry/glide/commit/9f92417f5dd812dee27ee37e2f7ad2a22c55d2f6))
+* **focus-follows-mouse:** Don't dismiss Spotlight when mouse moves off it ([bd0f0a7](https://github.com/tmandry/glide/commit/bd0f0a732093120d19ebb952194753202447dfc7))
+* **focus-follows-mouse:** Don't dismiss Spotlight when mouse moves off it ([ec66f56](https://github.com/tmandry/glide/commit/ec66f562c08fd770cb6064bb910e80afc33d9197))
+* Ignore screen parameter changes that don't change anything ([d2932b2](https://github.com/tmandry/glide/commit/d2932b2fb28b4f4ece105807bf6fdbe3d55db51d))
+* Keep layout commands usable without a focused window ([c5c4d8a](https://github.com/tmandry/glide/commit/c5c4d8a288a6ef778bdb0ad8391121ab2928b375))
+* Keep layout commands usable without a focused window ([81c92db](https://github.com/tmandry/glide/commit/81c92db7e9d565d35593b19f582faa85833c2bce))
+* Only let a pending raise quiet one main window change ([8d6990e](https://github.com/tmandry/glide/commit/8d6990e1c15b4585d40fff95b68c965f28ed903c))
+* Re-apply the layout when the system restacks windows ([5dc54f1](https://github.com/tmandry/glide/commit/5dc54f13e2c8d27ab28136e8401b52c8e04ad281))
+* Reconcile the layout when a raise request fails ([7dd3b13](https://github.com/tmandry/glide/commit/7dd3b1304c05c78100bd360be6e7011119a37357))
+* Skip restacking windows that are already in place ([f973996](https://github.com/tmandry/glide/commit/f97399637c28e4ef14e7d8ca333209394b49c5d6))
+* Stop re-applying a frame an app keeps undoing ([e1a0bf6](https://github.com/tmandry/glide/commit/e1a0bf6d75f550944a4c61875d28a3225348a98a))
+
+
+### Improvements
+
+* Do some exponential backoff for all apps on init ([3c0b655](https://github.com/tmandry/glide/commit/3c0b6555da4963ca67a08a33b8c32d84dfb94fab))
+* Restore original window frames when they are floated ([f92ecf2](https://github.com/tmandry/glide/commit/f92ecf2e2cd1e6cfc715ffa7ccbb10dba6fbeff4))
+
 ## [0.2.14](https://github.com/tmandry/glide/compare/v0.2.13...v0.2.14) (2026-07-09)
 
 This release adds window rules to auto-float windows, pause/resume commands, and better multi-screen support.
