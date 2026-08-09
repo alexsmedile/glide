@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.15](https://github.com/tmandry/glide/compare/v0.2.14...v0.2.15) (2026-08-09)
+
+When a window is floated, Glide now remembers the original size and position of the window. This release brings a ton of reliability improvements for when windows move between spaces and screens, focus changes, and windows are resized or floated. It also improves compatibility with certain apps.
+
+### Bug Fixes
+
+* Preserve Glide's default key bindings when a configuration file omits the `[keys]` section ([#222](https://github.com/tmandry/glide/pull/222)).
+* Detect windows from Android Studio, Microsoft Teams, Xcode, and other apps that finish initializing after Glide is already running ([8af4257](https://github.com/tmandry/glide/commit/8af42576cb2168897764b0fd8d48404ab350a78f), [3c0b655](https://github.com/tmandry/glide/commit/3c0b6555da4963ca67a08a33b8c32d84dfb94fab)).
+* Classify windows correctly when they enter a space, and leave off-screen windows unassigned until their screen is known ([9e94dfd](https://github.com/tmandry/glide/commit/9e94dfd12ae6d2c3d5c4e3d478366fe6f7154feb), [6be2c43](https://github.com/tmandry/glide/commit/6be2c43f29aa75bb90237c7b47119c9d6b61b502)).
+* Improve focus and stacking reliability when apps raise or reorder windows, including preventing focus-follows-mouse from dismissing Spotlight ([#231](https://github.com/tmandry/glide/issues/231)).
+* Avoid fighting mouse-driven window resizing and eliminate oscillation between adjacent windows ([#227](https://github.com/tmandry/glide/issues/227)).
+* Keep layout commands available when no window is focused ([81c92db](https://github.com/tmandry/glide/commit/81c92db7e9d565d35593b19f582faa85833c2bce)).
+* Keep the status menu targeting the focused space and retry inconsistent screen updates that could leave its toggle stale ([e172f5a](https://github.com/tmandry/glide/commit/e172f5af969208153eadd53040876655c879f44a), [415c6f3](https://github.com/tmandry/glide/commit/415c6f3428bc8a15f0d724df647af0e2c5d6f038)).
+* Stop repeatedly applying a window frame when an app keeps undoing it ([e1a0bf6](https://github.com/tmandry/glide/commit/e1a0bf6d75f550944a4c61875d28a3225348a98a)).
+
+### Improvements
+
+* Restore a window's original position and size when it becomes floating ([f92ecf2](https://github.com/tmandry/glide/commit/f92ecf2e2cd1e6cfc715ffa7ccbb10dba6fbeff4)).
+
 ## [0.2.14](https://github.com/tmandry/glide/compare/v0.2.13...v0.2.14) (2026-07-09)
 
 This release adds window rules to auto-float windows, pause/resume commands, and better multi-screen support.
