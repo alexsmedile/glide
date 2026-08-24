@@ -168,7 +168,16 @@ impl Mouse {
                 let modifiers = MouseModifiers {
                     alt_held: event.get_flags().contains(CGEventFlags::CGEventFlagAlternate),
                 };
-                self.events_tx.send(Event::LeftMouseDown(loc.to_icrate(), modifiers));
+                let target = self
+                    .config
+                    .borrow()
+                    .settings
+                    .mouse_drag
+                    .then(|| {
+                        window_server::get_window_at_point(loc.to_icrate(), state.converter, mtm)
+                    })
+                    .flatten();
+                self.events_tx.send(Event::LeftMouseDown(loc.to_icrate(), modifiers, target));
             }
             CGEventType::LeftMouseUp => {
                 self.events_tx.send(Event::MouseUp);

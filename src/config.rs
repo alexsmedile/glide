@@ -94,6 +94,8 @@ pub struct Settings {
     pub mouse_follows_focus: bool,
     pub mouse_hides_on_focus: bool,
     pub focus_follows_mouse: bool,
+    pub mouse_drag: bool,
+    pub mouse_drag_snap_distance: f64,
     pub outer_gap: f64,
     pub inner_gap: f64,
     pub default_keys: bool,

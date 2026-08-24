@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use glide_wm::actor::dock::Dock;
+use glide_wm::actor::drop_preview::DropPreview;
 use glide_wm::actor::group_bars::GroupBars;
 use glide_wm::actor::layout::LayoutManager;
 use glide_wm::actor::mouse::Mouse;
@@ -122,6 +123,7 @@ fn main() {
     let (status_tx, status_rx) = channel();
 
     let (group_indicators_tx, group_indicators_rx) = glide_wm::actor::channel();
+    let (drop_preview_tx, drop_preview_rx) = glide_wm::actor::channel();
     let (events_tx, events_rx) = reactor::channel();
     let (skylight_tx, skylight_rx) = glide_wm::actor::channel::<window_server::SkylightRequest>();
     let wm_config = wm_controller::Config {
@@ -149,6 +151,7 @@ fn main() {
         mouse_tx.clone(),
         status_tx.clone(),
         group_indicators_tx,
+        drop_preview_tx,
         events_tx.clone(),
         events_rx,
         wm_controller_tx.clone(),
@@ -164,6 +167,7 @@ fn main() {
     let mouse = Mouse::new(config.clone(), events_tx.clone(), mouse_rx);
     let status = Status::new(config.clone(), status_rx, mtm, wm_controller_tx.clone());
     let group_bars = GroupBars::new(config.clone(), group_indicators_rx, mtm);
+    let drop_preview = DropPreview::new(drop_preview_rx, mtm);
     let dock = Dock::new(dock_sm_tx);
 
     // TODO: Run on another thread so we don't tie up the main thread.
@@ -179,6 +183,7 @@ fn main() {
             skylight_watcher.run(skylight_rx),
             dock.run(),
             group_bars.run(),
+            drop_preview.run(),
             message_server.run(),
         );
     });

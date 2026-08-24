@@ -20,6 +20,11 @@ mouse_follows_focus = true
 # mouse_follows_focus is false.
 mouse_hides_on_focus = true
 
+# Show snap previews while dragging windows. Screen-edge targets are always
+# available; hold Alt for split and group targets inside a managed layout.
+mouse_drag = false
+mouse_drag_snap_distance = 24
+
 # Gap between windows and screen edges (in pixels).
 outer_gap = 0
 

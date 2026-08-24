@@ -23,7 +23,7 @@ use std::{mem, thread};
 
 use animation::{Animation, AnimationManager, Message as AnimationMessage};
 use main_window::MainWindowTracker;
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CGPoint, CGRect};
 use redact::Secret;
 pub use replay::{Record, replay};
 use serde::{Deserialize, Serialize};
@@ -36,7 +36,7 @@ use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, Wind
 use crate::actor::layout::{self, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo};
 use crate::actor::raise::{self, RaiseManager, RaiseRequest};
 use crate::actor::space_manager::SpaceManager;
-use crate::actor::{group_bars, space_manager, status, window_server, wm_controller};
+use crate::actor::{drop_preview, group_bars, space_manager, status, window_server, wm_controller};
 use crate::collections::{HashMap, HashSet};
 use crate::config::Config;
 use crate::log::{self, MetricsCommand};
@@ -189,6 +189,7 @@ pub enum Event {
     LeftMouseDown(
         #[serde(with = "crate::sys::geometry::CGPointDef")] objc2_core_foundation::CGPoint,
         #[serde(default)] MouseModifiers,
+        #[serde(default)] Option<WindowServerId>,
     ),
     LeftMouseDragged(
         #[serde(with = "crate::sys::geometry::CGPointDef")] objc2_core_foundation::CGPoint,
@@ -258,6 +259,8 @@ pub struct Reactor {
     mouse_tx: Option<mouse::Sender>,
     status_tx: Option<status::Sender>,
     group_indicators_tx: group_bars::Sender,
+    drop_preview_tx: Option<drop_preview::Sender>,
+    window_drop_drag: Option<WindowDropDrag>,
 }
 
 /// How many times in a row we write the same frame to a window before giving
@@ -270,6 +273,11 @@ struct FrameAttempt {
     target: CGRect,
     count: u32,
     last: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WindowDropDrag {
+    window_id: WindowId,
 }
 
 #[derive(Debug)]
@@ -357,6 +365,7 @@ impl Reactor {
         mouse_tx: mouse::Sender,
         status_tx: status::Sender,
         group_indicators_tx: group_bars::Sender,
+        drop_preview_tx: drop_preview::Sender,
         reactor_tx: Sender,
         events: Receiver,
         wm_tx: wm_controller::Sender,
@@ -373,6 +382,7 @@ impl Reactor {
                     Reactor::new(config.clone(), layout, record, group_indicators_tx.clone());
                 reactor.mouse_tx.replace(mouse_tx.clone());
                 reactor.status_tx.replace(status_tx.clone());
+                reactor.drop_preview_tx.replace(drop_preview_tx);
                 let space_manager = SpaceManager::new(
                     one_space,
                     config,
@@ -426,6 +436,8 @@ impl Reactor {
             mouse_tx: None,
             status_tx: None,
             group_indicators_tx: group_indicators_tx,
+            drop_preview_tx: None,
+            window_drop_drag: None,
         }
     }
 
@@ -663,6 +675,9 @@ impl Reactor {
                 }
                 self.update_active_screen();
                 // FIXME: Update visible windows if space changed.
+                if let Some(tx) = &self.drop_preview_tx {
+                    tx.send(drop_preview::Event::ScreenParametersChanged(converter));
+                }
                 // Forward the event to group_indicators. We serialize these
                 // through the reactor instead of delivering directly from
                 // wm_controller in order to eliminate possible races with other
@@ -682,6 +697,7 @@ impl Reactor {
                     return;
                 }
                 self.layout.cancel_interactive_state();
+                self.hide_window_drop_preview();
                 self.in_drag = false;
                 self.resizing_window = None;
                 info!("space changed");
@@ -764,9 +780,18 @@ impl Reactor {
                 self.update_active_screen();
                 self.update_visible_windows();
             }
-            Event::LeftMouseDown(point, _) => {
+            Event::LeftMouseDown(point, modifiers, target) => {
+                self.window_drop_drag = self
+                    .config
+                    .settings
+                    .mouse_drag
+                    .then(|| target.and_then(|wsid| self.window_ids.get(&wsid).copied()))
+                    .flatten()
+                    .map(|window_id| WindowDropDrag { window_id });
+                let layout_drag_started = modifiers.alt_held && self.window_drop_drag.is_some();
                 if let Some(screen) = self.active_screen()
                     && let Some(space) = screen.space
+                    && !layout_drag_started
                 {
                     if let Some((col, win, edges)) =
                         self.layout.hit_test_scroll_edges(space, point, screen.frame, &self.config)
@@ -781,7 +806,8 @@ impl Reactor {
                     }
                 }
             }
-            Event::LeftMouseDragged(point, _) => {
+            Event::LeftMouseDragged(point, modifiers) => {
+                self.update_window_drop_preview(point, modifiers);
                 if let Some(&screen) = self.active_screen() {
                     if screen.space.is_some() {
                         if self.layout.update_interactive_resize(point, screen.frame) {
@@ -797,6 +823,7 @@ impl Reactor {
                 }
             }
             Event::MouseUp => {
+                self.hide_window_drop_preview();
                 if self.layout.has_interactive_state() {
                     if let Some(&screen) = self.active_screen() {
                         if let Some(space) = screen.space {
@@ -1111,6 +1138,39 @@ impl Reactor {
         self.screens.get(self.active_screen_idx.unwrap_or(0) as usize)
     }
 
+    fn update_window_drop_preview(&mut self, point: CGPoint, modifiers: MouseModifiers) {
+        let Some(drag) = self.window_drop_drag else { return };
+        let Some(screen) = self.screens.iter().copied().find(|screen| screen.frame.contains(point))
+        else {
+            if let Some(tx) = &self.drop_preview_tx {
+                tx.send(drop_preview::Event::Hide);
+            }
+            return;
+        };
+        let preview = self.layout.window_drop_preview(
+            screen.space,
+            drag.window_id,
+            point,
+            screen.frame,
+            modifiers.alt_held,
+            self.config.settings.mouse_drag_snap_distance,
+            &self.config,
+        );
+        if let Some(tx) = &self.drop_preview_tx {
+            tx.send(match preview {
+                Some(preview) => drop_preview::Event::Show(preview),
+                None => drop_preview::Event::Hide,
+            });
+        }
+    }
+
+    fn hide_window_drop_preview(&mut self) {
+        self.window_drop_drag = None;
+        if let Some(tx) = &self.drop_preview_tx {
+            tx.send(drop_preview::Event::Hide);
+        }
+    }
+
     fn window_is_tracked(&self, _id: WindowId) -> bool {
         // For now we track all windows in the reactor and let the LayoutManager
         // decide what to keep.
@@ -1358,21 +1418,26 @@ pub mod tests {
 
     #[test]
     fn mouse_modifiers_round_trip_in_recordings() {
-        let event =
-            Event::LeftMouseDown(CGPoint::new(10.0, 20.0), MouseModifiers { alt_held: true });
+        let event = Event::LeftMouseDown(
+            CGPoint::new(10.0, 20.0),
+            MouseModifiers { alt_held: true },
+            Some(WindowServerId::new(42)),
+        );
 
         let serialized = ron::to_string(&event).unwrap();
-        let Event::LeftMouseDown(point, modifiers) = ron::from_str(&serialized).unwrap() else {
+        let Event::LeftMouseDown(point, modifiers, target) = ron::from_str(&serialized).unwrap()
+        else {
             panic!("expected mouse-down event");
         };
 
         assert_eq!(point, CGPoint::new(10.0, 20.0));
         assert_eq!(modifiers, MouseModifiers { alt_held: true });
+        assert_eq!(target, Some(WindowServerId::new(42)));
     }
 
     #[test]
     fn mouse_modifiers_default_when_replaying_an_older_recording() {
-        let Event::LeftMouseDown(point, modifiers) =
+        let Event::LeftMouseDown(point, modifiers, target) =
             ron::from_str("LeftMouseDown((x:10.0,y:20.0))").unwrap()
         else {
             panic!("expected mouse-down event");
@@ -1380,6 +1445,67 @@ pub mod tests {
 
         assert_eq!(point, CGPoint::new(10.0, 20.0));
         assert_eq!(modifiers, MouseModifiers::default());
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn mouse_drag_emits_preview_without_moving_the_window() {
+        let mut config = Config::default();
+        config.settings.default_disable = false;
+        config.settings.animate = false;
+        config.settings.mouse_drag = true;
+        let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
+        let (group_indicators_tx, _) = crate::actor::channel();
+        let mut reactor = Reactor::new(
+            Arc::new(config),
+            LayoutManager::new_for_test(),
+            record,
+            group_indicators_tx,
+        );
+        let (preview_tx, mut preview_rx) = crate::actor::channel();
+        reactor.drop_preview_tx = Some(preview_tx);
+
+        let mut apps = Apps::new();
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 600.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(
+            1,
+            make_windows(2),
+            Some(WindowId::new(1, 1)),
+            true,
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        _ = preview_rx.try_recv();
+
+        reactor.handle_event(Event::LeftMouseDown(
+            CGPoint::new(100.0, 100.0),
+            MouseModifiers::default(),
+            Some(WindowServerId::new(1)),
+        ));
+        reactor.handle_event(Event::LeftMouseDragged(
+            CGPoint::new(5.0, 300.0),
+            MouseModifiers::default(),
+        ));
+
+        let (_, event) = preview_rx.try_recv().unwrap();
+        let drop_preview::Event::Show(preview) = event else {
+            panic!("expected a visible drop preview");
+        };
+        assert_eq!(preview.placement, layout::WindowDropPlacement::ScreenLeft);
+        assert!(apps.requests().is_empty(), "preview must not move a window");
+
+        reactor.handle_event(Event::MouseUp);
+        assert!(matches!(
+            preview_rx.try_recv(),
+            Ok((_, drop_preview::Event::Hide))
+        ));
     }
 
     #[test]

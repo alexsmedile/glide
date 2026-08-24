@@ -13,6 +13,7 @@ use tracing::Span;
 
 pub mod app;
 pub mod dock;
+pub mod drop_preview;
 pub mod group_bars;
 pub mod layout;
 pub mod mouse;
