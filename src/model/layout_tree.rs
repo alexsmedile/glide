@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::selection::Selection;
-use super::size::{ContainerKind, Direction, Size};
+use super::size::{ContainerKind, Direction, Orientation, Size};
 use super::tree::{self, Tree};
 use super::window::Window;
 use crate::actor::app::{WindowId, pid_t};
@@ -812,6 +812,54 @@ impl LayoutTree {
         }
         self.apply_resize(resizing_node, sibling, parent, delta / px_per_weight);
         true
+    }
+
+    /// Sets `node` to take up `proportion` of its parent, taking the
+    /// difference from its siblings.
+    ///
+    /// Returns false if the node has no parent, or if its parent lays its
+    /// children out along the other axis, where a proportion has no meaning.
+    pub fn set_proportion(&mut self, node: NodeId, proportion: f64) -> bool {
+        let Some(parent) = node.parent(&self.tree.map) else {
+            return false;
+        };
+        let kind = self.tree.data.size.kind(parent);
+        if kind.is_group() {
+            return false;
+        }
+        let direction = match kind.orientation() {
+            Orientation::Horizontal => Direction::Right,
+            Orientation::Vertical => Direction::Down,
+        };
+        let Some(current) = self.tree.data.size.proportion(&self.tree.map, node) else {
+            return false;
+        };
+        let delta = proportion - current;
+        if delta.abs() < 0.001 {
+            return true;
+        }
+        // resize takes a ratio of the screen, while delta is a ratio of the
+        // parent, so scale by the parent's own share of the screen.
+        let screen_share = self.screen_share(parent, direction);
+        if screen_share <= 0.0 {
+            return false;
+        }
+        self.resize(node, delta * screen_share, direction)
+    }
+
+    /// The share of the screen taken up by `node` along `direction`'s axis.
+    fn screen_share(&self, node: NodeId, direction: Direction) -> f64 {
+        node.ancestors(&self.tree.map)
+            .fold(1.0, |share, node| match node.parent(&self.tree.map) {
+                Some(parent)
+                    if self.tree.data.size.kind(parent).orientation()
+                        == direction.orientation()
+                        && !self.tree.data.size.kind(parent).is_group() =>
+                {
+                    share * self.tree.data.size.proportion(&self.tree.map, node).unwrap()
+                }
+                _ => share,
+            })
     }
 
     pub fn resize(&mut self, node: NodeId, screen_ratio: f64, direction: Direction) -> bool {

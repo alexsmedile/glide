@@ -49,6 +49,10 @@ pub enum LayoutCommand {
         #[serde(default = "default_resize_percent")]
         percent: f64,
     },
+    SetProportion {
+        #[serde(rename = "proportion")]
+        proportion: f64,
+    },
     CycleColumnWidth,
     ChangeLayoutKind,
     ToggleColumnTabbed,
@@ -152,6 +156,7 @@ impl LayoutCommand {
             | Ungroup
             | Balance
             | Resize { .. }
+            | SetProportion { .. }
             | CycleColumnWidth
             | ToggleColumnTabbed => true,
 
@@ -1053,6 +1058,11 @@ impl LayoutManager {
                 let percent = percent.clamp(-100.0, 100.0);
                 let node = self.tree.selection(layout);
                 self.tree.resize(node, percent / 100.0, direction);
+                EventResponse::default()
+            }
+            LayoutCommand::SetProportion { proportion } => {
+                let node = self.tree.selection(layout);
+                self.tree.set_proportion(node, proportion.clamp(0.0, 1.0));
                 EventResponse::default()
             }
             LayoutCommand::CycleColumnWidth => {
@@ -2962,6 +2972,115 @@ mod tests {
         let layout = mgr.layout(space);
         let parent = mgr.tree.selection(layout).parent(mgr.tree.map()).unwrap();
         assert_eq!(ContainerKind::Stacked, mgr.tree.container_kind(parent));
+    }
+
+    #[test]
+    fn it_sets_an_exact_proportion_with_set_proportion() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let pid = 1;
+        let windows = make_windows(pid, 2);
+
+        let screen = rect(0, 0, 900, 100);
+        _ = mgr.handle_event(SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, windows));
+        _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, 1)));
+
+        _ = mgr.handle_command(Some(space), &[space], SetProportion { proportion: 1.0 / 3.0 });
+        assert_eq!(
+            vec![
+                (WindowId::new(pid, 1), rect(0, 0, 300, 100)),
+                (WindowId::new(pid, 2), rect(300, 0, 600, 100)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+
+        // Setting a proportion is absolute, not relative: going to 2/3 from
+        // 1/3 lands on 2/3 rather than compounding.
+        _ = mgr.handle_command(Some(space), &[space], SetProportion { proportion: 2.0 / 3.0 });
+        assert_eq!(
+            vec![
+                (WindowId::new(pid, 1), rect(0, 0, 600, 100)),
+                (WindowId::new(pid, 2), rect(600, 0, 300, 100)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+
+        // Repeating it is a no-op.
+        _ = mgr.handle_command(Some(space), &[space], SetProportion { proportion: 2.0 / 3.0 });
+        assert_eq!(
+            vec![
+                (WindowId::new(pid, 1), rect(0, 0, 600, 100)),
+                (WindowId::new(pid, 2), rect(600, 0, 300, 100)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+    }
+
+    #[test]
+    fn set_proportion_follows_the_parent_orientation() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let pid = 1;
+        let windows = make_windows(pid, 1);
+
+        let screen = rect(0, 0, 100, 900);
+        _ = mgr.handle_event(SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, windows));
+        _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, 1)));
+
+        // Nest the window in a vertical container, so the second window lands
+        // below it rather than beside it.
+        _ = mgr.handle_command(Some(space), &[space], Split(Orientation::Vertical));
+        _ = mgr.handle_event(WindowAdded(space, WindowId::new(pid, 2), win_info()));
+        _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, 1)));
+
+        // The parent is vertical, so the proportion applies to height.
+        _ = mgr.handle_command(Some(space), &[space], SetProportion { proportion: 1.0 / 3.0 });
+        assert_eq!(
+            vec![
+                (WindowId::new(pid, 1), rect(0, 0, 100, 300)),
+                (WindowId::new(pid, 2), rect(0, 300, 100, 600)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+    }
+
+    #[test]
+    fn set_proportion_is_relative_to_the_parent_not_the_screen() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let pid = 1;
+        let windows = make_windows(pid, 2);
+
+        let screen = rect(0, 0, 900, 100);
+        _ = mgr.handle_event(SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, windows));
+        _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, 2)));
+
+        // Nest a third window beside the second, so the pair shares the right
+        // half of the screen.
+        _ = mgr.handle_command(Some(space), &[space], Split(Orientation::Horizontal));
+        _ = mgr.handle_event(WindowAdded(space, WindowId::new(pid, 3), win_info()));
+        _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, 2)));
+
+        // 1/3 of the parent container, which is itself half the screen, so
+        // 150px rather than 300px.
+        _ = mgr.handle_command(Some(space), &[space], SetProportion { proportion: 1.0 / 3.0 });
+        assert_eq!(
+            vec![
+                (WindowId::new(pid, 1), rect(0, 0, 450, 100)),
+                (WindowId::new(pid, 2), rect(450, 0, 150, 100)),
+                (WindowId::new(pid, 3), rect(600, 0, 300, 100)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
     }
 
     #[test]
