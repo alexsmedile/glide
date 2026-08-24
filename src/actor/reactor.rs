@@ -278,6 +278,8 @@ struct FrameAttempt {
 #[derive(Debug, Clone, Copy)]
 struct WindowDropDrag {
     window_id: WindowId,
+    destination: Option<(Option<SpaceId>, layout::WindowDropPreview)>,
+    native_frame_changed: bool,
 }
 
 #[derive(Debug)]
@@ -599,6 +601,11 @@ impl Reactor {
                 if old_frame == new_frame {
                     return;
                 }
+                if let Some(drag) = &mut self.window_drop_drag
+                    && drag.window_id == wid
+                {
+                    drag.native_frame_changed = true;
+                }
                 self.send_layout_event(LayoutEvent::WindowFrameChanged { wid, frame: new_frame });
                 let old_screen = self.best_screen_idx_for_window(&old_frame);
                 let new_screen = self.best_screen_idx_for_window(&new_frame);
@@ -787,7 +794,11 @@ impl Reactor {
                     .mouse_drag
                     .then(|| target.and_then(|wsid| self.window_ids.get(&wsid).copied()))
                     .flatten()
-                    .map(|window_id| WindowDropDrag { window_id });
+                    .map(|window_id| WindowDropDrag {
+                        window_id,
+                        destination: None,
+                        native_frame_changed: false,
+                    });
                 let layout_drag_started = modifiers.alt_held && self.window_drop_drag.is_some();
                 if let Some(screen) = self.active_screen()
                     && let Some(space) = screen.space
@@ -823,6 +834,10 @@ impl Reactor {
                 }
             }
             Event::MouseUp => {
+                let window_drop = self.window_drop_drag.and_then(|drag| {
+                    let (space, preview) = drag.destination?;
+                    Some((space, drag.window_id, preview))
+                });
                 self.hide_window_drop_preview();
                 if self.layout.has_interactive_state() {
                     if let Some(&screen) = self.active_screen() {
@@ -834,6 +849,13 @@ impl Reactor {
                 }
                 self.in_drag = false;
                 self.resizing_window = None;
+                if let Some((space, dragged_window, preview)) = window_drop
+                    && let Some(response) =
+                        self.layout.apply_window_drop(space, dragged_window, preview)
+                {
+                    self.handle_layout_response(response);
+                    self.update_layout(&[], false);
+                }
                 // Now re-check the layout.
             }
             Event::MouseMovedOverWindow(wsid, key_focus_pid) => {
@@ -1140,6 +1162,15 @@ impl Reactor {
 
     fn update_window_drop_preview(&mut self, point: CGPoint, modifiers: MouseModifiers) {
         let Some(drag) = self.window_drop_drag else { return };
+        if !modifiers.alt_held && !drag.native_frame_changed {
+            if let Some(drag) = &mut self.window_drop_drag {
+                drag.destination = None;
+            }
+            if let Some(tx) = &self.drop_preview_tx {
+                tx.send(drop_preview::Event::Hide);
+            }
+            return;
+        }
         let Some(screen) = self.screens.iter().copied().find(|screen| screen.frame.contains(point))
         else {
             if let Some(tx) = &self.drop_preview_tx {
@@ -1156,6 +1187,9 @@ impl Reactor {
             self.config.settings.mouse_drag_snap_distance,
             &self.config,
         );
+        if let Some(drag) = &mut self.window_drop_drag {
+            drag.destination = preview.map(|preview| (screen.space, preview));
+        }
         if let Some(tx) = &self.drop_preview_tx {
             tx.send(match preview {
                 Some(preview) => drop_preview::Event::Show(preview),
@@ -1449,7 +1483,7 @@ pub mod tests {
     }
 
     #[test]
-    fn mouse_drag_emits_preview_without_moving_the_window() {
+    fn mouse_drag_applies_the_screen_preview_only_on_mouse_up() {
         let mut config = Config::default();
         config.settings.default_disable = false;
         config.settings.animate = false;
@@ -1485,9 +1519,17 @@ pub mod tests {
         _ = preview_rx.try_recv();
 
         reactor.handle_event(Event::LeftMouseDown(
-            CGPoint::new(100.0, 100.0),
+            CGPoint::new(700.0, 100.0),
             MouseModifiers::default(),
-            Some(WindowServerId::new(1)),
+            Some(WindowServerId::new(2)),
+        ));
+        let dragged = WindowId::new(1, 2);
+        reactor.handle_event(Event::WindowFrameChanged(
+            dragged,
+            CGRect::new(CGPoint::new(510.0, 0.0), CGSize::new(500.0, 600.0)),
+            apps.windows[&dragged].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Down),
         ));
         reactor.handle_event(Event::LeftMouseDragged(
             CGPoint::new(5.0, 300.0),
@@ -1506,6 +1548,85 @@ pub mod tests {
             preview_rx.try_recv(),
             Ok((_, drop_preview::Event::Hide))
         ));
+        let requests = apps.requests();
+        assert!(
+            requests.iter().any(|request| {
+                matches!(
+                    request,
+                    Request::SetWindowFrame(wid, frame, _)
+                        if *wid == WindowId::new(1, 2)
+                            && *frame == CGRect::new(
+                                CGPoint::new(0.0, 0.0),
+                                CGSize::new(500.0, 600.0),
+                            )
+                )
+            }),
+            "{requests:?}"
+        );
+    }
+
+    #[test]
+    fn alt_mouse_drop_applies_the_previewed_layout_target() {
+        let mut config = Config::default();
+        config.settings.default_disable = false;
+        config.settings.animate = false;
+        config.settings.mouse_drag = true;
+        let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
+        let (group_indicators_tx, _) = crate::actor::channel();
+        let mut reactor = Reactor::new(
+            Arc::new(config),
+            LayoutManager::new_for_test(),
+            record,
+            group_indicators_tx,
+        );
+        let (preview_tx, mut preview_rx) = crate::actor::channel();
+        reactor.drop_preview_tx = Some(preview_tx);
+
+        let mut apps = Apps::new();
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(900., 600.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(
+            1,
+            make_windows(3),
+            Some(WindowId::new(1, 1)),
+            true,
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        _ = preview_rx.try_recv();
+
+        reactor.handle_event(Event::LeftMouseDown(
+            CGPoint::new(100.0, 100.0),
+            MouseModifiers { alt_held: true },
+            Some(WindowServerId::new(1)),
+        ));
+        reactor.handle_event(Event::LeftMouseDragged(
+            CGPoint::new(450.0, 500.0),
+            MouseModifiers { alt_held: true },
+        ));
+        reactor.handle_event(Event::MouseUp);
+
+        let requests = apps.requests();
+        assert!(
+            requests.iter().any(|request| {
+                matches!(
+                    request,
+                    Request::SetWindowFrame(wid, frame, _)
+                        if *wid == WindowId::new(1, 1)
+                            && *frame == CGRect::new(
+                                CGPoint::new(0.0, 300.0),
+                                CGSize::new(450.0, 300.0),
+                            )
+                )
+            }),
+            "{requests:?}"
+        );
     }
 
     #[test]

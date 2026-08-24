@@ -1218,6 +1218,57 @@ impl ActiveFloatingWindows {
 }
 
 impl LayoutManager {
+    pub fn apply_window_drop(
+        &mut self,
+        space: Option<SpaceId>,
+        dragged_window: WindowId,
+        preview: WindowDropPreview,
+    ) -> Option<EventResponse> {
+        let Some(target_window) = preview.target_window else {
+            self.add_floating_window(dragged_window, space);
+            self.tree.remove_window(dragged_window);
+            self.floating_restore_frames
+                .insert(dragged_window, FloatingRestoreFrame { frame: preview.frame });
+            return Some(EventResponse {
+                frame_overrides: vec![(dragged_window, preview.frame)],
+                ..Default::default()
+            });
+        };
+        let space = space?;
+        let layout = self.try_layout(space)?;
+        if self.tree.layout_kind(layout) != LayoutKind::Tree {
+            return None;
+        }
+        let direction = match preview.placement {
+            WindowDropPlacement::SplitLeft => Some(Direction::Left),
+            WindowDropPlacement::SplitRight => Some(Direction::Right),
+            WindowDropPlacement::SplitTop => Some(Direction::Up),
+            WindowDropPlacement::SplitBottom => Some(Direction::Down),
+            WindowDropPlacement::Group => None,
+            _ => return None,
+        };
+
+        if self.floating_windows.contains(&dragged_window) {
+            self.remove_floating_window(dragged_window, Some(space));
+        }
+        let changed = if let Some(direction) = direction {
+            self.tree.drop_window_beside(layout, dragged_window, target_window, direction)
+        } else {
+            self.tree.drop_window_in_group(
+                layout,
+                dragged_window,
+                target_window,
+                ContainerKind::Stacked,
+            )
+        };
+        if changed {
+            self.clear_user_scrolling(space);
+            Some(EventResponse::default())
+        } else {
+            None
+        }
+    }
+
     pub fn window_drop_preview(
         &self,
         space: Option<SpaceId>,
@@ -3733,6 +3784,67 @@ mod tests {
 
         assert_eq!(preview.target_window, None);
         assert_eq!(preview.placement, WindowDropPlacement::ScreenLeft);
+    }
+
+    #[test]
+    fn applying_an_alt_drop_restructures_the_managed_layout() {
+        use LayoutEvent::*;
+
+        let mut mgr = LayoutManager::new_for_test();
+        let config = Config::default();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 900, 600);
+        let dragged = WindowId::new(1, 1);
+        let target = WindowId::new(1, 2);
+        _ = mgr.handle_event(SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 1, make_windows(1, 3)));
+        let preview = WindowDropPreview {
+            target_window: Some(target),
+            placement: WindowDropPlacement::SplitBottom,
+            frame: CGRect::ZERO,
+        };
+
+        assert!(mgr.apply_window_drop(Some(space), dragged, preview).is_some());
+        assert_eq!(
+            mgr.calculate_layout(space, screen, &config),
+            vec![
+                (target, rect(0, 0, 450, 300)),
+                (dragged, rect(0, 300, 450, 300)),
+                (WindowId::new(1, 3), rect(450, 0, 450, 600)),
+            ]
+        );
+    }
+
+    #[test]
+    fn applying_a_screen_edge_drop_floats_at_the_previewed_frame() {
+        use LayoutEvent::*;
+
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 900, 600);
+        let dragged = WindowId::new(1, 1);
+        let snapped = rect(0, 0, 450, 600);
+        _ = mgr.handle_event(SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 1, make_windows(1, 2)));
+
+        let response = mgr
+            .apply_window_drop(
+                Some(space),
+                dragged,
+                WindowDropPreview {
+                    target_window: None,
+                    placement: WindowDropPlacement::ScreenLeft,
+                    frame: snapped,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(response.frame_overrides, vec![(dragged, snapped)]);
+        assert_eq!(mgr.floating_windows_in_space(space), BTreeSet::from([dragged]));
+        assert_eq!(
+            mgr.calculate_layout(space, screen, &Config::default()),
+            vec![(WindowId::new(1, 2), screen)]
+        );
     }
 
     #[test]

@@ -588,6 +588,84 @@ impl LayoutTree {
         moved
     }
 
+    pub fn drop_window_beside(
+        &mut self,
+        layout: LayoutId,
+        moving_window: WindowId,
+        target_window: WindowId,
+        direction: Direction,
+    ) -> bool {
+        let Some(moving_node) = self.window_node(layout, moving_window) else {
+            return false;
+        };
+        let Some(target_node) = self.window_node(layout, target_window) else {
+            return false;
+        };
+        if moving_node == target_node {
+            return false;
+        }
+
+        let parent = target_node.parent(&self.tree.map).unwrap();
+        if self.container_kind(parent).is_group()
+            || self.container_kind(parent).orientation() != direction.orientation()
+        {
+            self.wrap_node(target_node, ContainerKind::from(direction.orientation()));
+        }
+        match direction {
+            Direction::Left | Direction::Up => {
+                moving_node.detach(&mut self.tree).insert_before(target_node);
+            }
+            Direction::Right | Direction::Down => {
+                moving_node.detach(&mut self.tree).insert_after(target_node);
+            }
+        }
+        self.select(moving_node);
+        true
+    }
+
+    pub fn drop_window_in_group(
+        &mut self,
+        layout: LayoutId,
+        moving_window: WindowId,
+        target_window: WindowId,
+        kind: ContainerKind,
+    ) -> bool {
+        if !kind.is_group() {
+            return false;
+        }
+        let Some(moving_node) = self.window_node(layout, moving_window) else {
+            return false;
+        };
+        let Some(target_node) = self.window_node(layout, target_window) else {
+            return false;
+        };
+        if moving_node == target_node {
+            return false;
+        }
+
+        let parent = target_node.parent(&self.tree.map).unwrap();
+        if !self.container_kind(parent).is_group() {
+            self.wrap_node(target_node, kind);
+        }
+        moving_node.detach(&mut self.tree).insert_after(target_node);
+        self.select(moving_node);
+        true
+    }
+
+    fn wrap_node(&mut self, node: NodeId, kind: ContainerKind) -> NodeId {
+        let old_parent = node.parent(&self.tree.map).expect("cannot wrap a layout root");
+        let is_selection =
+            self.tree.data.selection.local_selection(self.map(), old_parent) == Some(node);
+        let new_parent = self.tree.mk_node().insert_before(node);
+        self.tree.data.size.assume_size_of(new_parent, node, &self.tree.map);
+        node.detach(&mut self.tree).push_back(new_parent);
+        self.tree.data.size.set_kind(new_parent, kind);
+        if is_selection {
+            self.tree.data.selection.select_locally(&self.tree.map, new_parent);
+        }
+        new_parent
+    }
+
     fn move_node_inner(
         &mut self,
         layout: LayoutId,
@@ -1519,6 +1597,49 @@ mod tests {
 
         tree.move_node(layout, b1, Direction::Right);
         tree.assert_children_are([a1, b1, a3], root);
+    }
+
+    #[test]
+    fn drop_window_beside_nests_the_target_in_the_requested_direction() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let moving = w(1, 1);
+        let target = w(1, 2);
+        let other = w(1, 3);
+        tree.add_window_under(layout, root, moving);
+        tree.add_window_under(layout, root, target);
+        tree.add_window_under(layout, root, other);
+
+        assert!(tree.drop_window_beside(layout, moving, target, Direction::Down));
+
+        let frames = tree.calculate_layout(layout, rect(0, 0, 900, 600), &Config::default());
+        assert_eq!(
+            frames,
+            vec![
+                (target, rect(0, 0, 450, 300)),
+                (moving, rect(0, 300, 450, 300)),
+                (other, rect(450, 0, 450, 600)),
+            ]
+        );
+    }
+
+    #[test]
+    fn drop_window_in_group_reuses_a_group_and_selects_the_drop() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let moving = w(1, 1);
+        let target = w(1, 2);
+        let grouped = w(1, 3);
+        tree.add_window_under(layout, root, moving);
+        let group = tree.add_container(root, ContainerKind::Stacked);
+        tree.add_window_under(layout, group, target);
+        tree.add_window_under(layout, group, grouped);
+
+        assert!(tree.drop_window_in_group(layout, moving, target, ContainerKind::Stacked));
+        assert_eq!(tree.selection(layout), tree.window_node(layout, moving).unwrap());
+        assert_eq!(tree.visible_windows_under(root), vec![moving]);
     }
 
     #[test]
