@@ -693,7 +693,15 @@ impl Reactor {
                 let response = self
                     .screens
                     .iter()
-                    .filter_map(|screen| screen.space.map(|space| (space, screen.frame.size)))
+                    .filter_map(|screen| {
+                        let space = screen.space?;
+                        let expose = if changed_spaces.is_empty() {
+                            spaces.iter().all(Option::is_some)
+                        } else {
+                            changed_spaces.contains(&space)
+                        };
+                        expose.then_some((space, screen.frame.size))
+                    })
                     .map(|(space, size)| {
                         self.layout.handle_event(LayoutEvent::SpaceExposed(space, size))
                     })
@@ -2094,6 +2102,44 @@ pub mod tests {
                 frame: reactor.windows[wid].frame_monotonic,
             })
             .collect()
+    }
+
+    #[test]
+    fn it_does_not_raise_an_unchanged_display_while_the_changed_space_is_unresolved() {
+        let (mut apps, mut reactor, mut raise_manager_rx) = two_display_reactor_with_selection();
+        let space2 = SpaceId::new(2);
+        reactor.handle_events(apps.make_app_with_opts(
+            3,
+            vec![WindowInfo {
+                frame: CGRect::new(CGPoint::new(1600., 450.), CGSize::new(300., 300.)),
+                ..make_window(30)
+            }],
+            Some(WindowId::new(3, 1)),
+            false,
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        while raise_manager_rx.try_recv().is_ok() {}
+
+        let mut on_screen = ws_infos(&reactor, &[WindowId::new(3, 1), WindowId::new(2, 1)]);
+        on_screen.insert(
+            1,
+            crate::sys::window_server::WindowServerInfo {
+                id: WindowServerId::new(999),
+                pid: 4,
+                layer: 0,
+                frame: CGRect::new(CGPoint::new(1490., 0.), CGSize::new(1020., 1020.)),
+            },
+        );
+        reactor.handle_event(Event::SpaceChanged(
+            vec![None, Some(space2)],
+            WindowsOnScreen::new(on_screen),
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+
+        assert!(
+            raise_manager_rx.try_recv().is_err(),
+            "the unchanged display should not participate in the space-change raise sequence"
+        );
     }
 
     #[test]
