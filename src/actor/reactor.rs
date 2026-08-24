@@ -678,9 +678,18 @@ impl Reactor {
                 self.in_drag = false;
                 self.resizing_window = None;
                 info!("space changed");
+                let old_spaces: Vec<Option<SpaceId>> =
+                    self.screens.iter().map(|screen| screen.space).collect();
                 for (space, screen) in spaces.iter().zip(&mut self.screens) {
                     screen.space = *space;
                 }
+                // The notification covers every screen, so this is the set of
+                // screens whose active space actually changed.
+                let changed_spaces: Vec<SpaceId> = spaces
+                    .iter()
+                    .zip(old_spaces)
+                    .filter_map(|(new, old)| (*new).filter(|space| Some(*space) != old))
+                    .collect();
                 let response = self
                     .screens
                     .iter()
@@ -699,6 +708,33 @@ impl Reactor {
                     );
                     for space in self.screens.iter().flat_map(|screen| screen.space) {
                         self.layout.debug_tree_desc(space, "after event", false);
+                    }
+                }
+                // Switching spaces rarely moves key focus by itself: macOS
+                // often reports no focused window yet, or still points at the
+                // display the user came from, while quiet raises race to
+                // activate their own apps. When macOS's focus doesn't point
+                // into one of the changed spaces, restore that space's
+                // remembered selection instead of leaving the outcome to the
+                // race. Click-to-switch keeps working because there the
+                // reported focus already points into the newly exposed space.
+                if !changed_spaces.is_empty()
+                    && !self
+                        .main_window_space()
+                        .is_some_and(|space| changed_spaces.contains(&space))
+                {
+                    let focus =
+                        changed_spaces.iter().find_map(|space| self.layout.selected_window(*space));
+                    if let Some(wid) = focus
+                        && self.main_window() != Some(wid)
+                    {
+                        self.handle_layout_response_with_context(
+                            layout::EventResponse {
+                                focus_window: Some(wid),
+                                ..Default::default()
+                            },
+                            ResponseContext::default(),
+                        );
                     }
                 }
                 if let Some(main_window) = self.main_window() {
@@ -1997,6 +2033,166 @@ pub mod tests {
             }
             _ => panic!("Unexpected event: {msg:?}"),
         }
+    }
+
+    /// Set up two displays with managed spaces. Display A shows `space1` with
+    /// two windows of app 1, display B shows `space2` with one window of app
+    /// 2, and the user is focused on window 2 of app 1.
+    fn two_display_reactor_with_selection() -> (
+        Apps,
+        Reactor,
+        mpsc::UnboundedReceiver<(tracing::Span, raise::Event)>,
+    ) {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
+        reactor.raise_manager_tx = raise_manager_tx;
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![
+                CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.)),
+                CGRect::new(CGPoint::new(1500., 0.), CGSize::new(1000., 1000.)),
+            ],
+            spaces: vec![Some(space1), Some(space2)],
+            scale_factors: vec![2.0, 2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_events(apps.make_app_with_opts(
+            1,
+            make_windows(2),
+            Some(WindowId::new(1, 2)),
+            true,
+        ));
+        reactor.handle_events(apps.make_app_with_opts(
+            2,
+            vec![WindowInfo {
+                frame: CGRect::new(CGPoint::new(1600., 100.), CGSize::new(300., 300.)),
+                ..make_window(20)
+            }],
+            Some(WindowId::new(2, 1)),
+            false,
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!(reactor.main_window(), Some(WindowId::new(1, 2)));
+        assert_eq!(reactor.layout.selected_window(space1), Some(WindowId::new(1, 2)));
+        while raise_manager_rx.try_recv().is_ok() {}
+        (apps, reactor, raise_manager_rx)
+    }
+
+    fn ws_infos(
+        reactor: &Reactor,
+        wids: &[WindowId],
+    ) -> Vec<crate::sys::window_server::WindowServerInfo> {
+        wids.iter()
+            .map(|wid| crate::sys::window_server::WindowServerInfo {
+                id: reactor.windows[wid].window_server_id.unwrap(),
+                pid: wid.pid,
+                layer: 0,
+                frame: reactor.windows[wid].frame_monotonic,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn it_focuses_the_remembered_selection_when_macos_focus_is_on_another_display() {
+        let (mut apps, mut reactor, mut raise_manager_rx) = two_display_reactor_with_selection();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let space3 = SpaceId::new(3);
+
+        // Leave space1 for a fresh space on display A.
+        reactor.handle_event(Event::SpaceChanged(
+            vec![Some(space3), Some(space2)],
+            WindowsOnScreen::new(ws_infos(&reactor, &[WindowId::new(2, 1)])),
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        while raise_manager_rx.try_recv().is_ok() {}
+
+        // macOS still reports focus on display B when we come back.
+        reactor.handle_event(Event::ApplicationDeactivated(1));
+        reactor.handle_event(Event::ApplicationGloballyDeactivated(1));
+        reactor.handle_event(Event::ApplicationActivated(2, Quiet::No));
+        reactor.handle_event(Event::ApplicationGloballyActivated(2));
+        assert_eq!(reactor.main_window(), Some(WindowId::new(2, 1)));
+
+        // Return to space1.
+        let on_screen = ws_infos(
+            &reactor,
+            &[
+                WindowId::new(1, 1),
+                WindowId::new(1, 2),
+                WindowId::new(2, 1),
+            ],
+        );
+        reactor.handle_event(Event::SpaceChanged(
+            vec![Some(space1), Some(space2)],
+            WindowsOnScreen::new(on_screen),
+        ));
+
+        // Focus should go to the remembered selection of space1 instead of
+        // being left to the raises racing for it.
+        let mut saw_focus = false;
+        while let Ok((_, msg)) = raise_manager_rx.try_recv() {
+            if let raise::Event::RaiseRequest(RaiseRequest {
+                focus_window: Some((wid, _)), ..
+            }) = msg
+            {
+                assert_eq!(wid, WindowId::new(1, 2));
+                saw_focus = true;
+            }
+        }
+        assert!(
+            saw_focus,
+            "expected a focus request for the remembered selection"
+        );
+        assert_eq!(reactor.layout.selected_window(space1), Some(WindowId::new(1, 2)));
+    }
+
+    #[test]
+    fn it_keeps_macos_focus_when_it_points_into_the_changed_space() {
+        let (mut apps, mut reactor, mut raise_manager_rx) = two_display_reactor_with_selection();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let space3 = SpaceId::new(3);
+
+        reactor.handle_event(Event::SpaceChanged(
+            vec![Some(space3), Some(space2)],
+            WindowsOnScreen::new(ws_infos(&reactor, &[WindowId::new(2, 1)])),
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        while raise_manager_rx.try_recv().is_ok() {}
+
+        // The user clicked a window in space1 as part of switching to it, so
+        // macOS's focus already points into the changed space.
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_event(Event::ApplicationActivated(1, Quiet::No));
+        assert_eq!(reactor.main_window(), Some(WindowId::new(1, 2)));
+
+        let on_screen = ws_infos(
+            &reactor,
+            &[
+                WindowId::new(1, 1),
+                WindowId::new(1, 2),
+                WindowId::new(2, 1),
+            ],
+        );
+        reactor.handle_event(Event::SpaceChanged(
+            vec![Some(space1), Some(space2)],
+            WindowsOnScreen::new(on_screen),
+        ));
+
+        while let Ok((_, msg)) = raise_manager_rx.try_recv() {
+            if let raise::Event::RaiseRequest(RaiseRequest { focus_window, .. }) = msg {
+                assert!(
+                    focus_window.is_none(),
+                    "macOS focus should be respected, got {focus_window:?}"
+                );
+            }
+        }
+        assert_eq!(reactor.layout.selected_window(space1), Some(WindowId::new(1, 2)));
     }
 
     #[test]

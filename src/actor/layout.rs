@@ -1647,9 +1647,8 @@ impl LayoutManager {
 
     // This seems a bit messy, but it's simpler and more robust to write some
     // reactor tests as integration tests with this actor.
-    #[cfg(test)]
     pub(super) fn selected_window(&mut self, space: SpaceId) -> Option<WindowId> {
-        let layout = self.layout(space);
+        let layout = self.try_layout(space)?;
         self.tree.window_at(self.tree.selection(layout))
     }
 
