@@ -99,6 +99,12 @@ default_keys = false
 # "<key>" = { set_proportion = { proportion = 0.5 } }
 # "<key>" = { set_proportion = { proportion = 0.333 } }
 
+# Omit the direction to grow or shrink along whichever axis the container
+# lays its children out on, taking from the neighbour on either side. A
+# negative percent shrinks.
+"Alt + Minus" = { resize = { percent = -5 } }
+"Alt + Shift + Equal" = { resize = { percent = 5 } }
+
 # Move up or down the tree hierarchy, selecting a parent or child node
 # respectively. These commands change which node is selected (similar to
 # move_focus) rather than moving windows. The selected node affects subsequent
