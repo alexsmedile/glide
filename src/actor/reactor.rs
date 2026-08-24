@@ -690,6 +690,11 @@ impl Reactor {
                     .zip(old_spaces)
                     .filter_map(|(new, old)| (*new).filter(|space| Some(*space) != old))
                     .collect();
+                // SpaceManager uses None for unmanaged spaces. A space query can
+                // also return None while a display has no active space. In
+                // either case, an unchanged managed display must not join the
+                // raise sequence. Fully resolved no-change events still repair
+                // stacking after external window-order changes.
                 let response = self
                     .screens
                     .iter()
@@ -2105,7 +2110,7 @@ pub mod tests {
     }
 
     #[test]
-    fn it_does_not_raise_an_unchanged_display_while_the_changed_space_is_unresolved() {
+    fn it_does_not_raise_an_unchanged_display_when_another_display_is_unmanaged() {
         let (mut apps, mut reactor, mut raise_manager_rx) = two_display_reactor_with_selection();
         let space2 = SpaceId::new(2);
         reactor.handle_events(apps.make_app_with_opts(
@@ -2139,6 +2144,100 @@ pub mod tests {
         assert!(
             raise_manager_rx.try_recv().is_err(),
             "the unchanged display should not participate in the space-change raise sequence"
+        );
+    }
+
+    #[test]
+    fn it_restores_remembered_focus_when_an_unmanaged_space_becomes_managed() {
+        let (mut apps, mut reactor, mut raise_manager_rx) = two_display_reactor_with_selection();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+
+        reactor.handle_event(Event::SpaceChanged(
+            vec![None, Some(space2)],
+            WindowsOnScreen::new(ws_infos(&reactor, &[WindowId::new(2, 1)])),
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        while raise_manager_rx.try_recv().is_ok() {}
+
+        reactor.handle_event(Event::ApplicationDeactivated(1));
+        reactor.handle_event(Event::ApplicationGloballyDeactivated(1));
+        reactor.handle_event(Event::ApplicationActivated(2, Quiet::No));
+        reactor.handle_event(Event::ApplicationGloballyActivated(2));
+
+        reactor.handle_event(Event::SpaceChanged(
+            vec![Some(space1), Some(space2)],
+            WindowsOnScreen::new(ws_infos(
+                &reactor,
+                &[
+                    WindowId::new(1, 1),
+                    WindowId::new(1, 2),
+                    WindowId::new(2, 1),
+                ],
+            )),
+        ));
+
+        let mut saw_focus = false;
+        while let Ok((_, raise::Event::RaiseRequest(request))) = raise_manager_rx.try_recv() {
+            assert!(
+                request.raise_windows.iter().flatten().all(|wid| wid.pid != 2),
+                "the unchanged display should not be raised"
+            );
+            if let Some((wid, _)) = request.focus_window {
+                assert_eq!(wid, WindowId::new(1, 2));
+                saw_focus = true;
+            }
+        }
+        assert!(saw_focus, "expected the remembered window to receive focus");
+    }
+
+    #[test]
+    fn it_repairs_stacking_on_a_resolved_two_display_no_change_event() {
+        let (mut apps, mut reactor, mut raise_manager_rx) = two_display_reactor_with_selection();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        reactor.handle_events(apps.make_app_with_opts(
+            3,
+            vec![WindowInfo {
+                frame: CGRect::new(CGPoint::new(1600., 450.), CGSize::new(300., 300.)),
+                ..make_window(30)
+            }],
+            Some(WindowId::new(3, 1)),
+            false,
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        while raise_manager_rx.try_recv().is_ok() {}
+
+        let mut on_screen = ws_infos(
+            &reactor,
+            &[
+                WindowId::new(1, 1),
+                WindowId::new(1, 2),
+                WindowId::new(3, 1),
+                WindowId::new(2, 1),
+            ],
+        );
+        on_screen.insert(
+            2,
+            crate::sys::window_server::WindowServerInfo {
+                id: WindowServerId::new(999),
+                pid: 4,
+                layer: 0,
+                frame: CGRect::new(CGPoint::new(1490., 0.), CGSize::new(1020., 1020.)),
+            },
+        );
+        reactor.handle_event(Event::SpaceChanged(
+            vec![Some(space1), Some(space2)],
+            WindowsOnScreen::new(on_screen),
+        ));
+
+        let (_, msg) = raise_manager_rx.try_recv().expect("expected a stacking repair");
+        let raise::Event::RaiseRequest(request) = msg else {
+            panic!("expected a raise request, got {msg:?}");
+        };
+        assert!(
+            request.raise_windows.iter().flatten().any(|wid| wid.pid == 2 || wid.pid == 3),
+            "expected the unchanged second display to participate in the repair"
         );
     }
 
@@ -2183,11 +2282,17 @@ pub mod tests {
         let mut saw_focus = false;
         while let Ok((_, msg)) = raise_manager_rx.try_recv() {
             if let raise::Event::RaiseRequest(RaiseRequest {
-                focus_window: Some((wid, _)), ..
+                raise_windows, focus_window, ..
             }) = msg
             {
-                assert_eq!(wid, WindowId::new(1, 2));
-                saw_focus = true;
+                assert!(
+                    raise_windows.iter().flatten().all(|wid| wid.pid != 2),
+                    "the unchanged display should not be raised"
+                );
+                if let Some((wid, _)) = focus_window {
+                    assert_eq!(wid, WindowId::new(1, 2));
+                    saw_focus = true;
+                }
             }
         }
         assert!(
