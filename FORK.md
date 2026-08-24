@@ -1,0 +1,126 @@
+# Fork notes
+
+This fork adds resize and layout commands that AeroSpace had and upstream
+Glide does not. Everything here is additive: no upstream behaviour changes,
+and existing configs keep working.
+
+## Branches
+
+| Branch | Contents |
+|---|---|
+| `main` | All features, stacked. This is the branch to build and run. |
+| `upstream-main` | Clean upstream, no local commits. Rebase target. |
+| `feat/*` | One feature each, branched off `upstream-main`, for PRs. |
+
+Each `feat/*` branch builds and passes tests on its own, so it can be
+reviewed without the others. `main` is those same commits in order, so it
+stays a fast-forward of whatever upstream takes.
+
+## Upstream status
+
+| Feature | Branch | Upstream |
+|---|---|---|
+| `toggle_orientation` | `feat/toggle-orientation` | PR #237 |
+| `balance` | `feat/balance-sizes` | PR #238 |
+| smart `resize` | `feat/resize-smart` | PR #239 |
+| `set_proportion` | `feat/resize-presets` | issue #240, no PR yet |
+
+`set_proportion` is deliberately an issue rather than a PR: upstream already
+has `cycle_column_width`, which reads a presets list from config, so whether
+this should be a per-binding argument or a cycling command is a question for
+the maintainer before the code is written.
+
+## Features
+
+### `toggle_orientation` — `feat/toggle-orientation`
+
+Flips the parent container between horizontal and vertical, rearranging the
+windows already inside it. Groups stay groups: tabbed flips to stacked.
+
+Upstream's `split` only declares an orientation for windows opened *later*;
+there was no way to reorient a container that already has windows in it.
+
+```toml
+"Alt + Slash" = "toggle_orientation"
+```
+
+### `balance` — `feat/balance-sizes`
+
+Resets every container on the space to divide its space evenly, nested ones
+included. Sizing is a weight per node, so this sets every weight to 1.
+
+```toml
+"Alt + Shift + Digit0" = "balance"
+```
+
+### `set_proportion` — `feat/resize-presets`
+
+Gives the focused window an exact share of its container, along whichever
+axis the container uses. Absolute rather than incremental, so a key bound to
+a fraction always lands on that fraction and pressing it twice is a no-op.
+
+```toml
+"Alt + Ctrl + Digit1" = { set_proportion = { proportion = 0.333 } }
+"Alt + Ctrl + Digit5" = { set_proportion = { proportion = 0.5 } }
+```
+
+The proportion is of the parent container, not the screen: a window nested
+inside a half-screen split set to `0.5` fills a quarter of the screen.
+
+### Smart `resize` — `feat/resize-smart`
+
+Omitting `direction` resizes along whichever axis the container uses, so one
+key pair grows and shrinks in both a row and a column. A negative percent
+shrinks. `direction` is now optional, so existing configs are unaffected.
+
+Smart means it picks the *axis*, not the *side*. The space comes from the
+next window, or the previous one when there is no next, so a window in the
+middle of a row always moves its right edge:
+
+```
+before   [300][300][300]
+grow     [300][390][210]     right edge moved; left window untouched
+```
+
+Taking from whichever neighbour has more room was the alternative. It is
+rejected on purpose: which neighbour is larger changes as the layout
+changes, so repeated presses would move a different edge each time.
+
+Within a nested tree it acts on the container the window belongs to, so a
+window in a vertical stack grows downward rather than sideways. Groups do
+nothing, since only one window shows at a time.
+
+```toml
+"Alt + Minus" = { resize = { percent = -5 } }
+"Alt + Shift + Equal" = { resize = { percent = 5 } }
+```
+
+## The edge case worth knowing
+
+A node at the *end* of its container has no neighbour past its far edge, so
+resizing toward that edge finds no one to trade space with and does nothing.
+This is why a resize key can look dead on the rightmost window in a row while
+working everywhere else — it affects upstream's own `Alt + Ctrl + L` too.
+
+Both `set_proportion` and smart `resize` fall back to the neighbour on the
+near side. The fixed-direction `resize` still behaves as upstream does.
+
+## Building
+
+```
+cargo build --release
+cargo test
+```
+
+Running the built binary as an app bundle, so macOS Accessibility permission
+sticks to a stable identity:
+
+```
+cp -R /Applications/Glide.app /Applications/Glide-Dev.app
+# set CFBundleIdentifier to something distinct, then each rebuild:
+cp target/release/glide_server /Applications/Glide-Dev.app/Contents/MacOS/
+codesign --force --deep -s - /Applications/Glide-Dev.app
+```
+
+Replacing the binary breaks the developer signature, which revokes
+Accessibility. A separate bundle keeps the stock app working as a fallback.
