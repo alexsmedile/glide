@@ -869,6 +869,41 @@ impl LayoutTree {
             })
     }
 
+    /// Grows or shrinks `node` along whichever axis its container lays its
+    /// children out on, so one key works for both a row and a column.
+    ///
+    /// A positive ratio always grows and a negative one always shrinks, no
+    /// matter which side the neighbour is on.
+    ///
+    /// The space always comes from the neighbour after `node`, falling back
+    /// to the one before it when `node` is last. A node in the middle of a
+    /// row therefore always moves its right edge, rather than picking the
+    /// side with more room: which neighbour is larger changes as the layout
+    /// changes, so choosing by size would move a different edge on each
+    /// press.
+    pub fn resize_smart(&mut self, node: NodeId, screen_ratio: f64) -> bool {
+        let Some(parent) = node.parent(&self.tree.map) else {
+            return false;
+        };
+        let kind = self.tree.data.size.kind(parent);
+        if kind.is_group() {
+            return false;
+        }
+        let (forward, back) = match kind.orientation() {
+            Orientation::Horizontal => (Direction::Right, Direction::Left),
+            Orientation::Vertical => (Direction::Down, Direction::Up),
+        };
+        // Prefer the neighbour past the node's far edge, but fall back to the
+        // near one so a node at the edge of its container can still resize.
+        // A positive ratio grows the node whichever edge is moving, so the
+        // sign carries over to the fallback unchanged.
+        if self.resize_target(node, forward).is_some() {
+            self.resize(node, screen_ratio, forward)
+        } else {
+            self.resize(node, screen_ratio, back)
+        }
+    }
+
     pub fn resize(&mut self, node: NodeId, screen_ratio: f64, direction: Direction) -> bool {
         let Some((resizing_node, sibling)) = self.resize_target(node, direction) else {
             return false;
