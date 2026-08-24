@@ -4,6 +4,14 @@ This fork adds resize and layout commands that AeroSpace had and upstream
 Glide does not. Everything here is additive: no upstream behaviour changes,
 and existing configs keep working.
 
+The config that drives it lives in its own repo at
+`~/code/utils/glide-config`, and requires this fork — upstream rejects it with
+a parse error.
+
+`cargo test` on `main` is 251 tests, 244 of them upstream's. Each feature's
+tests were checked to fail with the implementation removed, so they test the
+behaviour rather than passing either way.
+
 ## Branches
 
 | Branch | Contents |
