@@ -92,6 +92,13 @@ default_keys = false
 "Alt + Ctrl + K" = { resize = { direction = "up", percent = 5 } }
 "Alt + Ctrl + L" = { resize = { direction = "right", percent = 5 } }
 
+# Give the focused window an exact share of its container, along whichever
+# axis the container lays its children out on. Unlike resize, this is
+# absolute: pressing it twice leaves the window where it is.
+# Not bound by default, since which fractions are useful is a matter of taste.
+# "<key>" = { set_proportion = { proportion = 0.5 } }
+# "<key>" = { set_proportion = { proportion = 0.333 } }
+
 # Move up or down the tree hierarchy, selecting a parent or child node
 # respectively. These commands change which node is selected (similar to
 # move_focus) rather than moving windows. The selected node affects subsequent
