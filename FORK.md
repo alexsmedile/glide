@@ -23,6 +23,7 @@ stays a fast-forward of whatever upstream takes.
 | `toggle_orientation` | `feat/toggle-orientation` | PR #237 |
 | `balance` | `feat/balance-sizes` | PR #238 |
 | smart `resize` | `feat/resize-smart` | PR #239 |
+| `default_root_orientation` | `feat/auto-root-orientation` | PR #242, issue #241 |
 | `set_proportion` | `feat/resize-presets` | issue #240, no PR yet |
 
 `set_proportion` is deliberately an issue rather than a PR: upstream already
@@ -66,6 +67,19 @@ a fraction always lands on that fraction and pressing it twice is a no-op.
 
 The proportion is of the parent container, not the screen: a window nested
 inside a half-screen split set to `0.5` fills a quarter of the screen.
+
+### `default_root_orientation` — `feat/auto-root-orientation`
+
+Splits the screen's longer axis when set to `auto`, so windows stack on a
+portrait screen rather than becoming tall narrow strips.
+
+```toml
+default_root_orientation = "auto"
+```
+
+Applies when a layout is created. A layout that moves to a differently
+shaped screen keeps the orientation it has, rather than being rearranged
+underneath you. Scroll layouts are unaffected.
 
 ### Smart `resize` — `feat/resize-smart`
 
