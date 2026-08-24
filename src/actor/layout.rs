@@ -3178,6 +3178,41 @@ mod tests {
     }
 
     #[test]
+    fn set_proportion_sizes_the_last_window_in_a_container() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let pid = 1;
+        let windows = make_windows(pid, 2);
+
+        let screen = rect(0, 0, 900, 100);
+        _ = mgr.handle_event(SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, windows));
+
+        // The last window has no neighbour past its far edge, so it has to
+        // take from the window before it.
+        _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, 2)));
+        _ = mgr.handle_command(Some(space), &[space], SetProportion { proportion: 1.0 / 3.0 });
+        assert_eq!(
+            vec![
+                (WindowId::new(pid, 1), rect(0, 0, 600, 100)),
+                (WindowId::new(pid, 2), rect(600, 0, 300, 100)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+
+        _ = mgr.handle_command(Some(space), &[space], SetProportion { proportion: 2.0 / 3.0 });
+        assert_eq!(
+            vec![
+                (WindowId::new(pid, 1), rect(0, 0, 300, 100)),
+                (WindowId::new(pid, 2), rect(300, 0, 600, 100)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+    }
+
+    #[test]
     fn space_exposed_forces_tree_when_scroll_gate_disabled() {
         use LayoutEvent::*;
         let mut mgr = LayoutManager::new_for_test();

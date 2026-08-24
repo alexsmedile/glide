@@ -827,9 +827,16 @@ impl LayoutTree {
         if kind.is_group() {
             return false;
         }
-        let direction = match kind.orientation() {
-            Orientation::Horizontal => Direction::Right,
-            Orientation::Vertical => Direction::Down,
+        let (forward, back) = match kind.orientation() {
+            Orientation::Horizontal => (Direction::Right, Direction::Left),
+            Orientation::Vertical => (Direction::Down, Direction::Up),
+        };
+        // The last node in a container has no neighbour past its far edge, so
+        // trade with the one on the near side instead of doing nothing.
+        let direction = if self.resize_target(node, forward).is_some() {
+            forward
+        } else {
+            back
         };
         let Some(current) = self.tree.data.size.proportion(&self.tree.map, node) else {
             return false;
