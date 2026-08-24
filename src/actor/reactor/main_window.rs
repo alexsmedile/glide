@@ -91,8 +91,8 @@ impl MainWindowTracker {
             | Event::RaiseRequestFailed { .. }
             | Event::RaiseTimeout { .. }
             | Event::ScrollWheel { .. }
-            | Event::LeftMouseDown(_)
-            | Event::LeftMouseDragged(_)
+            | Event::LeftMouseDown(..)
+            | Event::LeftMouseDragged(..)
             | Event::Command(..)
             | Event::ConfigChanged(_)
             | Event::WindowsOnScreenUpdated { .. } => return None,

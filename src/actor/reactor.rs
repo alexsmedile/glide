@@ -188,9 +188,11 @@ pub enum Event {
 
     LeftMouseDown(
         #[serde(with = "crate::sys::geometry::CGPointDef")] objc2_core_foundation::CGPoint,
+        #[serde(default)] MouseModifiers,
     ),
     LeftMouseDragged(
         #[serde(with = "crate::sys::geometry::CGPointDef")] objc2_core_foundation::CGPoint,
+        #[serde(default)] MouseModifiers,
     ),
 
     ScrollWheel {
@@ -205,6 +207,11 @@ pub enum Event {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Requested(pub bool);
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MouseModifiers {
+    pub alt_held: bool,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
@@ -469,8 +476,8 @@ impl Reactor {
             // Record more noisy events as trace logs instead of debug.
             Event::WindowFrameChanged(..)
             | Event::MouseUp
-            | Event::LeftMouseDown(_)
-            | Event::LeftMouseDragged(_) => trace!(?event, "Event"),
+            | Event::LeftMouseDown(..)
+            | Event::LeftMouseDragged(..) => trace!(?event, "Event"),
             _ => debug!(?event, "Event"),
         }
     }
@@ -757,7 +764,7 @@ impl Reactor {
                 self.update_active_screen();
                 self.update_visible_windows();
             }
-            Event::LeftMouseDown(point) => {
+            Event::LeftMouseDown(point, _) => {
                 if let Some(screen) = self.active_screen()
                     && let Some(space) = screen.space
                 {
@@ -774,7 +781,7 @@ impl Reactor {
                     }
                 }
             }
-            Event::LeftMouseDragged(point) => {
+            Event::LeftMouseDragged(point, _) => {
                 if let Some(&screen) = self.active_screen() {
                     if screen.space.is_some() {
                         if self.layout.update_interactive_resize(point, screen.frame) {
@@ -1348,6 +1355,32 @@ pub mod tests {
     use crate::actor::layout::LayoutManager;
     use crate::model::Direction;
     use crate::sys::window_server::WindowServerId;
+
+    #[test]
+    fn mouse_modifiers_round_trip_in_recordings() {
+        let event =
+            Event::LeftMouseDown(CGPoint::new(10.0, 20.0), MouseModifiers { alt_held: true });
+
+        let serialized = ron::to_string(&event).unwrap();
+        let Event::LeftMouseDown(point, modifiers) = ron::from_str(&serialized).unwrap() else {
+            panic!("expected mouse-down event");
+        };
+
+        assert_eq!(point, CGPoint::new(10.0, 20.0));
+        assert_eq!(modifiers, MouseModifiers { alt_held: true });
+    }
+
+    #[test]
+    fn mouse_modifiers_default_when_replaying_an_older_recording() {
+        let Event::LeftMouseDown(point, modifiers) =
+            ron::from_str("LeftMouseDown((x:10.0,y:20.0))").unwrap()
+        else {
+            panic!("expected mouse-down event");
+        };
+
+        assert_eq!(point, CGPoint::new(10.0, 20.0));
+        assert_eq!(modifiers, MouseModifiers::default());
+    }
 
     #[test]
     fn it_ignores_stale_resize_events() {

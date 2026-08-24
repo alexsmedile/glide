@@ -15,7 +15,7 @@ use objc2_core_foundation::{CGPoint, CGRect};
 use objc2_foundation::{MainThreadMarker, NSInteger};
 use tracing::{debug, error, warn};
 
-use super::reactor::{self, Event};
+use super::reactor::{self, Event, MouseModifiers};
 use crate::config::Config;
 use crate::sys::event;
 use crate::sys::geometry::{CGRectExt, ToICrate};
@@ -165,14 +165,20 @@ impl Mouse {
         match event_type {
             CGEventType::LeftMouseDown => {
                 let loc = event.location();
-                self.events_tx.send(Event::LeftMouseDown(loc.to_icrate()));
+                let modifiers = MouseModifiers {
+                    alt_held: event.get_flags().contains(CGEventFlags::CGEventFlagAlternate),
+                };
+                self.events_tx.send(Event::LeftMouseDown(loc.to_icrate(), modifiers));
             }
             CGEventType::LeftMouseUp => {
                 self.events_tx.send(Event::MouseUp);
             }
             CGEventType::LeftMouseDragged => {
                 let loc = event.location();
-                self.events_tx.send(Event::LeftMouseDragged(loc.to_icrate()));
+                let modifiers = MouseModifiers {
+                    alt_held: event.get_flags().contains(CGEventFlags::CGEventFlagAlternate),
+                };
+                self.events_tx.send(Event::LeftMouseDragged(loc.to_icrate(), modifiers));
             }
             CGEventType::MouseMoved if self.config.borrow().settings.focus_follows_mouse => {
                 let loc = event.location();
