@@ -1,16 +1,30 @@
 # Fork notes
 
-This fork adds resize and layout commands that AeroSpace had and upstream
-Glide does not. Everything here is additive: no upstream behaviour changes,
-and existing configs keep working.
+This fork adds resize, layout, and focus behaviour that AeroSpace had and
+upstream Glide does not. Existing configs keep working.
 
 The config that drives it lives in its own repo at
 `~/code/utils/glide-config`, and requires this fork — upstream rejects it with
 a parse error.
 
-`cargo test` on `main` is 251 tests, 244 of them upstream's. Each feature's
-tests were checked to fail with the implementation removed, so they test the
-behaviour rather than passing either way.
+`cargo test --lib` on `main` is 249 tests. Each feature's tests were checked to
+fail with the implementation removed, so they test the behaviour rather than
+passing either way.
+
+## Fork releases
+
+Fork releases use `fork-v<upstream>-r<N>`. The upstream version records the
+Glide release this fork is based on; the revision increments for each stable
+fork checkpoint and resets when the upstream version changes. The same tag is
+applied to the matching `glide-config` commit.
+
+The current identifier is stored in `FORK_VERSION`. Fork tags deliberately do
+not begin with `v`, so they cannot trigger upstream's `v*.*.*` packaging
+workflow.
+
+| Release | Upstream base | Contents |
+|---|---|---|
+| `fork-v0.2.15-r1` | `v0.2.15` | Five layout/resize features plus reliable per-Space focus restoration on multiple displays. |
 
 ## Branches
 
@@ -33,6 +47,7 @@ stays a fast-forward of whatever upstream takes.
 | smart `resize` | `feat/resize-smart` | PR #239 |
 | `default_root_orientation` | `feat/auto-root-orientation` | PR #242, issue #241 |
 | `set_proportion` | `feat/resize-presets` | issue #240, no PR yet |
+| Space focus memory | integrated on `main` | local validation complete |
 
 `set_proportion` is deliberately an issue rather than a PR: upstream already
 has `cycle_column_width`, which reads a presets list from config, so whether
@@ -40,6 +55,14 @@ this should be a per-binding argument or a cycling command is a question for
 the maintainer before the code is written.
 
 ## Features
+
+### Space focus memory
+
+Restores the remembered window when returning to a managed Space instead of
+leaving focus on another display. Space changes expose only the displays whose
+managed Space actually changed, preventing an unchanged display from winning
+the focus/raise race. Click-to-switch behaviour is preserved when macOS has
+already focused a window in the destination Space.
 
 ### `toggle_orientation` — `feat/toggle-orientation`
 
