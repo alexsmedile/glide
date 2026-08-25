@@ -208,7 +208,21 @@ impl Mouse {
 
                 if delta_x != 0.0 || delta_y != 0.0 {
                     let alt_held = event.get_flags().contains(CGEventFlags::CGEventFlagAlternate);
-                    self.events_tx.send(Event::ScrollWheel { delta_x, delta_y, alt_held });
+                    let target = alt_held
+                        .then(|| {
+                            window_server::get_window_at_point(
+                                event.location().to_icrate(),
+                                state.converter,
+                                mtm,
+                            )
+                        })
+                        .flatten();
+                    self.events_tx.send(Event::ScrollWheel {
+                        delta_x,
+                        delta_y,
+                        alt_held,
+                        target,
+                    });
                 }
             }
             _ => (),

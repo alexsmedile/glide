@@ -62,6 +62,7 @@ pub enum LayoutCommand {
     FocusPrev,
     FocusGroupNext,
     FocusGroupPrev,
+    SnapWindow(#[serde(rename = "direction")] Direction),
 }
 
 fn default_resize_percent() -> f64 {
@@ -166,7 +167,7 @@ impl LayoutCommand {
 
             NextLayout | PrevLayout | MoveFocus(_) | Ascend | Descend | Split(_)
             | ToggleFocusFloating | ToggleWindowFloating | ToggleFullscreen | ChangeLayoutKind
-            | FocusNext | FocusPrev | FocusGroupNext | FocusGroupPrev => false,
+            | FocusNext | FocusPrev | FocusGroupNext | FocusGroupPrev | SnapWindow(_) => false,
         }
     }
 }
@@ -210,6 +211,7 @@ struct InteractiveScrollMove {
 
 const RESIZE_EDGE_THRESHOLD: f64 = 8.0;
 const MOVE_DRAG_THRESHOLD: f64 = 10.0;
+const GROUP_SCROLL_THROTTLE: std::time::Duration = std::time::Duration::from_millis(180);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowDropPlacement {
@@ -288,6 +290,8 @@ pub struct LayoutManager {
     interactive_resize: Option<InteractiveScrollResize>,
     #[serde(skip)]
     interactive_move: Option<InteractiveScrollMove>,
+    #[serde(skip)]
+    last_group_scroll: Option<Instant>,
     #[serde(skip, default = "default_config")]
     config: Arc<Config>,
 }
@@ -408,6 +412,7 @@ impl LayoutManager {
             window_rules: Vec::new(),
             interactive_resize: None,
             interactive_move: None,
+            last_group_scroll: None,
             config,
         }
     }
@@ -925,6 +930,7 @@ impl LayoutManager {
             // Handled above.
             LayoutCommand::ToggleWindowFloating => unreachable!(),
             LayoutCommand::ToggleFocusFloating => unreachable!(),
+            LayoutCommand::SnapWindow(_) => unreachable!(),
 
             LayoutCommand::NextLayout => {
                 // FIXME: Update windows in the new layout.
@@ -1254,7 +1260,8 @@ impl LayoutManager {
             self.add_floating_window(dragged_window, space);
             self.tree.remove_window(dragged_window);
             self.floating_restore_frames
-                .insert(dragged_window, FloatingRestoreFrame { frame: preview.frame });
+                .entry(dragged_window)
+                .or_insert(FloatingRestoreFrame { frame: preview.frame });
             return Some(EventResponse {
                 frame_overrides: vec![(dragged_window, preview.frame)],
                 ..Default::default()
@@ -1292,6 +1299,60 @@ impl LayoutManager {
             Some(EventResponse::default())
         } else {
             None
+        }
+    }
+
+    pub fn snap_window(
+        &mut self,
+        space: Option<SpaceId>,
+        window: WindowId,
+        screen: CGRect,
+        direction: Direction,
+        config: &Config,
+    ) -> EventResponse {
+        self.focused_window = Some(window);
+        let usable = screen.inset(config.settings.outer_gap);
+        let preview = WindowDropPreview {
+            target_window: None,
+            placement: match direction {
+                Direction::Left => WindowDropPlacement::ScreenLeft,
+                Direction::Right => WindowDropPlacement::ScreenRight,
+                Direction::Up => WindowDropPlacement::ScreenTop,
+                Direction::Down => WindowDropPlacement::ScreenBottom,
+            },
+            frame: split_frame(usable, direction, config.settings.inner_gap),
+        };
+        self.apply_window_drop(space, window, preview).unwrap_or_default()
+    }
+
+    pub fn window_is_floating(&self, window: WindowId) -> bool {
+        self.floating_windows.contains(&window)
+    }
+
+    pub fn resize_window_to_screen_proportion(
+        &mut self,
+        window: WindowId,
+        current_frame: CGRect,
+        screen: CGRect,
+        proportion: f64,
+        config: &Config,
+    ) -> EventResponse {
+        let usable = screen.inset(config.settings.outer_gap);
+        let width = usable.size.width * proportion.clamp(0.0, 1.0);
+        let max_x = (usable.max().x - width).max(usable.min().x);
+        let frame = CGRect::new(
+            CGPoint::new(
+                current_frame.min().x.clamp(usable.min().x, max_x),
+                current_frame.min().y,
+            ),
+            CGSize::new(width, current_frame.size.height),
+        );
+        if self.floating_windows.contains(&window) {
+            self.floating_restore_frames.insert(window, FloatingRestoreFrame { frame });
+        }
+        EventResponse {
+            frame_overrides: vec![(window, frame)],
+            ..Default::default()
         }
     }
 
@@ -1610,6 +1671,39 @@ impl LayoutManager {
         for vp in self.viewports.values_mut() {
             vp.tick(Instant::now());
         }
+    }
+
+    pub fn handle_group_scroll(
+        &mut self,
+        space: SpaceId,
+        hovered_window: WindowId,
+        delta: f64,
+        now: Instant,
+    ) -> Option<EventResponse> {
+        if delta == 0.0 {
+            return None;
+        }
+        let layout = self.try_layout(space)?;
+        let hovered = self.tree.window_node(layout, hovered_window)?;
+        let new_focus = if delta < 0.0 {
+            self.tree.focus_group_next(hovered)
+        } else {
+            self.tree.focus_group_prev(hovered)
+        }?;
+        if self
+            .last_group_scroll
+            .is_some_and(|last| now.saturating_duration_since(last) < GROUP_SCROLL_THROTTLE)
+        {
+            return Some(EventResponse::default());
+        }
+        self.last_group_scroll = Some(now);
+        let focus_window = self.tree.window_at(new_focus);
+        let raise_windows = self.tree.select_returning_surfaced_windows(new_focus);
+        Some(EventResponse {
+            frame_overrides: vec![],
+            focus_window,
+            raise_windows,
+        })
     }
 
     pub fn handle_scroll_wheel(
@@ -3146,6 +3240,59 @@ mod tests {
     }
 
     #[test]
+    fn alt_scroll_cycles_the_hovered_group_and_throttles_a_gesture() {
+        use LayoutEvent::*;
+
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let pid = 1;
+        let first = WindowId::new(pid, 1);
+        let second = WindowId::new(pid, 2);
+        let outside = WindowId::new(pid, 3);
+        _ = mgr.handle_event(SpaceExposed(space, CGSize::new(1000.0, 1000.0)));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, make_windows(pid, 3)));
+        let layout = mgr.layout(space);
+        assert!(mgr.tree.drop_window_in_group(layout, second, first, ContainerKind::Stacked));
+
+        let now = Instant::now();
+        assert_eq!(
+            mgr.handle_group_scroll(space, first, -1.0, now).unwrap().focus_window,
+            Some(second)
+        );
+        assert_eq!(
+            mgr.handle_group_scroll(
+                space,
+                second,
+                -1.0,
+                now + std::time::Duration::from_millis(100),
+            )
+            .unwrap()
+            .focus_window,
+            None
+        );
+        assert_eq!(
+            mgr.handle_group_scroll(
+                space,
+                second,
+                -1.0,
+                now + std::time::Duration::from_millis(200),
+            )
+            .unwrap()
+            .focus_window,
+            Some(first)
+        );
+        assert!(
+            mgr.handle_group_scroll(
+                space,
+                outside,
+                -1.0,
+                now + std::time::Duration::from_millis(400),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn resize_without_a_direction_grows_and_shrinks_either_window() {
         use LayoutCommand::*;
         use LayoutEvent::*;
@@ -3973,6 +4120,104 @@ mod tests {
         assert_eq!(
             mgr.calculate_layout(space, screen, &Config::default()),
             vec![(WindowId::new(1, 2), screen)]
+        );
+    }
+
+    #[test]
+    fn keyboard_snap_floats_a_tiled_window_in_the_requested_half() {
+        use LayoutEvent::*;
+
+        let mut mgr = LayoutManager::new_for_test();
+        let config = Config::default();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 900, 600);
+        let snapped = rect(450, 0, 450, 600);
+        let window = WindowId::new(1, 1);
+        _ = mgr.handle_event(SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 1, make_windows(1, 2)));
+        _ = mgr.handle_event(WindowFocused(vec![space], window));
+
+        let response = mgr.snap_window(Some(space), window, screen, Direction::Right, &config);
+
+        assert_eq!(response.frame_overrides, vec![(window, snapped)]);
+        assert_eq!(mgr.floating_windows_in_space(space), BTreeSet::from([window]));
+        assert_eq!(
+            mgr.calculate_layout(space, screen, &config),
+            vec![(WindowId::new(1, 2), screen)]
+        );
+
+        _ = mgr.handle_command(Some(space), &[space], LayoutCommand::ToggleWindowFloating);
+        assert!(mgr.floating_windows_in_space(space).is_empty());
+        assert_eq!(
+            mgr.calculate_layout(space, screen, &config),
+            vec![
+                (WindowId::new(1, 2), rect(0, 0, 450, 600)),
+                (window, rect(450, 0, 450, 600)),
+            ]
+        );
+    }
+
+    #[test]
+    fn keyboard_snap_works_without_a_managed_space() {
+        let mut mgr = LayoutManager::new_for_test();
+        let config = Config::default();
+        let screen = rect(100, 50, 800, 600);
+        let window = WindowId::new(1, 1);
+
+        let response = mgr.snap_window(None, window, screen, Direction::Up, &config);
+
+        assert_eq!(response.frame_overrides, vec![(window, rect(100, 50, 800, 300))]);
+        assert!(mgr.floating_windows.contains(&window));
+    }
+
+    #[test]
+    fn screen_proportion_resizes_an_unmanaged_window_without_floating_it() {
+        let mut mgr = LayoutManager::new_for_test();
+        let config = Config::default();
+        let screen = rect(100, 50, 800, 600);
+        let window = WindowId::new(1, 1);
+
+        let response = mgr.resize_window_to_screen_proportion(
+            window,
+            rect(850, 80, 100, 400),
+            screen,
+            0.25,
+            &config,
+        );
+
+        assert_eq!(response.frame_overrides, vec![(window, rect(700, 80, 200, 400))]);
+        assert!(!mgr.floating_windows.contains(&window));
+    }
+
+    #[test]
+    fn screen_proportion_becomes_the_floating_restore_frame() {
+        use LayoutEvent::*;
+
+        let mut mgr = LayoutManager::new_for_test();
+        let config = Config::default();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 800, 600);
+        let window = WindowId::new(1, 1);
+        _ = mgr.handle_event(SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 1, make_windows(1, 1)));
+        _ = mgr.handle_event(WindowFocused(vec![space], window));
+        _ = mgr.handle_command(Some(space), &[space], LayoutCommand::ToggleWindowFloating);
+
+        let resized = mgr.resize_window_to_screen_proportion(
+            window,
+            rect(100, 100, 400, 300),
+            screen,
+            0.25,
+            &config,
+        );
+        assert_eq!(resized.frame_overrides, vec![(window, rect(100, 100, 200, 300))]);
+
+        _ = mgr.handle_command(Some(space), &[space], LayoutCommand::ToggleWindowFloating);
+        let restored =
+            mgr.handle_command(Some(space), &[space], LayoutCommand::ToggleWindowFloating);
+        assert_eq!(
+            restored.frame_overrides,
+            vec![(window, rect(100, 100, 200, 300))]
         );
     }
 

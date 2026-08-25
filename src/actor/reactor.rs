@@ -200,6 +200,8 @@ pub enum Event {
         delta_x: f64,
         delta_y: f64,
         alt_held: bool,
+        #[serde(default)]
+        target: Option<WindowServerId>,
     },
 
     Command(Command),
@@ -916,40 +918,112 @@ impl Reactor {
                 let msg = raise::Event::RaiseTimeout { sequence_id };
                 _ = self.raise_manager_tx.send((Span::current(), msg));
             }
-            Event::ScrollWheel { delta_x, delta_y, alt_held } => {
-                if !self.config.settings.experimental.scroll.enable {
-                    return;
-                }
+            Event::ScrollWheel {
+                delta_x,
+                delta_y,
+                alt_held,
+                target,
+            } => {
                 // TODO: Make the modifier key configurable.
                 if !alt_held {
                     return;
                 }
-                if let Some(&screen) = self.active_screen() {
-                    if let Some(space) = screen.space {
-                        let scroll_config = &self.config.settings.experimental.scroll;
-                        let delta = if delta_x != 0.0 { delta_x } else { delta_y };
-                        let response = self.layout.handle_scroll_wheel(
-                            space,
-                            delta,
-                            &screen.frame,
-                            scroll_config,
-                        );
-                        self.handle_layout_response(response);
+                let delta = if delta_y != 0.0 { delta_y } else { delta_x };
+                let group_response = target
+                    .and_then(|wsid| self.window_ids.get(&wsid).copied())
+                    .and_then(|window| {
+                        let frame = self.windows.get(&window)?.frame_monotonic;
+                        let space = self.best_space_for_window(&frame)?;
+                        self.layout.handle_group_scroll(space, window, delta, Instant::now())
+                    });
+                if let Some(response) = group_response {
+                    self.handle_layout_response(response);
+                } else if self.config.settings.experimental.scroll.enable {
+                    if let Some(&screen) = self.active_screen() {
+                        if let Some(space) = screen.space {
+                            let scroll_config = &self.config.settings.experimental.scroll;
+                            let response = self.layout.handle_scroll_wheel(
+                                space,
+                                delta,
+                                &screen.frame,
+                                scroll_config,
+                            );
+                            self.handle_layout_response(response);
+                        }
                     }
                 }
             }
             Event::Command(Command::Layout(cmd)) => {
                 info!(?cmd);
-                let visible_spaces =
-                    self.screens.iter().flat_map(|screen| screen.space).collect::<Vec<_>>();
-                // macOS can temporarily have no main window (for example after
-                // clicking the desktop). Keep keyboard layout commands usable
-                // by targeting the last active screen in that case.
-                let command_space = self
-                    .main_window_space()
-                    .or_else(|| self.active_screen().and_then(|screen| screen.space));
-                let response = self.layout.handle_command(command_space, &visible_spaces, cmd);
-                self.handle_layout_response(response);
+                match cmd {
+                    LayoutCommand::SnapWindow(direction) => {
+                        let response = self.main_window().and_then(|window| {
+                            let screen_idx = self.windows.get(&window).and_then(|state| {
+                                self.best_screen_idx_for_window(&state.frame_monotonic)
+                            })?;
+                            let screen = *self.screens.get(screen_idx)?;
+                            Some(self.layout.snap_window(
+                                screen.space,
+                                window,
+                                screen.frame,
+                                direction,
+                                &self.config,
+                            ))
+                        });
+                        if let Some(response) = response {
+                            self.handle_layout_response(response);
+                        }
+                    }
+                    LayoutCommand::SetProportion { proportion } => {
+                        let direct_resize = self.main_window().and_then(|window| {
+                            let current_frame = self.windows.get(&window)?.frame_monotonic;
+                            let screen_idx = self.best_screen_idx_for_window(&current_frame)?;
+                            let screen = *self.screens.get(screen_idx)?;
+                            (screen.space.is_none() || self.layout.window_is_floating(window)).then(
+                                || {
+                                    self.layout.resize_window_to_screen_proportion(
+                                        window,
+                                        current_frame,
+                                        screen.frame,
+                                        proportion,
+                                        &self.config,
+                                    )
+                                },
+                            )
+                        });
+                        if let Some(response) = direct_resize {
+                            self.handle_layout_response(response);
+                        } else {
+                            let visible_spaces = self
+                                .screens
+                                .iter()
+                                .flat_map(|screen| screen.space)
+                                .collect::<Vec<_>>();
+                            let command_space = self
+                                .main_window_space()
+                                .or_else(|| self.active_screen().and_then(|screen| screen.space));
+                            let response = self.layout.handle_command(
+                                command_space,
+                                &visible_spaces,
+                                LayoutCommand::SetProportion { proportion },
+                            );
+                            self.handle_layout_response(response);
+                        }
+                    }
+                    cmd => {
+                        let visible_spaces =
+                            self.screens.iter().flat_map(|screen| screen.space).collect::<Vec<_>>();
+                        // macOS can temporarily have no main window (for example after
+                        // clicking the desktop). Keep keyboard layout commands usable
+                        // by targeting the last active screen in that case.
+                        let command_space = self
+                            .main_window_space()
+                            .or_else(|| self.active_screen().and_then(|screen| screen.space));
+                        let response =
+                            self.layout.handle_command(command_space, &visible_spaces, cmd);
+                        self.handle_layout_response(response);
+                    }
+                }
             }
             Event::Command(Command::Metrics(cmd)) => log::handle_command(cmd),
             Event::Command(Command::Reactor(ReactorCommand::Debug)) => {
@@ -1480,6 +1554,132 @@ pub mod tests {
         assert_eq!(point, CGPoint::new(10.0, 20.0));
         assert_eq!(modifiers, MouseModifiers::default());
         assert_eq!(target, None);
+    }
+
+    #[test]
+    fn scroll_target_defaults_when_replaying_an_older_recording() {
+        let Event::ScrollWheel {
+            delta_x,
+            delta_y,
+            alt_held,
+            target,
+        } = ron::from_str("ScrollWheel(delta_x:0.0,delta_y:-1.0,alt_held:true)").unwrap()
+        else {
+            panic!("expected scroll-wheel event");
+        };
+
+        assert_eq!(delta_x, 0.0);
+        assert_eq!(delta_y, -1.0);
+        assert!(alt_held);
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn keyboard_snap_writes_the_requested_half_screen_frame() {
+        let mut config = Config::default();
+        config.settings.default_disable = false;
+        config.settings.animate = false;
+        let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
+        let (group_indicators_tx, _) = crate::actor::channel();
+        let mut reactor = Reactor::new(
+            Arc::new(config),
+            LayoutManager::new_for_test(),
+            record,
+            group_indicators_tx,
+        );
+        let mut apps = Apps::new();
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 600.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_events(apps.make_app_with_opts(
+            1,
+            make_windows(2),
+            Some(WindowId::new(1, 1)),
+            true,
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+
+        let snapped = WindowId::new(1, 1);
+        assert_eq!(reactor.main_window(), Some(snapped));
+        reactor.handle_event(Event::Command(Command::Layout(LayoutCommand::SnapWindow(
+            Direction::Right,
+        ))));
+
+        let requests = apps.requests();
+        assert!(
+            requests.iter().any(|request| {
+                matches!(
+                    request,
+                    Request::SetWindowFrame(wid, frame, _)
+                        if *wid == snapped
+                            && *frame == CGRect::new(
+                                CGPoint::new(500.0, 0.0),
+                                CGSize::new(500.0, 600.0),
+                            )
+                )
+            }),
+            "{requests:?}"
+        );
+    }
+
+    #[test]
+    fn set_proportion_resizes_a_window_on_an_unmanaged_space() {
+        let mut config = Config::default();
+        config.settings.default_disable = true;
+        config.settings.animate = false;
+        let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
+        let (group_indicators_tx, _) = crate::actor::channel();
+        let mut reactor = Reactor::new(
+            Arc::new(config),
+            LayoutManager::new_for_test(),
+            record,
+            group_indicators_tx,
+        );
+        let mut apps = Apps::new();
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 600.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![None],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_events(apps.make_app_with_opts(
+            1,
+            make_windows(1),
+            Some(WindowId::new(1, 1)),
+            true,
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+
+        let resized = WindowId::new(1, 1);
+        reactor.handle_event(Event::Command(Command::Layout(LayoutCommand::SetProportion {
+            proportion: 0.25,
+        })));
+
+        let requests = apps.requests();
+        assert!(
+            requests.iter().any(|request| {
+                matches!(
+                    request,
+                    Request::SetWindowFrame(wid, frame, _)
+                        if *wid == resized
+                            && *frame == CGRect::new(
+                                CGPoint::new(100.0, 100.0),
+                                CGSize::new(250.0, 50.0),
+                            )
+                )
+            }),
+            "{requests:?}"
+        );
     }
 
     #[test]

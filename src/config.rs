@@ -771,4 +771,33 @@ mod tests {
         assert!(config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + ArrowUp"));
         assert!(config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + ArrowRight"));
     }
+
+    #[test]
+    fn command_alt_shift_arrow_snap_keys_parse_correctly() {
+        let config = Config::parse(
+            r#"
+            [settings]
+            default_keys = false
+
+            [keys]
+            "Meta + Alt + Shift + ArrowLeft" = { snap_window = "left" }
+            "Meta + Alt + Shift + ArrowDown" = { snap_window = "down" }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.keys.len(), 2);
+        assert!(
+            config
+                .keys
+                .iter()
+                .any(|(hk, _)| hk.to_string() == "Alt + Meta + Shift + ArrowLeft")
+        );
+        assert!(
+            config
+                .keys
+                .iter()
+                .any(|(hk, _)| hk.to_string() == "Alt + Meta + Shift + ArrowDown")
+        );
+    }
 }

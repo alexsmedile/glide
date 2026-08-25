@@ -95,6 +95,13 @@ default_keys = false
 # Toggle whether the current space is managed by Glide.
 "Alt + Z" = "toggle_space_activated"
 
+# Put the focused window in one half of its screen. This works on managed and
+# unmanaged spaces; on a managed space, the window becomes floating.
+"Meta + Alt + Shift + ArrowLeft" = { snap_window = "left" }
+"Meta + Alt + Shift + ArrowRight" = { snap_window = "right" }
+"Meta + Alt + Shift + ArrowUp" = { snap_window = "up" }
+"Meta + Alt + Shift + ArrowDown" = { snap_window = "down" }
+
 # Focus the window in the specified direction.
 "Alt + H" = { move_focus = "left" }
 "Alt + J" = { move_focus = "down" }
@@ -116,6 +123,8 @@ default_keys = false
 # Give the focused window an exact share of its container, along whichever
 # axis the container lays its children out on. Unlike resize, this is
 # absolute: pressing it twice leaves the window where it is.
+# For a floating window or an unmanaged Space, the proportion applies to the
+# screen width instead and keeps the window floating.
 # Not bound by default, since which fractions are useful is a matter of taste.
 # "<key>" = { set_proportion = { proportion = 0.5 } }
 # "<key>" = { set_proportion = { proportion = 0.333 } }
@@ -192,6 +201,8 @@ default_keys = false
 
 # Focus the next/previous member of the nearest enclosing tabbed or stacked
 # group. These commands wrap inside the group and never escape to another tile.
+# Holding Alt and scrolling over a visible group window does the same thing:
+# scroll down for next and up for previous.
 # "<key>" = "focus_group_next"
 # "<key>" = "focus_group_prev"
 
