@@ -60,6 +60,8 @@ pub enum LayoutCommand {
     ToggleColumnTabbed,
     FocusNext,
     FocusPrev,
+    FocusGroupNext,
+    FocusGroupPrev,
 }
 
 fn default_resize_percent() -> f64 {
@@ -164,7 +166,7 @@ impl LayoutCommand {
 
             NextLayout | PrevLayout | MoveFocus(_) | Ascend | Descend | Split(_)
             | ToggleFocusFloating | ToggleWindowFloating | ToggleFullscreen | ChangeLayoutKind
-            | FocusNext | FocusPrev => false,
+            | FocusNext | FocusPrev | FocusGroupNext | FocusGroupPrev => false,
         }
     }
 }
@@ -1006,6 +1008,30 @@ impl LayoutManager {
                     raise_windows,
                 }
             }
+            LayoutCommand::FocusGroupNext => {
+                let new_focus = self.tree.focus_group_next(self.tree.selection(layout));
+                let focus_window = new_focus.and_then(|new| self.tree.window_at(new));
+                let raise_windows = new_focus
+                    .map(|new| self.tree.select_returning_surfaced_windows(new))
+                    .unwrap_or_default();
+                EventResponse {
+                    frame_overrides: vec![],
+                    focus_window,
+                    raise_windows,
+                }
+            }
+            LayoutCommand::FocusGroupPrev => {
+                let new_focus = self.tree.focus_group_prev(self.tree.selection(layout));
+                let focus_window = new_focus.and_then(|new| self.tree.window_at(new));
+                let raise_windows = new_focus
+                    .map(|new| self.tree.select_returning_surfaced_windows(new))
+                    .unwrap_or_default();
+                EventResponse {
+                    frame_overrides: vec![],
+                    focus_window,
+                    raise_windows,
+                }
+            }
             LayoutCommand::Ascend => {
                 self.tree.ascend_selection(layout);
                 EventResponse::default()
@@ -1283,6 +1309,7 @@ impl LayoutManager {
             mouse,
             screen,
             edge_distance,
+            config.settings.mouse_drag_corner_size,
             config.settings.outer_gap,
             config.settings.inner_gap,
         ) {
@@ -1298,7 +1325,13 @@ impl LayoutManager {
             .into_iter()
             .filter(|(wid, _)| *wid != dragged_window)
             .find_map(|(wid, frame)| {
-                window_drop_preview(mouse, wid, frame, config.settings.inner_gap)
+                window_drop_preview(
+                    mouse,
+                    wid,
+                    frame,
+                    config.settings.mouse_drag_split_ratio,
+                    config.settings.inner_gap,
+                )
             })
     }
 
@@ -1350,6 +1383,7 @@ fn screen_drop_preview(
     mouse: CGPoint,
     screen: CGRect,
     edge_distance: f64,
+    corner_size: f64,
     outer_gap: f64,
     inner_gap: f64,
 ) -> Option<WindowDropPreview> {
@@ -1361,39 +1395,53 @@ fn screen_drop_preview(
     let right = mouse.x >= screen.max().x - distance;
     let top = mouse.y <= screen.min().y + distance;
     let bottom = mouse.y >= screen.max().y - distance;
+    let corner_width = corner_size.max(distance).min(screen.size.width / 2.0);
+    let corner_height = corner_size.max(distance).min(screen.size.height / 2.0);
+    let in_left_corner = mouse.x <= screen.min().x + corner_width;
+    let in_right_corner = mouse.x >= screen.max().x - corner_width;
+    let in_top_corner = mouse.y <= screen.min().y + corner_height;
+    let in_bottom_corner = mouse.y >= screen.max().y - corner_height;
     let usable = screen.inset(outer_gap);
 
-    let (placement, frame) = match (left, right, top, bottom) {
-        (true, _, true, _) => (
+    let (placement, frame) = if (left && in_top_corner) || (top && in_left_corner) {
+        (
             WindowDropPlacement::ScreenTopLeft,
             quarter_frame(usable, true, true, inner_gap),
-        ),
-        (_, true, true, _) => (
+        )
+    } else if (right && in_top_corner) || (top && in_right_corner) {
+        (
             WindowDropPlacement::ScreenTopRight,
             quarter_frame(usable, false, true, inner_gap),
-        ),
-        (true, _, _, true) => (
+        )
+    } else if (left && in_bottom_corner) || (bottom && in_left_corner) {
+        (
             WindowDropPlacement::ScreenBottomLeft,
             quarter_frame(usable, true, false, inner_gap),
-        ),
-        (_, true, _, true) => (
+        )
+    } else if (right && in_bottom_corner) || (bottom && in_right_corner) {
+        (
             WindowDropPlacement::ScreenBottomRight,
             quarter_frame(usable, false, false, inner_gap),
-        ),
-        (true, _, _, _) => (
+        )
+    } else if left {
+        (
             WindowDropPlacement::ScreenLeft,
             split_frame(usable, Direction::Left, inner_gap),
-        ),
-        (_, true, _, _) => (
+        )
+    } else if right {
+        (
             WindowDropPlacement::ScreenRight,
             split_frame(usable, Direction::Right, inner_gap),
-        ),
-        (_, _, true, _) => (WindowDropPlacement::ScreenTop, usable),
-        (_, _, _, true) => (
+        )
+    } else if top {
+        (WindowDropPlacement::ScreenTop, usable)
+    } else if bottom {
+        (
             WindowDropPlacement::ScreenBottom,
             split_frame(usable, Direction::Down, inner_gap),
-        ),
-        _ => return None,
+        )
+    } else {
+        return None;
     };
     Some(WindowDropPreview {
         target_window: None,
@@ -1406,6 +1454,7 @@ fn window_drop_preview(
     mouse: CGPoint,
     target_window: WindowId,
     target_frame: CGRect,
+    split_ratio: f64,
     inner_gap: f64,
 ) -> Option<WindowDropPreview> {
     if !target_frame.contains(mouse)
@@ -1425,7 +1474,8 @@ fn window_drop_preview(
     ];
     let &(distance, placement, direction) =
         edges.iter().min_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
-    let (placement, frame) = if distance <= 0.25 {
+    let split_ratio = split_ratio.clamp(0.0, 0.5);
+    let (placement, frame) = if distance <= split_ratio {
         (placement, split_frame(target_frame, direction, inner_gap))
     } else {
         (WindowDropPlacement::Group, target_frame)
@@ -3058,6 +3108,44 @@ mod tests {
     }
 
     #[test]
+    fn focus_group_next_prev_stays_inside_the_nearest_group() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let pid = 1;
+        let first = WindowId::new(pid, 1);
+        let second = WindowId::new(pid, 2);
+        let outside = WindowId::new(pid, 3);
+
+        _ = mgr.handle_event(SpaceExposed(space, CGSize::new(1000.0, 1000.0)));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, make_windows(pid, 3)));
+        let layout = mgr.layout(space);
+        assert!(mgr.tree.drop_window_in_group(layout, second, first, ContainerKind::Stacked,));
+
+        _ = mgr.handle_event(WindowFocused(vec![space], first));
+        assert_eq!(
+            mgr.handle_command(Some(space), &[space], FocusGroupNext).focus_window,
+            Some(second)
+        );
+        _ = mgr.handle_event(WindowFocused(vec![space], second));
+        assert_eq!(
+            mgr.handle_command(Some(space), &[space], FocusGroupNext).focus_window,
+            Some(first)
+        );
+        assert_ne!(
+            mgr.handle_command(Some(space), &[space], FocusGroupPrev).focus_window,
+            Some(outside)
+        );
+
+        _ = mgr.handle_event(WindowFocused(vec![space], outside));
+        assert_eq!(
+            mgr.handle_command(Some(space), &[space], FocusGroupNext).focus_window,
+            None
+        );
+    }
+
+    #[test]
     fn resize_without_a_direction_grows_and_shrinks_either_window() {
         use LayoutCommand::*;
         use LayoutEvent::*;
@@ -3702,6 +3790,34 @@ mod tests {
     }
 
     #[test]
+    fn screen_corner_targets_extend_along_adjoining_edges() {
+        let mgr = LayoutManager::new_for_test();
+        let screen = rect(0, 0, 1000, 600);
+        let config = Config::default();
+
+        for point in [CGPoint::new(5.0, 150.0), CGPoint::new(150.0, 5.0)] {
+            let preview = mgr
+                .window_drop_preview(None, WindowId::new(1, 1), point, screen, false, 24.0, &config)
+                .unwrap();
+            assert_eq!(preview.placement, WindowDropPlacement::ScreenTopLeft);
+            assert_eq!(preview.frame, rect(0, 0, 500, 300));
+        }
+
+        let preview = mgr
+            .window_drop_preview(
+                None,
+                WindowId::new(1, 1),
+                CGPoint::new(5.0, 200.0),
+                screen,
+                false,
+                24.0,
+                &config,
+            )
+            .unwrap();
+        assert_eq!(preview.placement, WindowDropPlacement::ScreenLeft);
+    }
+
+    #[test]
     fn alt_drop_targets_split_and_group_tiled_windows() {
         use LayoutEvent::*;
 
@@ -3741,6 +3857,19 @@ mod tests {
         assert_eq!(split.target_window, Some(target));
         assert_eq!(split.placement, WindowDropPlacement::SplitLeft);
         assert_eq!(split.frame, rect(500, 0, 250, 600));
+
+        let wider_split_target = mgr
+            .window_drop_preview(
+                Some(space),
+                dragged,
+                CGPoint::new(650.0, 300.0),
+                screen,
+                true,
+                24.0,
+                &config,
+            )
+            .unwrap();
+        assert_eq!(wider_split_target.placement, WindowDropPlacement::SplitLeft);
 
         let group = mgr
             .window_drop_preview(

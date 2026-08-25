@@ -467,6 +467,41 @@ impl LayoutTree {
         Some(windows[prev_pos])
     }
 
+    pub fn focus_group_next(&self, current: NodeId) -> Option<NodeId> {
+        self.focus_group_sibling(current, true)
+    }
+
+    pub fn focus_group_prev(&self, current: NodeId) -> Option<NodeId> {
+        self.focus_group_sibling(current, false)
+    }
+
+    fn focus_group_sibling(&self, current: NodeId, next: bool) -> Option<NodeId> {
+        let map = self.map();
+        let (group, selected_child) =
+            current.ancestors_with_parent(map).find_map(|(child, parent)| {
+                parent
+                    .filter(|&parent| self.container_kind(parent).is_group())
+                    .map(|parent| (parent, child))
+            })?;
+        let sibling = if next {
+            selected_child.next_sibling(map).or(group.first_child(map))
+        } else {
+            selected_child.prev_sibling(map).or(group.last_child(map))
+        }?;
+        self.selected_window_under(sibling)
+    }
+
+    fn selected_window_under(&self, node: NodeId) -> Option<NodeId> {
+        iter::successors(Some(node), |&node| {
+            self.tree
+                .data
+                .selection
+                .local_selection(self.map(), node)
+                .or(node.first_child(self.map()))
+        })
+        .find(|&node| self.window_at(node).is_some())
+    }
+
     fn windows_in_order(&self, layout: LayoutId) -> Vec<NodeId> {
         self.root(layout)
             .traverse_preorder(self.map())
@@ -1368,6 +1403,25 @@ mod tests {
         assert_eq!(tree.focus_prev(layout, n1), Some(n3));
         assert_eq!(tree.focus_prev(layout, n3), Some(n2));
         assert_eq!(tree.focus_prev(layout, n2), Some(n1));
+    }
+
+    #[test]
+    fn focus_group_next_prev_wrap_without_leaving_group() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let outside = tree.add_window_under(layout, root, w(1, 1));
+        let group = tree.add_container(root, ContainerKind::Stacked);
+        let first = tree.add_window_under(layout, group, w(1, 2));
+        let second = tree.add_window_under(layout, group, w(1, 3));
+        let third = tree.add_window_under(layout, group, w(1, 4));
+
+        assert_eq!(tree.focus_group_next(first), Some(second));
+        assert_eq!(tree.focus_group_next(third), Some(first));
+        assert_eq!(tree.focus_group_prev(first), Some(third));
+        assert_eq!(tree.focus_group_prev(second), Some(first));
+        assert_eq!(tree.focus_group_next(outside), None);
+        assert_eq!(tree.focus_group_prev(outside), None);
     }
 
     #[test]

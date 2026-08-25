@@ -24,6 +24,11 @@ mouse_hides_on_focus = true
 # available; hold Alt for split and group targets inside a managed layout.
 mouse_drag = false
 mouse_drag_snap_distance = 24
+# Distance along a screen edge that activates its adjoining corner target.
+mouse_drag_corner_size = 180
+# Fraction of each tiled window claimed by each split edge. The remaining
+# center is the group target.
+mouse_drag_split_ratio = 0.35
 
 # Gap between windows and screen edges (in pixels).
 outer_gap = 0
@@ -184,6 +189,11 @@ default_keys = false
 # Focus the next/previous window.
 # "<key>" = "focus_next"
 # "<key>" = "focus_prev"
+
+# Focus the next/previous member of the nearest enclosing tabbed or stacked
+# group. These commands wrap inside the group and never escape to another tile.
+# "<key>" = "focus_group_next"
+# "<key>" = "focus_group_prev"
 
 #
 # Utilities
