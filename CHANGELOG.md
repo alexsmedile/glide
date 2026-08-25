@@ -1,5 +1,19 @@
 # Changelog
 
+## Fork v0.2.15 r2 (2026-08-25)
+
+### Features
+
+* Add mouse snap overlays for screen halves and quadrants, plus Alt-drag tree splits and stacked groups.
+* Add `snap_window` for keyboard half-screen placement on managed and unmanaged Spaces.
+* Add `focus_group_next` and `focus_group_prev`, with Alt-scroll cycling over stacked and tabbed windows.
+* Make `set_proportion` resize floating and unmanaged windows to a fraction of the screen width.
+
+### Improvements
+
+* Restore the pre-snap floating frame when switching between tiled and floating modes.
+* Expand configurable corner and tiled split targets for easier mouse placement.
+
 ## [0.2.15](https://github.com/tmandry/glide/compare/v0.2.14...v0.2.15) (2026-08-09)
 
 When a window is floated, Glide now remembers the original size and position of the window. This release brings a ton of reliability improvements for when windows move between spaces and screens, focus changes, and windows are resized or floated. It also improves compatibility with certain apps.

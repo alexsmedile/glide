@@ -7,7 +7,7 @@ The config that drives it lives in its own repo at
 `~/code/utils/glide-config`, and requires this fork — upstream rejects it with
 a parse error.
 
-`cargo test --lib` on `main` is 249 tests. Each feature's tests were checked to
+`cargo test --lib` on `main` is 272 tests. Each feature's tests were checked to
 fail with the implementation removed, so they test the behaviour rather than
 passing either way.
 
@@ -24,6 +24,7 @@ workflow.
 
 | Release | Upstream base | Contents |
 |---|---|---|
+| `fork-v0.2.15-r2` | `v0.2.15` | Mouse drop overlays and layout placement, keyboard half-screen snapping, floating/unmanaged size presets, group navigation, and Alt-scroll group cycling. |
 | `fork-v0.2.15-r1` | `v0.2.15` | Five layout/resize features plus reliable per-Space focus restoration on multiple displays. |
 
 ## Branches
@@ -48,6 +49,7 @@ stays a fast-forward of whatever upstream takes.
 | `default_root_orientation` | `feat/auto-root-orientation` | PR #242, issue #241 |
 | `set_proportion` | `feat/resize-presets` | issue #240, no PR yet |
 | Space focus memory | integrated on `main` | local validation complete |
+| Mouse layout placement | `feat/layout-drag-overlays` | local validation complete |
 
 `set_proportion` is deliberately an issue rather than a PR: upstream already
 has `cycle_column_width`, which reads a presets list from config, so whether
@@ -55,6 +57,34 @@ this should be a per-binding argument or a cycling command is a question for
 the maintainer before the code is written.
 
 ## Features
+
+### Mouse placement and snap overlays
+
+Dragging to a screen edge shows blue Rectangle-style previews for halves and
+quadrants. Releasing applies the preview as a floating frame. Holding Alt while
+dragging over a tiled window adds layout-aware targets: purple edges split the
+tree beside that window and the green center groups the windows into a stack.
+
+Corner reach, split reach, and edge activation are configurable with
+`mouse_drag_corner_size`, `mouse_drag_split_ratio`, and
+`mouse_drag_snap_distance`.
+
+### Keyboard snapping and smart size presets
+
+The `snap_window` command places the focused window in a screen half and works
+on managed and unmanaged Spaces. On a managed Space it deliberately floats the
+window; `toggle_window_floating` attaches it to the layout again.
+
+`set_proportion` remains layout-relative for tiled windows. For floating
+windows and unmanaged Spaces, it instead resizes the window width to that
+fraction of the screen while preserving its position and height.
+
+### Group navigation
+
+`focus_group_next` and `focus_group_prev` cycle only within the nearest tabbed
+or stacked group. Holding Alt and scrolling over the visible group window
+provides the same navigation with the mouse, with gesture throttling for
+trackpads.
 
 ### Space focus memory
 
@@ -96,8 +126,10 @@ a fraction always lands on that fraction and pressing it twice is a no-op.
 "Alt + Ctrl + Digit5" = { set_proportion = { proportion = 0.5 } }
 ```
 
-The proportion is of the parent container, not the screen: a window nested
-inside a half-screen split set to `0.5` fills a quarter of the screen.
+For a tiled window, the proportion is of the parent container, not the screen:
+a window nested inside a half-screen split set to `0.5` fills a quarter of the
+screen. For a floating window or unmanaged Space, it is a fraction of the
+screen width.
 
 ### `default_root_orientation` — `feat/auto-root-orientation`
 
@@ -157,15 +189,8 @@ cargo build --release
 cargo test
 ```
 
-Running the built binary as an app bundle, so macOS Accessibility permission
-sticks to a stable identity:
-
-```
-cp -R /Applications/Glide.app /Applications/Glide-Dev.app
-# set CFBundleIdentifier to something distinct, then each rebuild:
-cp target/release/glide_server /Applications/Glide-Dev.app/Contents/MacOS/
-codesign --force --deep -s - /Applications/Glide-Dev.app
-```
-
-Replacing the binary breaks the developer signature, which revokes
-Accessibility. A separate bundle keeps the stock app working as a fallback.
+The live fork uses `/Applications/Glide-Dev.app`, with bundle identifier
+`org.glidewm.glide-dev`, signed using the same Developer ID identity on every
+build. Do not ad-hoc re-sign the bundle: changing its designated requirement
+can invalidate the macOS Accessibility grant. Keep stock `Glide.app` installed
+as a signed fallback.
