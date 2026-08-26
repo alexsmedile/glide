@@ -434,7 +434,17 @@ impl<'a, 'out> Visitor<'a, 'out> {
         // Usually this should be false, except in the uncommon case where root
         // is fullscreen.
         let parent_visible = self.fullscreen_nodes.contains(&root);
-        let rect = rect.inset(self.config.settings.outer_gap);
+        let window_count = root
+            .traverse_preorder(self.map)
+            .filter(|&node| self.window.at(node).is_some())
+            .take(2)
+            .count();
+        let outer_gap = if window_count == 1 && !self.config.settings.single_window_uses_outer_gap {
+            0.0
+        } else {
+            self.config.settings.outer_gap
+        };
+        let rect = rect.inset(outer_gap);
         self.visit_node(root, rect, true, parent_visible, true);
         self.target_rect
     }
@@ -449,7 +459,12 @@ impl<'a, 'out> Visitor<'a, 'out> {
     ) {
         let info = &self.size.info[node];
         let rect = if info.is_fullscreen {
-            self.screen.inset(self.config.settings.outer_gap)
+            let outer_gap = if self.config.settings.fullscreen_uses_outer_gap {
+                self.config.settings.outer_gap
+            } else {
+                0.0
+            };
+            self.screen.inset(outer_gap)
         } else {
             rect
         };
@@ -1024,6 +1039,51 @@ mod tests {
             window1_fullscreen_frame,
             rect(10, 10, 980, 980),
             "window1 fullscreen with outer_gap"
+        );
+
+        config.settings.fullscreen_uses_outer_gap = false;
+        let (frames_gapless_fullscreen, _) =
+            tree.calculate_layout_and_groups(layout, screen, &config);
+        let window1_gapless_fullscreen_frame = frames_gapless_fullscreen
+            .iter()
+            .find(|(wid, _)| *wid == WindowId::new(1, 1))
+            .unwrap()
+            .1;
+        assert_eq!(window1_gapless_fullscreen_frame, screen);
+    }
+
+    #[test]
+    fn a_single_window_can_ignore_the_outer_gap() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let first = WindowId::new(1, 1);
+        tree.add_window_under(layout, root, first);
+
+        let screen = rect(0, 0, 1000, 1000);
+        let mut config = Config::default();
+        config.settings.outer_gap = 10.0;
+
+        assert_eq!(
+            tree.calculate_layout(layout, screen, &config),
+            vec![(first, rect(10, 10, 980, 980))]
+        );
+
+        config.settings.single_window_uses_outer_gap = false;
+
+        assert_eq!(
+            tree.calculate_layout(layout, screen, &config),
+            vec![(first, screen)]
+        );
+
+        let second = WindowId::new(1, 2);
+        tree.add_window_under(layout, root, second);
+        assert_eq!(
+            tree.calculate_layout(layout, screen, &config),
+            vec![
+                (first, rect(10, 10, 490, 980)),
+                (second, rect(500, 10, 490, 980))
+            ]
         );
     }
 

@@ -36,6 +36,12 @@ outer_gap = 0
 # Gap between adjacent windows (in pixels).
 inner_gap = 0
 
+# Keep the outer gap when a tiled window is fullscreen.
+fullscreen_uses_outer_gap = true
+
+# Keep the outer gap when a layout contains only one tiled window.
+single_window_uses_outer_gap = true
+
 # The default layout kind for new spaces: "tree" or "scroll".
 # Note: "scroll" requires settings.experimental.scroll.enable = true.
 default_layout_kind = "tree"

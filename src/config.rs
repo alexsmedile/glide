@@ -100,6 +100,8 @@ pub struct Settings {
     pub mouse_drag_split_ratio: f64,
     pub outer_gap: f64,
     pub inner_gap: f64,
+    pub fullscreen_uses_outer_gap: bool,
+    pub single_window_uses_outer_gap: bool,
     pub default_keys: bool,
     pub default_layout_kind: LayoutKind,
     pub default_root_orientation: RootOrientation,

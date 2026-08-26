@@ -1,5 +1,11 @@
 # Changelog
 
+## Fork v0.2.15 r3 (2026-08-26)
+
+### Features
+
+* Add independent settings for keeping outer gaps around fullscreen and single-window layouts.
+
 ## Fork v0.2.15 r2 (2026-08-25)
 
 ### Features

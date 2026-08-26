@@ -7,7 +7,7 @@ The config that drives it lives in its own repo at
 `~/code/utils/glide-config`, and requires this fork — upstream rejects it with
 a parse error.
 
-`cargo test --lib` on `main` is 272 tests. Each feature's tests were checked to
+`cargo test --lib` on `main` is 273 tests. Each feature's tests were checked to
 fail with the implementation removed, so they test the behaviour rather than
 passing either way.
 
@@ -24,6 +24,7 @@ workflow.
 
 | Release | Upstream base | Contents |
 |---|---|---|
+| `fork-v0.2.15-r3` | `v0.2.15` | Configurable gapless fullscreen and automatic gapless maximization for single-window layouts. |
 | `fork-v0.2.15-r2` | `v0.2.15` | Mouse drop overlays and layout placement, keyboard half-screen snapping, floating/unmanaged size presets, group navigation, and Alt-scroll group cycling. |
 | `fork-v0.2.15-r1` | `v0.2.15` | Five layout/resize features plus reliable per-Space focus restoration on multiple displays. |
 
@@ -57,6 +58,16 @@ this should be a per-binding argument or a cycling command is a question for
 the maintainer before the code is written.
 
 ## Features
+
+### Smart fullscreen gaps
+
+`fullscreen_uses_outer_gap` controls whether Glide's layout fullscreen command
+keeps the configured outer gap. `single_window_uses_outer_gap` controls whether
+a layout containing one tiled window keeps it. Both default to `true` for
+upstream-compatible behaviour and can be disabled independently.
+
+These settings maximize a window inside the macOS Space's usable screen. They
+do not invoke macOS native fullscreen or create a separate fullscreen Space.
 
 ### Mouse placement and snap overlays
 
