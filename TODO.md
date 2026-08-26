@@ -6,6 +6,7 @@ schema: make-a-change/todo/v1
 
 Actionable development roadmap for the Glide fork.
 Format adheres to [make-a-change](https://github.com/alexsmedile/make-a-change).
+Canonical feature terminology is defined in [WORKSETS.md](WORKSETS.md).
 
 The product direction is a hybrid of persistent tiling, precise snapping, and
 direct mouse editing. Each parent item needs a narrow prototype and a user
@@ -13,6 +14,23 @@ checkpoint before it earns a `feat/*` branch.
 
 ## Now
 
+- [ ] [prototype] Test Space 2 with Agents and Terminal Worksets <!-- ref: #4, from: #1 #3 -->
+  - [ ] Model an ordered Workset collection containing an Agents split tree and a Terminal tree
+  - [ ] Show Codex and Gemini together in the Agents Workset and the general Ghostty window in the Terminal Workset
+  - [ ] Preserve focus and proportions independently inside each Workset
+  - [ ] Use ephemeral window ids for the first session before adding durable title/role/mark matching
+  - [ ] Make `Alt+2` switch to Space 2 from elsewhere and cycle Worksets when Space 2 is already active
+  - [ ] Make `Alt+T` switch to Space 2 and select the Terminal Workset directly
+  - [ ] Keep the old Space 3 and macOS/`skhd` bindings recoverable until the interaction is verified
+- [ ] [worksets] Establish the Workset domain model <!-- ref: #5, from: #4 -->
+  - [ ] Introduce stable `WorksetId` identity above Layout selection
+  - [ ] Store an ordered Workset collection and one active Workset per Space
+  - [ ] Let each Workset own membership, tiled Layout, floating frames, focus, selection, placeholders, and runtime policy
+  - [ ] Keep Worksets live and usable without persistent Recipes
+  - [ ] Switch Worksets as one transaction that suppresses the old set before surfacing and focusing the new set
+  - [ ] Preserve inactive Workset state without raising or rearranging its windows
+  - [ ] Keep screen-size Layout variants subordinate to Workset identity
+  - [ ] Define deterministic model tests for activation, isolation, focus restoration, missing windows, and rollback
 - [ ] [placement] Implement R4 declarative precision-placement targets
   - [ ] Define activation regions independently from destination frames
   - [ ] Select different target sets for portrait and landscape displays
@@ -34,7 +52,8 @@ checkpoint before it earns a `feat/*` branch.
   - [ ] Bound event queues and command timeouts
   - [ ] Keep all transport and I/O in the actor layer
   - [ ] Make the CLI deterministic enough for `jq`, shell scripts, Raycast, SketchyBar, and replay tests
-- [ ] [recipes] Implement layouts and workspace recipes
+- [ ] [recipes] Implement persistent Recipes for Worksets <!-- ref: #1 -->
+  - [ ] Support explicit `apply_once` and persistent `maintain` recipe modes
   - [ ] Save the current tree, orientations, groups, proportions, gaps, placeholders, floating frames, and selected role under a name
   - [ ] Match recipe windows by bundle id, title, and role instead of ephemeral window ids
   - [ ] Restore a recipe on one display with explicit policies for missing and extra windows
@@ -43,6 +62,21 @@ checkpoint before it earns a `feat/*` branch.
   - [ ] Target displays by stable identity, relative order, or orientation
   - [ ] Activate recipes by shortcut, CLI/API call, login, or display connection change
   - [ ] Keep the recipe format editable, portable, validated, and separate from internal crash-restore snapshots
+- [ ] [spaces] Let Glide own Space shortcuts and per-Space Workset cycling <!-- ref: #3, from: #1 -->
+  - [ ] Add a Glide command that activates a Space by configured logical name or index
+  - [ ] Switch and restore the last-used Workset when the requested Space is not active
+  - [ ] Cycle Worksets forward when the requested Space is already active and reverse with Shift
+  - [ ] Show a short-lived Space/Workset indicator and remember the last Workset per Space
+  - [ ] Perform native Space switching in the system layer without synthesizing macOS shortcuts
+  - [ ] Keep switch-versus-cycle policy in `SpaceManager` and activate Worksets only after the destination is confirmed active
+  - [ ] Detect conflicting macOS Mission Control bindings and document their manual removal
+  - [ ] Preserve focus memory and coalesce repeated requests during in-flight Space transitions
+- [ ] [stage-manager] Integrate Stage Manager as an optional Workset adapter <!-- ref: #2, from: #1 -->
+  - [ ] Keep every Workset and Recipe usable when Stage Manager is disabled
+  - [ ] Treat the active Stage Manager group as a visibility boundary and arrange only its visible windows
+  - [ ] Restore a recognized group's remembered layout and focus after its visible window set settles
+  - [ ] Support an optional Stage Manager shelf/reserved-area policy
+  - [ ] Keep native group creation or switching experimental if it requires private APIs or Accessibility UI scripting
 - [ ] [pinning] Prototype pinned windows
   - [ ] Define all-Spaces, follow-focus, display-pinned, and layout-pinned scopes separately
   - [ ] Determine whether each scope permits tiling or requires floating
@@ -104,7 +138,7 @@ checkpoint before it earns a `feat/*` branch.
   - [ ] Preserve proportions and adapt geometry to the destination display
 - [ ] [layout] Add per-Space gaps and padding profiles
   - [ ] Set, nudge, or toggle inner gaps and each outer edge independently
-  - [ ] Save and restore the profile through workspace recipes
+  - [ ] Save and restore the profile through Workset Recipes
 - [ ] [diagnostics] Add a permission and runtime health check
   - [ ] Report bundle identity and signing, Accessibility permission, running binary and fork version, config compatibility, IPC health, and launch-agent state
   - [ ] Distinguish a missing permission from a stale or re-signed application identity
