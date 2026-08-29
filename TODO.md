@@ -52,6 +52,10 @@ checkpoint before it earns a `feat/*` branch.
   - [ ] Bound event queues and command timeouts
   - [ ] Keep all transport and I/O in the actor layer
   - [ ] Make the CLI deterministic enough for `jq`, shell scripts, Raycast, SketchyBar, and replay tests
+  - [ ] Replace the AppleScript focused-window lookup in `glide-config/scripts/finder-reset.sh`; a query API removes the need to ask Finder whether it is frontmost
+- [ ] [float] Reposition and resize floating windows from a Glide command
+  - [ ] Cover the finder-reset case natively: center a floating window at a given size on its display
+  - [ ] Retire `glide-config/scripts/finder-reset.sh` once the command lands
 - [ ] [recipes] Implement persistent Recipes for Worksets <!-- ref: #1 -->
   - [ ] Support explicit `apply_once` and persistent `maintain` recipe modes
   - [ ] Save the current tree, orientations, groups, proportions, gaps, placeholders, floating frames, and selected role under a name
