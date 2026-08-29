@@ -312,6 +312,7 @@ impl Size {
             groups: None,
             target: None,
             target_rect: None,
+            window_count: 0,
         }
         .visit(root, screen);
         sizes
@@ -345,6 +346,7 @@ impl Size {
             groups: None,
             target: Some(node),
             target_rect: None,
+            window_count: 0,
         }
         .visit(root, screen)
     }
@@ -407,6 +409,7 @@ impl Size {
             groups: Some(&mut groups),
             target: None,
             target_rect: None,
+            window_count: 0,
         }
         .visit(root, screen);
         (sizes, groups)
@@ -427,9 +430,36 @@ struct Visitor<'a, 'out> {
     /// If set, the rect assigned to this node is recorded in `target_rect`.
     target: Option<NodeId>,
     target_rect: Option<CGRect>,
+    /// Number of tiled windows in the layout, saturating at 2.
+    window_count: usize,
 }
 
 impl<'a, 'out> Visitor<'a, 'out> {
+    /// The gap between the layout and the screen edges.
+    fn outer_gap(&self) -> f64 {
+        let uses_gap = self.window_count > 1 || self.config.settings.single_window_uses_outer_gap;
+        if uses_gap {
+            self.config.settings.outer_gap
+        } else {
+            0.0
+        }
+    }
+
+    /// The gap between a fullscreen node and the screen edges. A layout with a
+    /// single tiled window follows the single-window setting, so a lone window
+    /// looks the same whether or not it is fullscreen; distinguishing the two
+    /// would only be confusing.
+    fn fullscreen_outer_gap(&self) -> f64 {
+        if self.window_count == 1 {
+            return self.outer_gap();
+        }
+        if self.config.settings.fullscreen_uses_outer_gap {
+            self.config.settings.outer_gap
+        } else {
+            0.0
+        }
+    }
+
     fn visit(mut self, root: NodeId, rect: CGRect) -> Option<CGRect> {
         // Usually this should be false, except in the uncommon case where root
         // is fullscreen.
@@ -439,12 +469,8 @@ impl<'a, 'out> Visitor<'a, 'out> {
             .filter(|&node| self.window.at(node).is_some())
             .take(2)
             .count();
-        let outer_gap = if window_count == 1 && !self.config.settings.single_window_uses_outer_gap {
-            0.0
-        } else {
-            self.config.settings.outer_gap
-        };
-        let rect = rect.inset(outer_gap);
+        self.window_count = window_count;
+        let rect = rect.inset(self.outer_gap());
         self.visit_node(root, rect, true, parent_visible, true);
         self.target_rect
     }
@@ -459,12 +485,7 @@ impl<'a, 'out> Visitor<'a, 'out> {
     ) {
         let info = &self.size.info[node];
         let rect = if info.is_fullscreen {
-            let outer_gap = if self.config.settings.fullscreen_uses_outer_gap {
-                self.config.settings.outer_gap
-            } else {
-                0.0
-            };
-            self.screen.inset(outer_gap)
+            self.screen.inset(self.fullscreen_outer_gap())
         } else {
             rect
         };
@@ -1050,6 +1071,34 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!(window1_gapless_fullscreen_frame, screen);
+    }
+
+    #[test]
+    fn a_lone_fullscreen_window_follows_the_single_window_setting() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let only = WindowId::new(1, 1);
+        tree.add_window_under(layout, root, only);
+        let node = tree.window_node(layout, only).unwrap();
+        tree.set_fullscreen(node, true);
+
+        let screen = rect(0, 0, 1000, 1000);
+        let mut config = Config::default();
+        config.settings.outer_gap = 10.0;
+        config.settings.single_window_uses_outer_gap = false;
+        config.settings.fullscreen_uses_outer_gap = true;
+
+        assert_eq!(
+            tree.calculate_layout(layout, screen, &config),
+            vec![(only, screen)]
+        );
+
+        config.settings.single_window_uses_outer_gap = true;
+        assert_eq!(
+            tree.calculate_layout(layout, screen, &config),
+            vec![(only, rect(10, 10, 980, 980))]
+        );
     }
 
     #[test]

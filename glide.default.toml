@@ -36,10 +36,14 @@ outer_gap = 0
 # Gap between adjacent windows (in pixels).
 inner_gap = 0
 
-# Keep the outer gap when a tiled window is fullscreen.
+# Keep the outer gap when a node is fullscreen in a layout that has other
+# tiled windows. Setting this keeps a zoomed window visibly distinct from a
+# layout that simply holds one window.
 fullscreen_uses_outer_gap = true
 
-# Keep the outer gap when a layout contains only one tiled window.
+# Keep the outer gap when a layout contains only one tiled window. This also
+# covers that window when it is fullscreen, so a lone window looks the same
+# either way.
 single_window_uses_outer_gap = true
 
 # The default layout kind for new spaces: "tree" or "scroll".
