@@ -1,5 +1,11 @@
 # Changelog
 
+## Fork v0.2.15 r4 (2026-08-29)
+
+### Bug Fixes
+
+* Keep a lone fullscreen window consistent with the single-window gap setting, so zooming the only window in a layout no longer adds or removes its outer gap.
+
 ## Fork v0.2.15 r3 (2026-08-26)
 
 ### Features

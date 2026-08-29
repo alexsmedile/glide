@@ -7,7 +7,7 @@ The config that drives it lives in its own repo at
 `~/code/utils/glide-config`, and requires this fork — upstream rejects it with
 a parse error.
 
-`cargo test --lib` on `main` is 273 tests. Each feature's tests were checked to
+`cargo test --lib` on `main` is 274 tests. Each feature's tests were checked to
 fail with the implementation removed, so they test the behaviour rather than
 passing either way.
 
@@ -24,6 +24,7 @@ workflow.
 
 | Release | Upstream base | Contents |
 |---|---|---|
+| `fork-v0.2.15-r4` | `v0.2.15` | Fullscreen gap handling for single-window layouts. |
 | `fork-v0.2.15-r3` | `v0.2.15` | Configurable gapless fullscreen and automatic gapless maximization for single-window layouts. |
 | `fork-v0.2.15-r2` | `v0.2.15` | Mouse drop overlays and layout placement, keyboard half-screen snapping, floating/unmanaged size presets, group navigation, and Alt-scroll group cycling. |
 | `fork-v0.2.15-r1` | `v0.2.15` | Five layout/resize features plus reliable per-Space focus restoration on multiple displays. |
