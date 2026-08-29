@@ -41,7 +41,7 @@ checkpoint before it earns a `feat/*` branch.
   - [ ] Let each target produce either a floating frame or a tiled-tree change
   - [ ] Preview the exact result through the existing drop overlay
   - [ ] Validate impossible fractions, ambiguous overlaps, and unknown actions at config load
-  - [ ] Use the saved Rectangle configuration in `~/code/utils/rectangle` as the migration reference
+  - [ ] Use the saved Rectangle configuration in `~/code/utils/rectangle-config` as the migration reference
 - [ ] [api] Design a versioned scriptable query and event API
   - [ ] Query displays, active Spaces, layouts, containers, windows, focus, floating state, groups, proportions, marks, and pinned state as stable JSON
   - [ ] Select windows by id, bundle id, app name, title, role, Space, mark, or current focus
@@ -130,6 +130,17 @@ checkpoint before it earns a `feat/*` branch.
 
 ## Later
 
+- [ ] [brand] Select a distinctive commercial product name
+  - [ ] Prioritize the strong candidates: `shoji`, `fusuma`, and `plica`
+  - [ ] Compare the fold-and-structure candidates: `plica`, `plico`, `hinge`, `tessel`, `pleat`, `pliant`, `ply`, `flect`, `tess`, `mado`, `madoji`, `oriba`, and `sash`
+  - [ ] Evaluate `plica` as the leading power-user brand and `flect` as the strongest technical fallback
+  - [ ] Test the positioning “Plica — a programmable window and workspace manager for macOS” against the CLI vocabulary `query`, `focus`, `workset`, `recipe`, `layout`, and `watch`
+  - [ ] Preserve the wider candidate pool: `oku`, `kasane`, `roomfold`, `tesseract-wm`, `gridwell`, `fold-wm`, `roomviolet`, `roombriole`, `shuffler`, `sash`, `sway`, and `shingle`
+  - [ ] Explore quirky, memorable names with the character of Peppermint, Cascade, and Glide
+  - [ ] Prefer a name that works as an app, GitHub repository, CLI command, and bundle identity
+  - [ ] Screen finalists for software collisions, trademarks, domains, package names, and pronunciation
+  - [ ] Keep Workset, Layout, and Recipe as product vocabulary independently of the brand name
+  - [ ] Treat Glide as upstream attribution unless separate naming permission is confirmed
 - [ ] [ui] Add a searchable window switcher
   - [ ] Filter by application, title, Space, group, mark, or pinned state
   - [ ] Switch Space, reveal the correct group member, and focus it as one operation
