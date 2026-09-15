@@ -34,7 +34,7 @@ use tracing::{Span, debug, error, info, instrument, trace, warn};
 use super::mouse;
 use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, pid_t};
 use crate::actor::layout::{self, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo};
-use crate::actor::raise::{self, RaiseManager, RaiseRequest};
+use crate::actor::raise::{self, RaiseManager, RaiseRequest, WorksetStack};
 use crate::actor::space_manager::SpaceManager;
 use crate::actor::wm_controller::WmCommand;
 use crate::actor::{drop_preview, group_bars, space_manager, status, window_server, wm_controller};
@@ -309,6 +309,10 @@ struct ResponseContext {
     /// Only valid for the event it arrived with: raising windows changes the
     /// order and the window server doesn't report the result.
     visible_window_order: Option<Vec<WindowServerId>>,
+    /// Windows belonging to inactive Worksets on the Space being surfaced.
+    /// When present, the raise manager verifies that the active windows form
+    /// one layer above these after all app activation has settled.
+    inactive_workset_windows: Option<Vec<WindowId>>,
     /// Whether the event came from the mouse moving, in which case we don't
     /// warp the mouse to the newly focused window.
     from_mouse: bool,
@@ -684,6 +688,13 @@ impl Reactor {
                         response,
                         ResponseContext {
                             visible_window_order: Some(visible_window_order),
+                            inactive_workset_windows: Some(
+                                self.screens
+                                    .iter()
+                                    .filter_map(|screen| screen.space)
+                                    .flat_map(|space| self.layout.inactive_workset_windows(space))
+                                    .collect(),
+                            ),
                             ..Default::default()
                         },
                     );
@@ -752,43 +763,36 @@ impl Reactor {
                         self.layout.handle_event(LayoutEvent::SpaceExposed(space, size))
                     })
                     .reduce(layout::EventResponse::coalesce);
-                if let Some(response) = response {
+                if let Some(mut response) = response {
+                    if !changed_spaces.is_empty() {
+                        response.focus_window = self
+                            .main_window()
+                            .filter(|wid| response.raise_windows.contains(wid))
+                            .or_else(|| {
+                                changed_spaces
+                                    .iter()
+                                    .find_map(|space| self.layout.selected_window(*space))
+                            });
+                    }
                     self.handle_layout_response_with_context(
                         response,
                         ResponseContext {
                             visible_window_order: Some(visible_window_order),
+                            inactive_workset_windows: Some(
+                                self.screens
+                                    .iter()
+                                    .filter_map(|screen| screen.space)
+                                    .filter(|space| {
+                                        changed_spaces.is_empty() || changed_spaces.contains(space)
+                                    })
+                                    .flat_map(|space| self.layout.inactive_workset_windows(space))
+                                    .collect(),
+                            ),
                             ..Default::default()
                         },
                     );
                     for space in self.screens.iter().flat_map(|screen| screen.space) {
                         self.layout.debug_tree_desc(space, "after event", false);
-                    }
-                }
-                // Switching spaces rarely moves key focus by itself: macOS
-                // often reports no focused window yet, or still points at the
-                // display the user came from, while quiet raises race to
-                // activate their own apps. When macOS's focus doesn't point
-                // into one of the changed spaces, restore that space's
-                // remembered selection instead of leaving the outcome to the
-                // race. Click-to-switch keeps working because there the
-                // reported focus already points into the newly exposed space.
-                if !changed_spaces.is_empty()
-                    && !self
-                        .main_window_space()
-                        .is_some_and(|space| changed_spaces.contains(&space))
-                {
-                    let focus =
-                        changed_spaces.iter().find_map(|space| self.layout.selected_window(*space));
-                    if let Some(wid) = focus
-                        && self.main_window() != Some(wid)
-                    {
-                        self.handle_layout_response_with_context(
-                            layout::EventResponse {
-                                focus_window: Some(wid),
-                                ..Default::default()
-                            },
-                            ResponseContext::default(),
-                        );
                     }
                 }
                 if let Some(main_window) = self.main_window() {
@@ -966,7 +970,14 @@ impl Reactor {
                 let visible_spaces =
                     self.screens.iter().flat_map(|screen| screen.space).collect::<Vec<_>>();
                 let response = self.layout.handle_command(Some(space), &visible_spaces, command);
-                self.handle_layout_response(response);
+                let inactive_workset_windows = self.layout.inactive_workset_windows(space);
+                self.handle_layout_response_with_context(
+                    response,
+                    ResponseContext {
+                        inactive_workset_windows: Some(inactive_workset_windows),
+                        ..Default::default()
+                    },
+                );
                 self.update_layout(&[], false);
                 if let Some(name) = self.layout.active_workset_name(space) {
                     self.group_indicators_tx
@@ -1056,7 +1067,20 @@ impl Reactor {
                         );
                         let response =
                             self.layout.handle_command(command_space, &visible_spaces, cmd);
-                        self.handle_layout_response(response);
+                        if relayout {
+                            let inactive_workset_windows = command_space
+                                .map(|space| self.layout.inactive_workset_windows(space))
+                                .unwrap_or_default();
+                            self.handle_layout_response_with_context(
+                                response,
+                                ResponseContext {
+                                    inactive_workset_windows: Some(inactive_workset_windows),
+                                    ..Default::default()
+                                },
+                            );
+                        } else {
+                            self.handle_layout_response(response);
+                        }
                         if relayout {
                             self.update_layout(&[], false);
                             // Worksets share a Space, so nothing on screen
@@ -1353,6 +1377,7 @@ impl Reactor {
         mut response: layout::EventResponse,
         ResponseContext {
             visible_window_order,
+            inactive_workset_windows,
             from_mouse,
         }: ResponseContext,
     ) {
@@ -1397,9 +1422,33 @@ impl Reactor {
             (wid, warp)
         });
 
+        let workset_stack = inactive_workset_windows.and_then(|inactive_wids| {
+            let mut active = Vec::new();
+            for wsid in raise_windows
+                .iter()
+                .chain(focus_window.iter())
+                .filter_map(|wid| self.windows.get(wid)?.window_server_id)
+            {
+                if !active.contains(&wsid) {
+                    active.push(wsid);
+                }
+            }
+            let mut inactive = Vec::new();
+            for wsid in
+                inactive_wids.iter().filter_map(|wid| self.windows.get(wid)?.window_server_id)
+            {
+                if !active.contains(&wsid) && !inactive.contains(&wsid) {
+                    inactive.push(wsid);
+                }
+            }
+            (!active.is_empty() && !inactive.is_empty())
+                .then_some(WorksetStack { active, inactive })
+        });
+
         let msg = raise::Event::RaiseRequest(RaiseRequest {
             raise_windows: windows_by_app_and_screen.into_values().collect(),
             focus_window: focus_window_with_warp,
+            workset_stack,
             app_handles,
         });
 
@@ -1426,6 +1475,7 @@ impl Reactor {
         let desired_visible_wsids = response
             .raise_windows
             .iter()
+            .filter(|wid| Some(**wid) != response.focus_window)
             .flat_map(|wid| self.windows.get(wid).and_then(|window| window.window_server_id))
             .collect::<HashSet<_>>();
         let current_top_wsids = visible_window_order
@@ -2653,9 +2703,7 @@ pub mod tests {
         let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
         match msg {
             raise::Event::RaiseRequest(RaiseRequest {
-                raise_windows,
-                focus_window,
-                app_handles: _,
+                raise_windows, focus_window, ..
             }) => {
                 assert_eq!(raise_windows, vec![desired]);
                 assert!(focus_window.is_none());
@@ -2951,14 +2999,19 @@ pub mod tests {
             WindowsOnScreen::new(on_screen),
         ));
 
+        let mut preserved_focus = false;
         while let Ok((_, msg)) = raise_manager_rx.try_recv() {
             if let raise::Event::RaiseRequest(RaiseRequest { focus_window, .. }) = msg {
-                assert!(
-                    focus_window.is_none(),
-                    "macOS focus should be respected, got {focus_window:?}"
-                );
+                if let Some((wid, _)) = focus_window {
+                    assert_eq!(wid, WindowId::new(1, 2));
+                    preserved_focus = true;
+                }
             }
         }
+        assert!(
+            preserved_focus,
+            "the stacking repair should preserve macOS focus"
+        );
         assert_eq!(reactor.layout.selected_window(space1), Some(WindowId::new(1, 2)));
     }
 
@@ -3023,6 +3076,55 @@ pub mod tests {
             layout::EventResponse {
                 frame_overrides: vec![],
                 raise_windows: vec![w2],
+                focus_window: Some(w1),
+            },
+            &[WindowServerId::new(1), WindowServerId::new(2)],
+        );
+
+        assert!(response.raise_windows.is_empty());
+        assert!(response.focus_window.is_none());
+    }
+
+    #[test]
+    fn filter_response_clears_a_focus_window_duplicated_in_the_raise_set() {
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        reactor.screens = vec![Screen {
+            frame: CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.)),
+            space: Some(SpaceId::new(1)),
+            scale_factor: 2.0,
+        }];
+        let w1 = WindowId::with_wsid(1, WindowServerId::new(1));
+        let w2 = WindowId::with_wsid(1, WindowServerId::new(2));
+        for (wid, x) in [(w1, 0.0), (w2, 500.0)] {
+            let frame = CGRect::new(CGPoint::new(x, 0.), CGSize::new(500., 1000.));
+            reactor.windows.insert(
+                wid,
+                super::WindowState {
+                    title: Secret::new(String::new()),
+                    window_server_id: wid.wsid(),
+                    frame_monotonic: frame,
+                    is_ax_standard: true,
+                    is_resizable: true,
+                    ax_role: String::new(),
+                    ax_subrole: None,
+                    last_sent_txid: TransactionId::default(),
+                },
+            );
+            reactor.window_server_info.insert(
+                wid.wsid().unwrap(),
+                WindowServerInfo {
+                    id: wid.wsid().unwrap(),
+                    pid: 1,
+                    layer: 0,
+                    frame,
+                },
+            );
+        }
+
+        let response = reactor.filter_response(
+            layout::EventResponse {
+                frame_overrides: vec![],
+                raise_windows: vec![w1, w2],
                 focus_window: Some(w1),
             },
             &[WindowServerId::new(1), WindowServerId::new(2)],
@@ -3509,9 +3611,7 @@ pub mod tests {
         let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
         match msg {
             raise::Event::RaiseRequest(RaiseRequest {
-                raise_windows,
-                focus_window,
-                app_handles: _,
+                raise_windows, focus_window, ..
             }) => {
                 let raise_windows: HashSet<Vec<WindowId>> = raise_windows.into_iter().collect();
                 let expected = [
@@ -3526,6 +3626,49 @@ pub mod tests {
             }
             _ => panic!("Unexpected event: {msg:?}"),
         }
+    }
+
+    #[test]
+    fn workset_stack_includes_inactive_windows_from_the_same_app() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
+        reactor.raise_manager_tx = raise_manager_tx;
+        let space = SpaceId::new(1);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(3)));
+        let _events = apps.simulate_events();
+        while raise_manager_rx.try_recv().is_ok() {}
+
+        reactor.handle_layout_response_with_context(
+            layout::EventResponse {
+                frame_overrides: vec![],
+                raise_windows: vec![WindowId::new(1, 1), WindowId::new(1, 2)],
+                focus_window: Some(WindowId::new(1, 2)),
+            },
+            ResponseContext {
+                inactive_workset_windows: Some(vec![WindowId::new(1, 3)]),
+                ..Default::default()
+            },
+        );
+
+        let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
+        let raise::Event::RaiseRequest(RaiseRequest { workset_stack, .. }) = msg else {
+            panic!("Unexpected event: {msg:?}");
+        };
+        assert_eq!(
+            workset_stack,
+            Some(WorksetStack {
+                active: vec![WindowServerId::new(1), WindowServerId::new(2)],
+                inactive: vec![WindowServerId::new(3)],
+            })
+        );
     }
 
     #[test]

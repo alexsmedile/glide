@@ -19,6 +19,7 @@ use tracing::{Span, debug, trace, warn};
 use crate::actor::app::{AppThreadHandle, Quiet, Request, WindowId};
 use crate::actor::{mouse, reactor};
 use crate::sys::timer::Timer;
+use crate::sys::window_server::{self, OrderMode, WindowServerId};
 
 /// Messages that can be sent to the raise manager
 #[derive(Debug)]
@@ -45,14 +46,27 @@ pub struct RaiseRequest {
     pub raise_windows: Vec<Vec<WindowId>>,
     /// The window to raise and focus last.
     pub focus_window: Option<(WindowId, Option<CGPoint>)>,
+    /// Desired Workset boundary after all application activation and AX raises
+    /// have completed. The WindowServer ordering pass catches windows from the
+    /// same application too: activating that application may have raised an
+    /// inactive sibling along with the requested windows.
+    pub workset_stack: Option<WorksetStack>,
     pub app_handles: HashMap<i32, AppThreadHandle>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorksetStack {
+    pub active: Vec<WindowServerId>,
+    pub inactive: Vec<WindowServerId>,
 }
 
 impl RaiseRequest {
     /// Whether this request asks for the same thing as `other`. App handles
     /// aren't compared; they don't affect what the request does.
     fn matches(&self, other: &RaiseRequest) -> bool {
-        self.raise_windows == other.raise_windows && self.focus_window == other.focus_window
+        self.raise_windows == other.raise_windows
+            && self.focus_window == other.focus_window
+            && self.workset_stack == other.workset_stack
     }
 }
 
@@ -71,6 +85,7 @@ struct ActiveSequence {
     sequence_id: u64,
     pending_raises: HashSet<WindowId>,
     focus_batch: Option<(pid_t, Vec<WindowId>, Option<CGPoint>)>,
+    workset_stack: Option<WorksetStack>,
     app_handles: HashMap<i32, AppThreadHandle>,
     raise_token: CancellationToken,
     started_at: Instant,
@@ -238,6 +253,7 @@ impl RaiseManager {
         RaiseRequest {
             raise_windows,
             focus_window,
+            workset_stack,
             app_handles,
         }: RaiseRequest,
     ) {
@@ -291,6 +307,7 @@ impl RaiseManager {
                 sequence_id,
                 pending_raises,
                 focus_batch,
+                workset_stack,
                 app_handles,
                 raise_token,
                 started_at: Instant::now(),
@@ -343,6 +360,9 @@ impl RaiseManager {
 
         // If all raises (including focus) are complete, remove the active sequence.
         if sequence.pending_raises.is_empty() && sequence.focus_batch.is_none() {
+            if let Some(stack) = sequence.workset_stack.take() {
+                enforce_workset_stack(&stack);
+            }
             trace!(
                 "Raise sequence completed after {:?}",
                 sequence.started_at.elapsed(),
@@ -352,6 +372,64 @@ impl RaiseManager {
         }
 
         changed
+    }
+}
+
+fn enforce_workset_stack(stack: &WorksetStack) {
+    if stack.active.is_empty() || stack.inactive.is_empty() {
+        return;
+    }
+
+    for attempt in 0..2 {
+        let order = window_server::get_visible_window_ids();
+        if workset_stack_is_correct(&order, stack) {
+            return;
+        }
+        let Some(anchor) = order.iter().rev().find(|id| stack.active.contains(id)).copied() else {
+            debug!(?stack.active, "No visible active Workset window to order against");
+            return;
+        };
+        for &window in &stack.inactive {
+            if order.contains(&window)
+                && let Err(error) =
+                    window_server::order_window(window, OrderMode::Below, Some(anchor))
+            {
+                warn!(
+                    ?window,
+                    ?anchor,
+                    ?error,
+                    "Failed to lower inactive Workset window"
+                );
+            }
+        }
+        if attempt == 0 {
+            trace!(?anchor, "Retrying Workset order verification");
+        }
+    }
+
+    let order = window_server::get_visible_window_ids();
+    if !workset_stack_is_correct(&order, stack) {
+        warn!(?stack.active, ?stack.inactive, "Workset windows did not form a complete top layer");
+    }
+}
+
+fn workset_stack_is_correct(order: &[WindowServerId], stack: &WorksetStack) -> bool {
+    let lowest_active = order
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| stack.active.contains(id))
+        .map(|(index, _)| index)
+        .max();
+    let highest_inactive = order
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| stack.inactive.contains(id))
+        .map(|(index, _)| index)
+        .min();
+    match (lowest_active, highest_inactive) {
+        (Some(active), Some(inactive)) => active < inactive,
+        // There is no boundary to repair when one side is not on screen.
+        _ => true,
     }
 }
 
@@ -383,6 +461,7 @@ mod tests {
         Event::RaiseRequest(RaiseRequest {
             raise_windows: raise_windows.into_iter().map(|w| vec![w]).collect(),
             focus_window,
+            workset_stack: None,
             app_handles,
         })
     }
@@ -967,6 +1046,7 @@ mod tests {
             let raise_request = Event::RaiseRequest(RaiseRequest {
                 raise_windows: batched_windows,
                 focus_window: Some((WindowId::new(1, 7), None)),
+                workset_stack: None,
                 app_handles,
             });
 
@@ -1025,5 +1105,32 @@ mod tests {
                 panic!("Expected Raise request for first batch");
             }
         });
+    }
+
+    #[test]
+    fn workset_stack_requires_every_active_window_above_every_inactive_window() {
+        let stack = WorksetStack {
+            active: vec![WindowServerId::new(10), WindowServerId::new(11)],
+            inactive: vec![WindowServerId::new(20), WindowServerId::new(21)],
+        };
+
+        assert!(workset_stack_is_correct(
+            &[
+                WindowServerId::new(10),
+                WindowServerId::new(11),
+                WindowServerId::new(20),
+                WindowServerId::new(21),
+            ],
+            &stack,
+        ));
+        assert!(!workset_stack_is_correct(
+            &[
+                WindowServerId::new(10),
+                WindowServerId::new(20),
+                WindowServerId::new(11),
+                WindowServerId::new(21),
+            ],
+            &stack,
+        ));
     }
 }
