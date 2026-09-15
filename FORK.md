@@ -7,9 +7,9 @@ The config that drives it lives in its own repo at
 `~/code/utils/glide-config`, and requires this fork — upstream rejects it with
 a parse error.
 
-The library contains 303 tests. The 299 model and actor tests pass in the
-automation environment; four macOS GUI/IPC integration tests require a live
-LaunchServices and message-port context.
+The library contains 307 tests. Of those, 303 pass in the automation
+environment; four macOS GUI/IPC integration tests require a live LaunchServices
+and message-port context.
 
 ## Fork releases
 
@@ -24,6 +24,7 @@ workflow.
 
 | Release | Upstream base | Contents |
 |---|---|---|
+| `fork-v0.2.15-r6` | `v0.2.15` | Deterministic complete Workset activation across applications, remembered-focus restoration, and verified retry of incomplete window layers. |
 | `fork-v0.2.15-r5` | `v0.2.15` | Named per-Space Worksets, native Space handoff, Workset HUD and routing, reliable group activation, and transient-window crash/flicker fixes. |
 | `fork-v0.2.15-r4` | `v0.2.15` | Fullscreen gap handling for single-window layouts. |
 | `fork-v0.2.15-r3` | `v0.2.15` | Configurable gapless fullscreen and automatic gapless maximization for single-window layouts. |

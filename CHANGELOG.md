@@ -1,5 +1,12 @@
 # Changelog
 
+## Fork v0.2.15 r6 (2026-09-16)
+
+### Bug Fixes
+
+* Raise every window in the selected Workset in deterministic cross-application order, then restore its remembered focused window.
+* Verify the completed Workset layer and retry once when macOS reports an incomplete visible stack, without hiding or moving inactive windows.
+
 ## Fork v0.2.15 r5 (2026-09-15)
 
 ### Features

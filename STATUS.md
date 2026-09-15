@@ -1,8 +1,8 @@
 # Status — Glide Fork
 
-**Last updated:** 2026-09-15
+**Last updated:** 2026-09-16
 **Current objective:** Evolve the stable private fork into a hybrid tiling and snapping window manager for keyboard and mouse power users.
-**Overall state:** `fork-v0.2.15-r5` release candidate · Worksets and native Space switching operational · 299 non-GUI library tests passing
+**Overall state:** `fork-v0.2.15-r6` stable checkpoint · Worksets and native Space switching operational · deterministic complete Workset activation confirmed · 303 automated tests passing
 
 ---
 
@@ -12,12 +12,13 @@
 - `src/model/layout_tree.rs` and `src/model/size.rs`: tree/group manipulation, exact proportions, balancing, automatic root orientation, and configurable gapless fullscreen/single-window layouts.
 - `src/actor/drop_preview.rs` and `src/ui/group_bar.rs`: visual drop previews and indicators for stacked/tabbed groups.
 - `glide.default.toml`: upstream-compatible defaults for fork commands and settings.
-- `FORK.md` and `CHANGELOG.md`: fork behavior, release history, and versioning documented through `fork-v0.2.15-r3`.
+- `FORK.md` and `CHANGELOG.md`: fork behavior, release history, and versioning documented through `fork-v0.2.15-r6`.
 - `TODO.md`: make-a-change roadmap prioritizing Worksets, precision placement, a scriptable API, Recipes, and pinned windows.
 - `WORKSETS.md`: canonical Space, Workset, Layout, Window, Role, Slot, Recipe, pinning, and Stage Manager ontology.
 - Named Worksets: per-Space layouts, direct selection, cycling, rule-based routing, focus restoration, inactive-window suppression, and HUD feedback.
 - Native Space handoff: macOS exclusively owns Alt+digits; direct Workset shortcuts can request the native Desktop transition and activate after confirmation.
 - Runtime hardening: zero WindowServer ids no longer panic, and transient non-resizable `AXUnknown` surfaces no longer disturb tiled layouts.
+- Workset layering: active windows are raised sequentially across applications, remembered focus is restored last, and an incomplete visible stack is verified and retried without hiding or moving inactive windows.
 
 ## 2. Active Decisions & Constraints
 
@@ -39,7 +40,7 @@
 
 ## 4. Next Concrete Steps (Ordered)
 
-1. [ ] Runtime-check Chrome/Chromium transient surfaces and Workset switching over a normal work session.
+1. [ ] Continue runtime-checking Chrome/Chromium transient surfaces and Workset switching over normal work sessions.
 2. [ ] Specify configurable snap targets: activation region, destination frame, display orientation, modifier, priority, and repeated-action cycle.
 3. [ ] Design the versioned read-only query schema and selectors that Workset Recipes will depend on.
 4. [ ] Generalize live Worksets into portable single-display `save current` and `apply` Recipes.
