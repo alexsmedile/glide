@@ -41,6 +41,8 @@ pub enum WmEvent {
     ConfigUpdated(Arc<crate::config::Config>),
     /// Sent by SpaceManager to register or unregister hotkeys.
     HotkeysActive(bool),
+    /// Sent by SpaceManager to replay a native Option+Digit Space shortcut.
+    PostNativeSpaceShortcut(usize),
     /// Sent by WindowServer to collect a fresh AppKit display snapshot.
     RefreshScreenParameters(u8),
 }
@@ -58,6 +60,14 @@ pub enum WmCmd {
     ToggleGlobalEnabled,
     SetGlobalEnabled(bool),
     ToggleSpaceActivated,
+    /// Lets the native Option+Digit shortcut switch Spaces, or cycles the
+    /// requested Space's Worksets when that Space is already active.
+    SpaceOrWorkset(usize),
+    /// Activates a named Workset on a particular native macOS Space.
+    WorksetOnSpace {
+        desktop: usize,
+        name: String,
+    },
     Exec(ExecCmd),
 }
 
@@ -109,6 +119,8 @@ pub struct WmController {
     startup_channel_tx: Option<self::StartupToken>,
     login_window_pid: Option<pid_t>,
     hotkeys: Option<HotkeyManager>,
+    passthrough_hotkeys: Option<HotkeyManager>,
+    ignored_passthrough_shortcut: Option<usize>,
     mtm: MainThreadMarker,
 }
 
@@ -132,6 +144,8 @@ impl WmController {
             startup_channel_tx: None,
             login_window_pid: None,
             hotkeys: None,
+            passthrough_hotkeys: None,
+            ignored_passthrough_shortcut: None,
             mtm: MainThreadMarker::new().unwrap(),
         };
         (this, sender)
@@ -208,6 +222,15 @@ impl WmController {
             Command(Wm(SetGlobalEnabled(enabled))) => {
                 self.sm_tx.send(space_manager::Event::SetGlobalEnabled(enabled));
             }
+            Command(Wm(SpaceOrWorkset(desktop))) => {
+                if self.ignored_passthrough_shortcut.take() == Some(desktop) {
+                    return;
+                }
+                self.sm_tx.send(space_manager::Event::SpaceOrWorkset(desktop));
+            }
+            Command(Wm(WorksetOnSpace { desktop, name })) => {
+                self.sm_tx.send(space_manager::Event::WorksetOnSpace { desktop, name });
+            }
             Command(Wm(Exec(cmd))) => {
                 self.exec_cmd(cmd);
             }
@@ -230,6 +253,13 @@ impl WmController {
                     }
                 } else {
                     self.unregister_hotkeys();
+                }
+            }
+            PostNativeSpaceShortcut(desktop) => {
+                self.ignored_passthrough_shortcut = Some(desktop);
+                if let Err(error) = sys::event::post_native_space_shortcut(desktop) {
+                    self.ignored_passthrough_shortcut = None;
+                    warn!(desktop, %error, "Failed to replay native Space shortcut");
                 }
             }
             RefreshScreenParameters(attempt) => {
@@ -263,22 +293,41 @@ impl WmController {
     fn register_hotkeys(&mut self) {
         debug!("register_hotkeys");
         self.hotkeys.take();
-        let mgr = match HotkeyManager::new(self.sender.upgrade().unwrap()) {
+        self.passthrough_hotkeys.take();
+        let Some(events_tx) = self.sender.upgrade() else {
+            return;
+        };
+        let mgr = match HotkeyManager::new(events_tx.clone()) {
             Ok(mgr) => mgr,
             Err(e) => {
                 warn!("Failed to register hotkeys: {e:?}");
                 return;
             }
         };
+        let passthrough_mgr = match HotkeyManager::new_passthrough(events_tx) {
+            Ok(mgr) => Some(mgr),
+            Err(e) => {
+                warn!("Failed to observe native Space hotkeys: {e:?}");
+                None
+            }
+        };
         for (key, cmd) in &self.config.config.keys {
-            mgr.register_wm(key.modifiers, key.key_code, cmd.clone());
+            if matches!(cmd, WmCommand::Wm(WmCmd::SpaceOrWorkset(_))) {
+                if let Some(passthrough_mgr) = &passthrough_mgr {
+                    passthrough_mgr.register_wm(key.modifiers, key.key_code, cmd.clone());
+                }
+            } else {
+                mgr.register_wm(key.modifiers, key.key_code, cmd.clone());
+            }
         }
         self.hotkeys = Some(mgr);
+        self.passthrough_hotkeys = passthrough_mgr;
     }
 
     fn unregister_hotkeys(&mut self) {
         debug!("unregister_hotkeys");
         self.hotkeys = None;
+        self.passthrough_hotkeys = None;
     }
 
     fn exec_cmd(&self, cmd_args: ExecCmd) {

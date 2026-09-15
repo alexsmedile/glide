@@ -1,8 +1,8 @@
 # Status — Glide Fork
 
-**Last updated:** 2026-08-26
+**Last updated:** 2026-09-15
 **Current objective:** Evolve the stable private fork into a hybrid tiling and snapping window manager for keyboard and mouse power users.
-**Overall state:** Fork release `fork-v0.2.15-r3` published · 273 library tests passing · Space 2 Workset prototype prioritized
+**Overall state:** `fork-v0.2.15-r5` release candidate · Worksets and native Space switching operational · 299 non-GUI library tests passing
 
 ---
 
@@ -15,6 +15,9 @@
 - `FORK.md` and `CHANGELOG.md`: fork behavior, release history, and versioning documented through `fork-v0.2.15-r3`.
 - `TODO.md`: make-a-change roadmap prioritizing Worksets, precision placement, a scriptable API, Recipes, and pinned windows.
 - `WORKSETS.md`: canonical Space, Workset, Layout, Window, Role, Slot, Recipe, pinning, and Stage Manager ontology.
+- Named Worksets: per-Space layouts, direct selection, cycling, rule-based routing, focus restoration, inactive-window suppression, and HUD feedback.
+- Native Space handoff: macOS exclusively owns Alt+digits; direct Workset shortcuts can request the native Desktop transition and activate after confirmation.
+- Runtime hardening: zero WindowServer ids no longer panic, and transient non-resizable `AXUnknown` surfaces no longer disturb tiled layouts.
 
 ## 2. Active Decisions & Constraints
 
@@ -29,14 +32,15 @@
 - Fixed halves/quadrants and tree split/group targets exist, but user-defined zones, per-orientation presets, target priority, and repeated-action cycles do not.
 - Reserved empty tiles—the ability to leave a placeholder slot for the next window—are specified in the roadmap but not implemented.
 - Tiled windows can be split or grouped by mouse, but there is no direct mouse swap/reinsert gesture for rearranging existing leaves.
-- Window rules currently classify floating behavior; they do not route windows into Spaces, Worksets, named containers, or saved Recipes.
+- Window rules classify floating behavior and route into Worksets, but do not yet route into native Spaces, named containers, or saved Recipes.
+- The combined Alt+digit switch-or-cycle interaction remains experimental; the stable setup uses separate native Space and Glide Workset shortcuts.
 - There is no user-facing undo history for accidental tree restructuring.
 - Focus and group navigation exist, but recent-focus navigation, marks, scratchpads, sticky windows, and a searchable window switcher do not.
 
 ## 4. Next Concrete Steps (Ordered)
 
-1. [ ] Prototype Space 2 with Agents and Terminal Worksets, `Alt+2` cycling, and direct `Alt+T` selection.
-2. [ ] Specify R4 configurable snap targets: activation region, destination frame, display orientation, modifier, priority, and repeated-action cycle.
+1. [ ] Runtime-check Chrome/Chromium transient surfaces and Workset switching over a normal work session.
+2. [ ] Specify configurable snap targets: activation region, destination frame, display orientation, modifier, priority, and repeated-action cycle.
 3. [ ] Design the versioned read-only query schema and selectors that Workset Recipes will depend on.
-4. [ ] Generalize the Workset prototype into portable single-display `save current` and `apply` Recipes.
+4. [ ] Generalize live Worksets into portable single-display `save current` and `apply` Recipes.
 5. [ ] Investigate pinned-window scopes and confirm which behaviors are possible without unsupported macOS APIs.

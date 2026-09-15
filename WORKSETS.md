@@ -170,7 +170,6 @@ Window is a room, and each Layout describes how those rooms occupy the floor.
 ## Activation semantics
 
 - Activating a different Space restores that Space's last active Workset.
-- Requesting the already-active Space may cycle its ordered Worksets.
 - Activating a Workset directly may first activate its containing Space.
 - Cycling Worksets never changes Space.
 - Each Workset remembers its own selected Window, focus, proportions, groups,
@@ -178,11 +177,16 @@ Window is a room, and each Layout describes how those rooms occupy the floor.
 - A Workset switch is one transaction: inactive windows are suppressed before
   active windows are surfaced and focused.
 
-For the first prototype:
+For the reliable shortcut configuration:
 
-- `Alt+2` activates Space 2 or cycles its Worksets when already active.
+- Native macOS `Alt+2` activates Space 2 and never cycles Worksets.
 - `Alt+T` activates the Terminal Workset in Space 2 directly.
-- `Alt+A` may activate the Agents Workset directly.
+- `Alt+A` activates the Agents Workset in Space 2 directly.
+- `Alt+Backquote` and `Alt+Shift+Backquote` cycle Worksets in the active Space.
+
+macOS and Glide must not both register the same Alt+digit. The experimental
+`space_or_workset` command can switch elsewhere or cycle when already on its
+target Space, but it is intentionally not part of the reliable configuration.
 
 ## Naming rules
 

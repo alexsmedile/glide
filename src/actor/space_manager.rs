@@ -14,7 +14,7 @@ use crate::actor::wm_controller::WmEvent;
 use crate::actor::{group_bars, mouse, reactor, status, window_server, wm_controller};
 use crate::collections::HashSet;
 use crate::config::Config;
-use crate::sys::screen::{CoordinateConverter, ScreenId, SpaceId};
+use crate::sys::screen::{CoordinateConverter, ScreenId, SpaceId, space_with_number};
 use crate::sys::window_server::WindowsOnScreen;
 
 #[derive(Debug)]
@@ -40,6 +40,15 @@ pub enum Event {
     SetGlobalEnabled(bool),
     LoginWindowActive(bool),
     ExposeActive(bool),
+    /// Observe a native Option+Digit shortcut without consuming it. If the
+    /// requested Space is already active, cycle that Space's Worksets.
+    SpaceOrWorkset(usize),
+    /// Activate a named Workset on a native Space, switching Spaces first if
+    /// necessary.
+    WorksetOnSpace {
+        desktop: usize,
+        name: String,
+    },
     ReactorCommand(reactor::Command),
     ConfigUpdated(Arc<Config>),
 }
@@ -70,6 +79,13 @@ pub struct SpaceManager {
     expose_active: bool,
     is_globally_enabled: bool,
     hotkeys_active: bool,
+    pending_workset: Option<PendingWorkset>,
+}
+
+#[derive(Debug)]
+struct PendingWorkset {
+    target: SpaceId,
+    name: String,
 }
 
 impl SpaceManager {
@@ -105,6 +121,7 @@ impl SpaceManager {
             expose_active: false,
             is_globally_enabled,
             hotkeys_active: false,
+            pending_workset: None,
         }
     }
 
@@ -135,6 +152,7 @@ impl SpaceManager {
                     scale_factors,
                     on_screen,
                 });
+                self.finish_pending_workset();
                 self.status_tx.send(status::Event::SpaceChanged(spaces));
                 self.send_space_enabled_status();
                 self.mouse_tx.send(mouse::Request::ScreenParametersChanged(frames, converter));
@@ -144,6 +162,7 @@ impl SpaceManager {
                 if !self.expose_active {
                     self.reactor_tx
                         .send(reactor::Event::SpaceChanged(self.active_spaces(), on_screen));
+                    self.finish_pending_workset();
                 }
                 self.status_tx.send(status::Event::SpaceChanged(spaces));
                 self.send_space_enabled_status();
@@ -187,6 +206,20 @@ impl SpaceManager {
                     // gets up-to-date visible windows.
                     self.request_space_refresh();
                 }
+            }
+            Event::SpaceOrWorkset(desktop) => {
+                let Some(target) = self.target_space(desktop) else {
+                    warn!(desktop, "Could not resolve native Space shortcut");
+                    return;
+                };
+                self.space_or_workset(desktop, target);
+            }
+            Event::WorksetOnSpace { desktop, name } => {
+                let Some(target) = self.target_space(desktop) else {
+                    warn!(desktop, workset = name, "Could not resolve Workset Space");
+                    return;
+                };
+                self.workset_on_space(desktop, target, name);
             }
             Event::ReactorCommand(cmd) => {
                 self.reactor_tx.send(reactor::Event::Command(cmd));
@@ -238,10 +271,23 @@ impl SpaceManager {
     }
 
     fn is_space_enabled(&self, space: SpaceId) -> bool {
+        // A desktop listed in the config is managed from launch, which is
+        // what survives a restart: toggles are keyed by space id, and macOS
+        // reassigns those across reboots.
+        if !self.disabled_spaces.contains(&space) && self.is_configured_desktop(space) {
+            return true;
+        }
         match space {
             sp if self.config.settings.default_disable => self.enabled_spaces.contains(&sp),
             sp => !self.disabled_spaces.contains(&sp),
         }
+    }
+
+    /// Whether this space is one of the desktops the config manages from
+    /// launch.
+    fn is_configured_desktop(&self, space: SpaceId) -> bool {
+        let wanted = &self.config.settings.managed_desktops;
+        !wanted.is_empty() && wanted.iter().any(|&n| space_with_number(n, space) == Some(space))
     }
 
     fn toggle_space(&mut self, space: SpaceId) {
@@ -269,10 +315,8 @@ impl SpaceManager {
             let enabled = match space {
                 _ if self.login_window_active => false,
                 Some(_) if self.one_space && *space != self.starting_space => false,
-                Some(sp) if self.disabled_spaces.contains(sp) => false,
-                Some(sp) if self.enabled_spaces.contains(sp) => true,
-                _ if self.config.settings.default_disable => false,
-                _ => true,
+                Some(sp) => self.is_space_enabled(*sp),
+                None => false,
             };
             if !enabled {
                 *space = None;
@@ -285,6 +329,58 @@ impl SpaceManager {
         self.focused_screen
             .and_then(|s| self.space_for_screen(s))
             .or_else(|| self.first_space())
+    }
+
+    fn target_space(&self, desktop: usize) -> Option<SpaceId> {
+        let current = self.focused_space()?;
+        space_with_number(desktop, current)
+    }
+
+    fn space_or_workset(&self, desktop: usize, target: SpaceId) {
+        if self.focused_space() == Some(target) {
+            self.reactor_tx.send(reactor::Event::WorksetCommand {
+                space: target,
+                command: crate::actor::layout::LayoutCommand::NextWorkset,
+            });
+        } else {
+            _ = self.wm_tx.send((
+                tracing::Span::current(),
+                WmEvent::PostNativeSpaceShortcut(desktop),
+            ));
+        }
+    }
+
+    fn workset_on_space(&mut self, desktop: usize, target: SpaceId, name: String) {
+        if self.focused_space() == Some(target) {
+            self.activate_workset(target, name);
+        } else {
+            self.pending_workset = Some(PendingWorkset { target, name });
+            _ = self.wm_tx.send((
+                tracing::Span::current(),
+                WmEvent::PostNativeSpaceShortcut(desktop),
+            ));
+        }
+    }
+
+    fn activate_workset(&self, space: SpaceId, name: String) {
+        self.reactor_tx.send(reactor::Event::WorksetCommand {
+            space,
+            command: crate::actor::layout::LayoutCommand::Workset(name),
+        });
+    }
+
+    /// Completes a direct Workset request only after WindowServer has
+    /// confirmed that its native Space is visible. The SpaceChanged event is
+    /// queued first so Reactor targets the destination Space.
+    fn finish_pending_workset(&mut self) {
+        let Some(pending) = self.pending_workset.take() else {
+            return;
+        };
+        if self.cur_space.contains(&Some(pending.target)) {
+            self.activate_workset(pending.target, pending.name);
+        } else {
+            self.pending_workset = Some(pending);
+        }
     }
 
     fn send_space_enabled_status(&self) {
@@ -675,6 +771,90 @@ mod tests {
             wm_events.iter().any(|e| matches!(e, WmEvent::HotkeysActive(true))),
             "Expected HotkeysActive(true), got {wm_events:?}"
         );
+    }
+
+    #[test]
+    fn requesting_the_active_space_cycles_its_worksets() {
+        let mut h = TestHarness::new();
+        let active = space(10);
+        h.setup_space(screen(1), active);
+
+        h.sm.space_or_workset(2, active);
+
+        let events = drain(&mut h.reactor_rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            reactor::Event::WorksetCommand {
+                space,
+                command: crate::actor::layout::LayoutCommand::NextWorkset
+            } if *space == active
+        )));
+    }
+
+    #[test]
+    fn requesting_another_space_replays_the_native_shortcut() {
+        let mut h = TestHarness::new();
+        h.setup_space(screen(1), space(10));
+
+        h.sm.space_or_workset(2, space(20));
+
+        assert!(drain(&mut h.reactor_rx).is_empty());
+        assert!(
+            drain_wm(&mut h.wm_rx)
+                .iter()
+                .any(|event| matches!(event, WmEvent::PostNativeSpaceShortcut(2)))
+        );
+    }
+
+    #[test]
+    fn direct_workset_waits_for_the_native_space_change() {
+        let mut config = Config::default();
+        config.settings.default_disable = false;
+        let mut h = TestHarness::new_with(false, config);
+        let current = space(10);
+        let target = space(20);
+        h.setup_space(screen(1), current);
+
+        h.sm.workset_on_space(2, target, "agents".to_owned());
+
+        assert!(drain(&mut h.reactor_rx).is_empty());
+        assert!(
+            drain_wm(&mut h.wm_rx)
+                .iter()
+                .any(|event| matches!(event, WmEvent::PostNativeSpaceShortcut(2)))
+        );
+
+        h.send_space_changed(vec![Some(target)]);
+        let events = drain(&mut h.reactor_rx);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                reactor::Event::SpaceChanged(_, _),
+                reactor::Event::WorksetCommand {
+                    space,
+                    command: crate::actor::layout::LayoutCommand::Workset(name)
+                }
+            ] if name == "agents"
+                && *space == target
+        ));
+    }
+
+    #[test]
+    fn direct_workset_on_the_active_space_does_not_replay_a_shortcut() {
+        let mut h = TestHarness::new();
+        let active = space(10);
+        h.setup_space(screen(1), active);
+
+        h.sm.workset_on_space(2, active, "terminal".to_owned());
+
+        assert!(drain_wm(&mut h.wm_rx).is_empty());
+        assert!(drain(&mut h.reactor_rx).iter().any(|event| matches!(
+            event,
+            reactor::Event::WorksetCommand {
+                space,
+                command: crate::actor::layout::LayoutCommand::Workset(name)
+            } if name == "terminal" && *space == active
+        )));
     }
 
     #[test]

@@ -21,10 +21,14 @@ use tracing::{debug, warn};
 #[repr(transparent)]
 pub struct SpaceId(NonZeroU64);
 
-#[cfg(test)]
 impl SpaceId {
+    #[cfg(test)]
     pub fn new(id: u64) -> SpaceId {
         SpaceId(NonZeroU64::new(id).unwrap())
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0.get()
     }
 }
 
@@ -247,8 +251,8 @@ pub struct ScreenInfo {
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
 pub struct ScreenId(CGDirectDisplayID);
 
-#[cfg(test)]
 impl ScreenId {
+    #[cfg(test)]
     pub fn new(id: u32) -> ScreenId {
         ScreenId(id)
     }
@@ -275,6 +279,53 @@ impl NSScreenExt for NSScreen {
             }
         }
     }
+}
+
+/// Returns the spaces of the display that currently shows `on_display`,
+/// in the order macOS presents them.
+///
+/// Each display owns an independent set of spaces, so "Desktop 2" means the
+/// second space *of one display*, matching what Mission Control shows. A
+/// space number is only meaningful together with a display.
+fn spaces_of_display(on_display: SpaceId) -> Option<Vec<SpaceId>> {
+    let cid = unsafe { CGSMainConnectionID() };
+    let space_info = unsafe { Retained::from_raw(CGSCopyManagedDisplaySpaces(cid))? };
+    for screen in space_info {
+        let Ok(screen) = screen.downcast::<NSDictionary>() else {
+            continue;
+        };
+        let Some(spaces) = screen
+            .valueForKey(ns_string!("Spaces"))
+            .and_then(|s| s.downcast::<NSArray>().ok())
+        else {
+            continue;
+        };
+        let ids: Vec<SpaceId> = spaces
+            .iter()
+            .filter_map(|space| {
+                let space = space.downcast::<NSDictionary>().ok()?;
+                let id: Retained<NSNumber> =
+                    space.valueForKey(ns_string!("ManagedSpaceID"))?.downcast().ok()?;
+                NonZeroU64::new(id.as_u64()).map(SpaceId)
+            })
+            .collect();
+        if ids.contains(&on_display) {
+            return Some(ids);
+        }
+    }
+    None
+}
+
+/// Returns the space at a user-facing position on the display that currently
+/// shows `on_display`.
+///
+/// Space ids are assigned by the window server and change across reboots, so
+/// config refers to spaces by this position instead. Numbering is per display:
+/// with one desktop, only `1` resolves, and attaching a second display does
+/// not renumber the first display's spaces.
+pub fn space_with_number(number: usize, on_display: SpaceId) -> Option<SpaceId> {
+    let spaces = spaces_of_display(on_display)?;
+    spaces.get(number.checked_sub(1)?).copied()
 }
 
 /// Returns the user-facing number of the currently active space.

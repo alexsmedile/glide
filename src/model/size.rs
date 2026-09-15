@@ -453,7 +453,13 @@ impl<'a, 'out> Visitor<'a, 'out> {
         if self.window_count == 1 {
             return self.outer_gap();
         }
-        if self.config.settings.fullscreen_uses_outer_gap {
+        let gap = self.config.settings.fullscreen_gap;
+        if gap > 0.0 {
+            // A gap wider than half the screen would invert the rect, so cap
+            // it at something that still leaves a window to look at.
+            let limit = f64::min(self.screen.size.width, self.screen.size.height) / 4.0;
+            gap.clamp(0.0, limit)
+        } else if self.config.settings.fullscreen_uses_outer_gap {
             self.config.settings.outer_gap
         } else {
             0.0

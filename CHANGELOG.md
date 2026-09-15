@@ -1,5 +1,22 @@
 # Changelog
 
+## Fork v0.2.15 r5 (2026-09-15)
+
+### Features
+
+* Add named Worksets inside each native macOS Space, with direct selection, cycling, window routing, independent layouts and focus, inactive-window suppression, and a short-lived HUD.
+* Add Workset shortcuts that can ask macOS to perform its native Desktop transition before selecting the destination Workset.
+
+### Bug Fixes
+
+* Preserve complete Workset groups when focus changes instead of surfacing a single window from another Workset.
+* Ignore transient non-resizable `AXUnknown` surfaces, preventing Chrome, Chromium, and Electron menus and popovers from entering tiled layouts.
+* Ignore transient windows with a zero WindowServer id instead of crashing during registration.
+
+### Documentation
+
+* Document the reliable shortcut split: macOS owns Alt+digits for Spaces, while Glide owns Alt+letters and Alt+Backquote for Worksets.
+
 ## Fork v0.2.15 r4 (2026-08-29)
 
 ### Bug Fixes

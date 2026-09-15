@@ -11,7 +11,7 @@ use tracing::instrument;
 use crate::actor::wm_controller;
 use crate::config::Config;
 use crate::sys::screen::{SpaceId, get_active_space_number};
-use crate::ui::status_bar::StatusIcon;
+use crate::ui::status_bar::{StatusIcon, WorksetMenuEntry};
 use crate::{actor, trace_call};
 
 #[derive(Debug)]
@@ -23,6 +23,8 @@ pub enum Event {
     GlobalEnabledChanged(bool),
     SpaceEnabledChanged(bool),
     ConfigUpdated(Arc<Config>),
+    /// The Worksets of the active Space, and which one is active.
+    WorksetsChanged(Vec<WorksetMenuEntry>),
 }
 
 pub struct Status {
@@ -83,6 +85,11 @@ impl Status {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::SpaceChanged(_) | Event::FocusedScreenChanged => self.update_space(),
+            Event::WorksetsChanged(worksets) => {
+                if let Some(icon) = &mut self.icon {
+                    icon.set_worksets(&worksets);
+                }
+            }
             Event::GlobalEnabledChanged(enabled) => self.update_toggle_title(enabled),
             Event::SpaceEnabledChanged(enabled) => self.update_space_toggle_title(enabled),
             Event::ConfigUpdated(config) => {

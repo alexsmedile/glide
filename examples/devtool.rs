@@ -208,7 +208,17 @@ async fn main() -> anyhow::Result<()> {
             .await;
         }
         Command::List(List::Spaces) => {
-            println!("Current space: {:?}", screen::diagnostic::cur_space());
+            let current = screen::diagnostic::cur_space();
+            println!("Current space: {current:?}");
+            println!(
+                "Number on current display: {:?}",
+                (1..=9)
+                    .filter_map(|number| {
+                        screen::space_with_number(number, current).map(|space| (number, space))
+                    })
+                    .collect::<Vec<_>>()
+            );
+            println!("Global active number: {:?}", screen::get_active_space_number());
             println!("Visible spaces: {:?}", screen::diagnostic::visible_spaces());
             println!("All spaces: {:?}", screen::diagnostic::all_spaces());
             println!(

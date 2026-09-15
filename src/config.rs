@@ -91,6 +91,13 @@ enum Disabled {
 pub struct Settings {
     pub animate: bool,
     pub default_disable: bool,
+    /// Desktops to manage from launch, by their number in Mission Control.
+    ///
+    /// Space ids are reassigned across reboots, so a restored session names
+    /// desktops by position instead. Empty means "decide per space at
+    /// runtime", which is `default_disable`'s behaviour.
+    #[serde(default)]
+    pub managed_desktops: Vec<usize>,
     pub mouse_follows_focus: bool,
     pub mouse_hides_on_focus: bool,
     pub focus_follows_mouse: bool,
@@ -101,6 +108,12 @@ pub struct Settings {
     pub outer_gap: f64,
     pub inner_gap: f64,
     pub fullscreen_uses_outer_gap: bool,
+    /// Inset of a fullscreen window from the screen edge, in points.
+    ///
+    /// Larger than `outer_gap` leaves the tiled windows visible around the
+    /// edges, so fullscreen reads as "maximized on top" rather than as a
+    /// separate screen. Zero falls back to `outer_gap`.
+    pub fullscreen_gap: f64,
     pub single_window_uses_outer_gap: bool,
     pub default_keys: bool,
     pub default_layout_kind: LayoutKind,
@@ -167,6 +180,31 @@ pub struct WindowRule {
     pub conditions: WindowRuleConditions,
     /// Whether matching windows should float (`true`) or tile (`false`).
     pub float: bool,
+    /// The Workset matching windows belong to. When set, a new window is
+    /// placed in that Workset of its Space instead of whichever Workset
+    /// happens to be active, creating it if necessary.
+    #[serde(default)]
+    pub workset: Option<String>,
+    /// How to suppress matching windows when their Workset is inactive.
+    ///
+    /// Defaults to ordering the window below the active Workset, which is the
+    /// cheapest option because the window is never moved or resized. Apps that
+    /// raise themselves can defeat ordering; those need `suppress = "offscreen"`.
+    #[serde(default)]
+    pub suppress: SuppressMode,
+}
+
+/// How an inactive Workset's windows are kept out of the way.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SuppressMode {
+    /// Order the window below the active Workset, leaving its frame alone.
+    #[default]
+    Order,
+    /// Move the window outside the visible screen area. Survives apps that
+    /// raise themselves, at the cost of a frame write per window.
+    ///
+    Offscreen,
 }
 
 /// Conditions matched against a window and its application. All specified
@@ -512,6 +550,8 @@ mod tests {
                         ..Default::default()
                     },
                     float: true,
+                    workset: None,
+                    suppress: SuppressMode::Order,
                 },
                 WindowRule {
                     conditions: WindowRuleConditions {
@@ -520,6 +560,8 @@ mod tests {
                         ..Default::default()
                     },
                     float: true,
+                    workset: None,
+                    suppress: SuppressMode::Order,
                 },
             ]
         );
@@ -544,6 +586,8 @@ mod tests {
                     ..Default::default()
                 },
                 float: true,
+                workset: None,
+                suppress: SuppressMode::Order,
             }]
         );
     }
@@ -801,5 +845,33 @@ mod tests {
                 .iter()
                 .any(|(hk, _)| hk.to_string() == "Alt + Meta + Shift + ArrowDown")
         );
+    }
+
+    #[test]
+    fn native_space_and_workset_commands_parse() {
+        let config = Config::parse(
+            r#"
+            [settings]
+            default_keys = false
+
+            [keys]
+            "Alt + Digit2" = { space_or_workset = 2 }
+            "Alt + A" = { workset_on_space = { desktop = 2, name = "agents" } }
+            "Alt + T" = { workset_on_space = { desktop = 2, name = "terminal" } }
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.keys.iter().any(|(_, command)| matches!(
+            command,
+            WmCommand::Wm(crate::actor::wm_controller::WmCmd::SpaceOrWorkset(2))
+        )));
+        assert!(config.keys.iter().any(|(_, command)| matches!(
+            command,
+            WmCommand::Wm(crate::actor::wm_controller::WmCmd::WorksetOnSpace {
+                desktop: 2,
+                name
+            }) if name == "terminal"
+        )));
     }
 }

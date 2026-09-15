@@ -7,9 +7,9 @@ The config that drives it lives in its own repo at
 `~/code/utils/glide-config`, and requires this fork — upstream rejects it with
 a parse error.
 
-`cargo test --lib` on `main` is 274 tests. Each feature's tests were checked to
-fail with the implementation removed, so they test the behaviour rather than
-passing either way.
+The library contains 303 tests. The 299 model and actor tests pass in the
+automation environment; four macOS GUI/IPC integration tests require a live
+LaunchServices and message-port context.
 
 ## Fork releases
 
@@ -24,6 +24,7 @@ workflow.
 
 | Release | Upstream base | Contents |
 |---|---|---|
+| `fork-v0.2.15-r5` | `v0.2.15` | Named per-Space Worksets, native Space handoff, Workset HUD and routing, reliable group activation, and transient-window crash/flicker fixes. |
 | `fork-v0.2.15-r4` | `v0.2.15` | Fullscreen gap handling for single-window layouts. |
 | `fork-v0.2.15-r3` | `v0.2.15` | Configurable gapless fullscreen and automatic gapless maximization for single-window layouts. |
 | `fork-v0.2.15-r2` | `v0.2.15` | Mouse drop overlays and layout placement, keyboard half-screen snapping, floating/unmanaged size presets, group navigation, and Alt-scroll group cycling. |
@@ -105,6 +106,26 @@ leaving focus on another display. Space changes expose only the displays whose
 managed Space actually changed, preventing an unchanged display from winning
 the focus/raise race. Click-to-switch behaviour is preserved when macOS has
 already focused a window in the destination Space.
+
+### Worksets and native Spaces
+
+A native macOS Space can contain multiple named Worksets, each with its own
+layout, selection, and remembered focus. Window rules can route applications
+into a Workset, while `workset`, `next_workset`, `prev_workset`, and
+`move_to_next_workset` select or reorganize them. Inactive Worksets remain in
+the same Space and are kept below or parked off-screen according to their
+suppression rule.
+
+For the reliable configuration, macOS owns Alt+digits exclusively and performs
+the native animated Space transition. Glide owns Alt+letters for direct
+Workset selection and Alt+Backquote / Alt+Shift+Backquote for cycling Worksets
+inside the current Space. A direct Workset shortcut can replay the native
+Desktop shortcut when its Workset belongs to another Space, then waits for the
+destination before activating it.
+
+Do not bind the same Alt+digit in both macOS and Glide. The combined
+`space_or_workset` command remains available for experimentation, but sharing a
+key between the event tap and Mission Control is not the recommended setup.
 
 ### `toggle_orientation` — `feat/toggle-orientation`
 

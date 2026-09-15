@@ -9,6 +9,7 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly};
@@ -18,6 +19,7 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::CGRect;
 use objc2_foundation::NSZeroRect;
+use tokio::select;
 use tracing::debug;
 
 use crate::actor;
@@ -25,7 +27,12 @@ use crate::collections::HashMap;
 use crate::config::Config;
 use crate::model::{ContainerKind, GroupBarInfo, NodeId};
 use crate::sys::screen::{CoordinateConverter, SpaceId};
+use crate::sys::timer::Timer;
 use crate::ui::group_bar::{GroupDisplayData, GroupIndicatorNSView, GroupKind};
+use crate::ui::workset_hud::WorksetHud;
+
+/// How long the Workset overlay stays on screen.
+const HUD_VISIBLE_FOR: Duration = Duration::from_millis(900);
 
 #[derive(Debug)]
 pub enum Event {
@@ -45,6 +52,8 @@ pub enum Event {
     SpaceDisabled(SpaceId),
     GlobalDisabled,
     ConfigChanged(Arc<Config>),
+    /// A Workset was activated and should be named on screen.
+    WorksetActivated(String),
 }
 
 pub struct GroupBars {
@@ -54,6 +63,10 @@ pub struct GroupBars {
     indicators: HashMap<SpaceId, HashMap<NodeId, Indicator>>,
     coordinate_converter: CoordinateConverter,
     active_spaces: Vec<Option<SpaceId>>,
+    workset_hud: WorksetHud,
+    /// When the overlay should come down. A later switch pushes this out,
+    /// so the overlay stays up as long as switching continues.
+    hud_deadline: Option<Instant>,
 }
 
 struct Indicator {
@@ -80,11 +93,39 @@ impl GroupBars {
             indicators: HashMap::default(),
             coordinate_converter: CoordinateConverter::default(),
             active_spaces: Vec::new(),
+            workset_hud: WorksetHud::new(mtm),
+            hud_deadline: None,
         }
     }
 
     pub async fn run(mut self) {
-        while let Some((span, event)) = self.rx.recv().await {
+        loop {
+            // While the overlay is up, wake when it is due to come down even
+            // if no further events arrive.
+            let next = match self.hud_deadline {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if deadline <= now {
+                        self.hud_deadline = None;
+                        self.workset_hud.hide();
+                        continue;
+                    }
+                    Some(deadline - now)
+                }
+                None => None,
+            };
+            let event = match next {
+                Some(wait) => select! {
+                    event = self.rx.recv() => event,
+                    () = Timer::sleep(wait) => {
+                        self.hud_deadline = None;
+                        self.workset_hud.hide();
+                        continue;
+                    }
+                },
+                None => self.rx.recv().await,
+            };
+            let Some((span, event)) = event else { return };
             let _guard = span.enter();
             self.handle_event(event);
         }
@@ -93,6 +134,9 @@ impl GroupBars {
     fn handle_event(&mut self, event: Event) {
         debug!(?event);
         match event {
+            Event::WorksetActivated(name) => {
+                self.show_workset_hud(name);
+            }
             Event::GroupsUpdated { space_id, groups } => {
                 self.handle_groups_updated(space_id, groups);
             }
@@ -126,6 +170,12 @@ impl GroupBars {
                 self.indicators.clear();
             }
         }
+    }
+
+    /// Shows the Workset overlay, to be dismissed once its deadline passes.
+    fn show_workset_hud(&mut self, name: String) {
+        self.workset_hud.show(&name, self.mtm);
+        self.hud_deadline = Some(Instant::now() + HUD_VISIBLE_FOR);
     }
 
     fn handle_groups_updated(&mut self, space_id: SpaceId, groups: Vec<GroupBarInfo>) {

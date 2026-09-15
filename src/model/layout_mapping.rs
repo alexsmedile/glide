@@ -21,7 +21,15 @@ pub struct SpaceLayoutMapping {
     /// The refcount includes the active space and is used for garbage
     /// collection.
     layouts: IndexMap<LayoutId, i16>,
+    /// Names for the layouts that act as Worksets, so a binding can select one
+    /// by name instead of by position. Layouts without a name are screen-size
+    /// variants rather than Worksets.
+    #[serde(default)]
+    workset_names: HashMap<LayoutId, String>,
 }
+
+/// The name of the Workset a Space starts with.
+pub const DEFAULT_WORKSET: &str = "main";
 
 /// How the active state should be saved.
 #[derive(Serialize, Deserialize, Debug)]
@@ -47,6 +55,10 @@ impl SpaceLayoutMapping {
             active_layout: layout,
             memory: Default::default(),
             layouts: indexmap! {layout => 1},
+            // The layout a Space starts with is the Workset windows land in
+            // when nothing routes them elsewhere, so it is named rather than
+            // anonymous and can be targeted by a binding or a window rule.
+            workset_names: [(layout, DEFAULT_WORKSET.to_owned())].into_iter().collect(),
         }
     }
 
@@ -78,9 +90,16 @@ impl SpaceLayoutMapping {
         }
         debug!("Using layout {:?}", self.active_layout);
 
-        // Garbage collect.
+        // Garbage collect. Worksets the user named are kept even at refcount
+        // zero: they are user-facing state a binding or window rule can name
+        // again later. The default name every Space starts with is not a
+        // reason to keep a screen-size variant nothing refers to.
+        let named = &self.workset_names;
         self.layouts.retain(|&layout, &mut refcount| {
-            if refcount > 0 {
+            let user_named = named
+                .get(&layout)
+                .is_some_and(|name| !name.eq_ignore_ascii_case(DEFAULT_WORKSET));
+            if refcount > 0 || user_named {
                 true
             } else {
                 debug!("Garbage collecting {layout:?}");
@@ -99,6 +118,43 @@ impl SpaceLayoutMapping {
         self.decrement_ref(self.active_layout);
         self.active_layout = layout;
         self.retain_layout();
+    }
+
+    /// Registers an additional layout in this space without activating it.
+    ///
+    /// The layout starts with a refcount of zero; activating it with
+    /// [`Self::select_layout`] takes the first reference.
+    pub fn add_layout(&mut self, layout: LayoutId) {
+        self.layouts.insert(layout, 0);
+    }
+
+    #[cfg(test)]
+    pub fn add_layout_for_test(&mut self, layout: LayoutId) {
+        self.layouts.insert(layout, 1);
+    }
+
+    /// Names this layout as a Workset, replacing any previous name.
+    ///
+    /// Names are unique within a Space: any other layout holding this name
+    /// loses it, so `workset_by_name` always resolves to one layout.
+    pub fn set_workset_name(&mut self, layout: LayoutId, name: String) {
+        self.workset_names
+            .retain(|&other, existing| other == layout || !existing.eq_ignore_ascii_case(&name));
+        self.workset_names.insert(layout, name);
+    }
+
+    pub fn workset_name(&self, layout: LayoutId) -> Option<&str> {
+        self.workset_names.get(&layout).map(String::as_str)
+    }
+
+    /// The layout named `name`, if this space has one.
+    pub fn workset_by_name(&self, name: &str) -> Option<LayoutId> {
+        self.workset_names
+            .iter()
+            .find(|(layout, candidate)| {
+                candidate.eq_ignore_ascii_case(name) && self.layouts.contains_key(*layout)
+            })
+            .map(|(&layout, _)| layout)
     }
 
     pub fn layouts(&self) -> impl ExactSizeIterator<Item = LayoutId> {

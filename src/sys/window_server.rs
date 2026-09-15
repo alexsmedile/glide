@@ -553,11 +553,44 @@ pub fn allow_hide_mouse() -> Result<(), CGError> {
     check(unsafe { CGSSetConnectionProperty(cid, cid, &property, CFBoolean::new(true)) })
 }
 
+/// Orders a window relative to another window, or to the whole level when
+/// `relative_to` is `None`.
+///
+/// This is how an inactive Workset is suppressed: its windows are ordered out
+/// of the way without moving or resizing them, so the owning app never sees a
+/// geometry change and never redraws.
+pub fn order_window(
+    window: WindowServerId,
+    mode: OrderMode,
+    relative_to: Option<WindowServerId>,
+) -> Result<(), CGError> {
+    let cid = unsafe { SLSMainConnectionID() };
+    check(unsafe {
+        SLSOrderWindow(
+            cid,
+            window.as_u32(),
+            mode as i32,
+            relative_to.map_or(0, |w| w.as_u32()),
+        )
+    })
+}
+
+/// Where to place a window relative to the reference window in
+/// [`order_window`].
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum OrderMode {
+    Below = -1,
+    Out = 0,
+    Above = 1,
+}
+
 type CGSConnectionID = c_int;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn CGSMainConnectionID() -> CGSConnectionID;
+    fn SLSMainConnectionID() -> CGSConnectionID;
+    fn SLSOrderWindow(cid: CGSConnectionID, window: u32, mode: c_int, relative_to: u32) -> CGError;
     fn CGSSetConnectionProperty(
         cid: CGSConnectionID,
         target_cid: CGSConnectionID,

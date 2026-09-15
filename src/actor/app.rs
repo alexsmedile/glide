@@ -1149,6 +1149,10 @@ impl State {
                 }
             })
             .ok();
+        if is_zero_window_server_id(wsid) {
+            debug!(?elem, "Ignoring transient window with zero WindowServer id");
+            return None;
+        }
         if !register_notifs(&elem, self, wsid) {
             return None;
         }
@@ -1214,10 +1218,14 @@ impl State {
 
     fn id(&self, elem: &AXUIElement) -> Result<WindowId, accessibility::Error> {
         if let Ok(id) = WindowServerId::try_from(elem) {
-            let wid = WindowId {
-                pid: self.pid,
-                idx: NonZeroU32::new(id.as_u32()).expect("Window server id was 0"),
+            let Some(idx) = NonZeroU32::new(id.as_u32()) else {
+                // Accessibility can briefly deliver a stale or non-window
+                // element with a zero WindowServer id while windows are being
+                // created, destroyed, or reordered. Treat it as unknown; an
+                // asynchronous notification must never abort the whole WM.
+                return Err(accessibility::Error::NotFound);
             };
+            let wid = WindowId { pid: self.pid, idx };
             if self.windows.contains_key(&wid) {
                 return Ok(wid);
             }
@@ -1397,4 +1405,20 @@ fn optional<T>(val: Result<T, accessibility::Error>) -> Result<Option<T>, access
         return Ok(None);
     }
     val.map(Some)
+}
+
+fn is_zero_window_server_id(wsid: Option<WindowServerId>) -> bool {
+    wsid.is_some_and(|id| id.as_u32() == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_window_server_ids_are_transient() {
+        assert!(is_zero_window_server_id(Some(WindowServerId::new(0))));
+        assert!(!is_zero_window_server_id(Some(WindowServerId::new(1))));
+        assert!(!is_zero_window_server_id(None));
+    }
 }

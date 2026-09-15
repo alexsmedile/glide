@@ -36,6 +36,7 @@ use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, Wind
 use crate::actor::layout::{self, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo};
 use crate::actor::raise::{self, RaiseManager, RaiseRequest};
 use crate::actor::space_manager::SpaceManager;
+use crate::actor::wm_controller::WmCommand;
 use crate::actor::{drop_preview, group_bars, space_manager, status, window_server, wm_controller};
 use crate::collections::{HashMap, HashSet};
 use crate::config::Config;
@@ -46,6 +47,7 @@ use crate::sys::geometry::{CGRectDef, CGRectExt, SameAs, round_to_physical};
 use crate::sys::screen::{CoordinateConverter, SpaceId};
 use crate::sys::timer::Timer;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
+use crate::ui::status_bar::WorksetMenuEntry;
 
 pub type Sender = crate::actor::Sender<Event>;
 pub type Receiver = crate::actor::Receiver<Event>;
@@ -204,6 +206,11 @@ pub enum Event {
         target: Option<WindowServerId>,
     },
 
+    /// A Workset command whose native Space was resolved by SpaceManager.
+    WorksetCommand {
+        space: SpaceId,
+        command: LayoutCommand,
+    },
     Command(Command),
     ConfigChanged(Arc<Config>),
 }
@@ -243,6 +250,8 @@ pub struct Reactor {
     window_server_info: HashMap<WindowServerId, WindowServerInfo>,
     window_ids: HashMap<WindowServerId, WindowId>,
     visible_windows: HashSet<WindowServerId>,
+    /// Windows suppressed on the current layout pass because their Workset is
+    /// inactive. Rebuilt each pass.
     screens: Vec<Screen>,
     active_screen_idx: Option<u16>,
     main_window_tracker: MainWindowTracker,
@@ -953,6 +962,18 @@ impl Reactor {
                     }
                 }
             }
+            Event::WorksetCommand { space, command } => {
+                let visible_spaces =
+                    self.screens.iter().flat_map(|screen| screen.space).collect::<Vec<_>>();
+                let response = self.layout.handle_command(Some(space), &visible_spaces, command);
+                self.handle_layout_response(response);
+                self.update_layout(&[], false);
+                if let Some(name) = self.layout.active_workset_name(space) {
+                    self.group_indicators_tx
+                        .send(group_bars::Event::WorksetActivated(name.to_owned()));
+                }
+                self.publish_worksets(space);
+            }
             Event::Command(Command::Layout(cmd)) => {
                 info!(?cmd);
                 match cmd {
@@ -1019,9 +1040,35 @@ impl Reactor {
                         let command_space = self
                             .main_window_space()
                             .or_else(|| self.active_screen().and_then(|screen| screen.space));
+                        // Switching Worksets changes which layout is active
+                        // without changing the active layout's contents, so
+                        // nothing else would recompute frames for the windows
+                        // coming into view.
+                        let relayout = matches!(
+                            cmd,
+                            LayoutCommand::NextLayout
+                                | LayoutCommand::PrevLayout
+                                | LayoutCommand::NewWorkset
+                                | LayoutCommand::Workset(_)
+                                | LayoutCommand::MoveToNextWorkset
+                                | LayoutCommand::NextWorkset
+                                | LayoutCommand::PrevWorkset
+                        );
                         let response =
                             self.layout.handle_command(command_space, &visible_spaces, cmd);
                         self.handle_layout_response(response);
+                        if relayout {
+                            self.update_layout(&[], false);
+                            // Worksets share a Space, so nothing on screen
+                            // says which one is now active. Name it.
+                            if let Some(space) = command_space {
+                                if let Some(name) = self.layout.active_workset_name(space) {
+                                    self.group_indicators_tx
+                                        .send(group_bars::Event::WorksetActivated(name.to_owned()));
+                                }
+                                self.publish_worksets(space);
+                            }
+                        }
                     }
                 }
             }
@@ -1407,6 +1454,46 @@ impl Reactor {
         self.best_space_for_window(&self.windows.get(&self.main_window()?)?.frame_monotonic)
     }
 
+    /// Tells the status menu which Worksets this Space has, which one is
+    /// active, and the key that selects each.
+    fn publish_worksets(&self, space: SpaceId) {
+        let Some(status_tx) = &self.status_tx else { return };
+        let active = self.layout.active_workset_name(space);
+        let entries = self
+            .layout
+            .workset_names(space)
+            .map(|name| WorksetMenuEntry {
+                key_equivalent: self.workset_shortcut(name),
+                is_active: Some(name) == active,
+                name: name.to_owned(),
+            })
+            .collect();
+        status_tx.send(status::Event::WorksetsChanged(entries));
+    }
+
+    /// The key bound to selecting `workset`, if the user bound one.
+    fn workset_shortcut(&self, workset: &str) -> Option<String> {
+        self.config.keys.iter().find_map(|(hotkey, command)| match command {
+            WmCommand::ReactorCommand(Command::Layout(LayoutCommand::Workset(name)))
+                if name.eq_ignore_ascii_case(workset) =>
+            {
+                // KeyCode's Debug spells a letter key as "KeyD"; the menu
+                // wants the bare character.
+                let name = format!("{:?}", hotkey.key_code);
+                let key = name.strip_prefix("Key").unwrap_or(&name).to_lowercase();
+                Some(key)
+            }
+            WmCommand::Wm(wm_controller::WmCmd::WorksetOnSpace { name, .. })
+                if name.eq_ignore_ascii_case(workset) =>
+            {
+                let name = format!("{:?}", hotkey.key_code);
+                let key = name.strip_prefix("Key").unwrap_or(&name).to_lowercase();
+                Some(key)
+            }
+            _ => None,
+        })
+    }
+
     #[instrument(skip(self), fields())]
     pub fn update_layout(&mut self, new_wids: &[WindowId], skip_anim: bool) {
         let main_window = self.main_window();
@@ -1415,6 +1502,10 @@ impl Reactor {
         let mut targets = BTreeMap::new();
         for &screen in &self.screens {
             let Some(space) = screen.space else { continue };
+            // Worksets are created as windows are routed into them, not only
+            // by an explicit switch, so the menu is refreshed here rather
+            // than at the command that happened to cause it.
+            self.publish_worksets(space);
             if !skip_anim {
                 self.layout.update_viewport_for_focus(space, screen.frame, &self.config);
             }
@@ -1884,6 +1975,51 @@ pub mod tests {
             animation_rx.try_recv(),
             Ok(animation::Message::Replace(_))
         ));
+    }
+
+    #[test]
+    fn moving_a_window_to_another_workset_repositions_it() {
+        use LayoutCommand::{MoveToNextWorkset, NewWorkset};
+
+        // Regression: the move changed the model but produced no frame
+        // writes, so the window stayed where it was and appeared to vanish.
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let wid = WindowId::new(1, 1);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(1, make_windows(2), Some(wid), true));
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.send_layout_event(LayoutEvent::WindowFocused(vec![space], wid));
+
+        // Create an empty Workset and come back to the original one.
+        reactor.handle_event(Event::Command(Command::Layout(NewWorkset)));
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_event(Event::Command(Command::Layout(LayoutCommand::NextLayout)));
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.send_layout_event(LayoutEvent::WindowFocused(vec![space], wid));
+
+        // In the original Workset the window shares the screen with its
+        // sibling, so it occupies half of it.
+        assert_eq!(reactor.windows[&wid].frame_monotonic.size.width, 500.);
+
+        // After moving it to the Workset that held nothing, it is the only
+        // window there and must be resized to fill the screen.
+        reactor.handle_event(Event::Command(Command::Layout(MoveToNextWorkset)));
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!(
+            reactor.windows[&wid].frame_monotonic, screen,
+            "window was not laid out in the Workset it moved to"
+        );
     }
 
     #[test]

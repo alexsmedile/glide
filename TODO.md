@@ -14,14 +14,6 @@ checkpoint before it earns a `feat/*` branch.
 
 ## Now
 
-- [ ] [prototype] Test Space 2 with Agents and Terminal Worksets <!-- ref: #4, from: #1 #3 -->
-  - [ ] Model an ordered Workset collection containing an Agents split tree and a Terminal tree
-  - [ ] Show Codex and Gemini together in the Agents Workset and the general Ghostty window in the Terminal Workset
-  - [ ] Preserve focus and proportions independently inside each Workset
-  - [ ] Use ephemeral window ids for the first session before adding durable title/role/mark matching
-  - [ ] Make `Alt+2` switch to Space 2 from elsewhere and cycle Worksets when Space 2 is already active
-  - [ ] Make `Alt+T` switch to Space 2 and select the Terminal Workset directly
-  - [ ] Keep the old Space 3 and macOS/`skhd` bindings recoverable until the interaction is verified
 - [ ] [worksets] Establish the Workset domain model <!-- ref: #5, from: #4 -->
   - [ ] Introduce stable `WorksetId` identity above Layout selection
   - [ ] Store an ordered Workset collection and one active Workset per Space
@@ -71,9 +63,9 @@ checkpoint before it earns a `feat/*` branch.
   - [ ] Switch and restore the last-used Workset when the requested Space is not active
   - [ ] Cycle Worksets forward when the requested Space is already active and reverse with Shift
   - [ ] Show a short-lived Space/Workset indicator and remember the last Workset per Space
-  - [ ] Perform native Space switching in the system layer without synthesizing macOS shortcuts
+  - [ ] Investigate a native Space transition API that is as reliable as macOS Mission Control shortcuts
   - [ ] Keep switch-versus-cycle policy in `SpaceManager` and activate Worksets only after the destination is confirmed active
-  - [ ] Detect conflicting macOS Mission Control bindings and document their manual removal
+  - [ ] Detect conflicting macOS Mission Control bindings and document the stable exclusive-ownership setup
   - [ ] Preserve focus memory and coalesce repeated requests during in-flight Space transitions
 - [ ] [stage-manager] Integrate Stage Manager as an optional Workset adapter <!-- ref: #2, from: #1 -->
   - [ ] Keep every Workset and Recipe usable when Stage Manager is disabled
@@ -163,3 +155,13 @@ checkpoint before it earns a `feat/*` branch.
   - [ ] Report deprecated fields and generate a safe migration preview
 
 ## Done (Unreleased)
+
+- [x] [prototype] Deliver live per-Space Worksets <!-- ref: #4, from: #1 #3 -->
+  - [x] Store ordered named Worksets with independent layouts, focus, and proportions
+  - [x] Route existing and newly opened windows by application rules
+  - [x] Surface complete Worksets and suppress inactive Worksets without moving windows outside the screen by default
+  - [x] Select Agents and Terminal directly with Alt+A and Alt+T
+  - [x] Cycle Worksets with Alt+Backquote and Alt+Shift+Backquote
+  - [x] Keep native macOS Alt+digits exclusively responsible for Space switching
+  - [x] Show a short-lived Workset HUD
+- [x] [reliability] Ignore zero-id and transient `AXUnknown` windows <!-- ref: #6, from: #4 -->

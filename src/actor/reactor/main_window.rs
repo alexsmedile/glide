@@ -93,6 +93,7 @@ impl MainWindowTracker {
             | Event::ScrollWheel { .. }
             | Event::LeftMouseDown(..)
             | Event::LeftMouseDragged(..)
+            | Event::WorksetCommand { .. }
             | Event::Command(..)
             | Event::ConfigChanged(_)
             | Event::WindowsOnScreenUpdated { .. } => return None,

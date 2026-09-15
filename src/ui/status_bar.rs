@@ -25,12 +25,25 @@ const TOGGLE_GLOBAL_TAG: i64 = 2;
 const TOGGLE_SPACE_TAG: i64 = 3;
 const SHOW_DOCS_TAG: i64 = 4;
 
+/// One Workset as shown in the status menu.
+#[derive(Debug, Clone)]
+pub struct WorksetMenuEntry {
+    pub name: String,
+    /// The key that selects this Workset, without its modifiers.
+    pub key_equivalent: Option<String>,
+    pub is_active: bool,
+}
+
 pub struct StatusIcon {
     status_item: Retained<NSStatusItem>,
     mtm: MainThreadMarker,
     _menu_handler: Retained<MenuHandler>,
     toggle_item: Retained<NSMenuItem>,
     space_toggle_item: Retained<NSMenuItem>,
+    /// Menu items naming this Space's Worksets, rebuilt whenever they change.
+    workset_items: Vec<Retained<NSMenuItem>>,
+    /// Where the Workset items start, so they can be replaced in place.
+    workset_index: usize,
 }
 
 impl StatusIcon {
@@ -71,6 +84,7 @@ impl StatusIcon {
         menu.addItem(&space_toggle_item);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let workset_index = menu.numberOfItems() as usize;
 
         let version_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -130,6 +144,50 @@ impl StatusIcon {
             _menu_handler: menu_handler,
             toggle_item,
             space_toggle_item,
+            workset_items: Vec::new(),
+            workset_index,
+        }
+    }
+
+    /// Lists this Space's Worksets in the menu, marking the active one and
+    /// showing the shortcut that selects each.
+    ///
+    /// Worksets are created as they are used, so the list is rebuilt rather
+    /// than updated in place.
+    pub fn set_worksets(&mut self, worksets: &[WorksetMenuEntry]) {
+        let Some(menu) = self.status_item.menu(self.mtm) else {
+            return;
+        };
+        for item in self.workset_items.drain(..) {
+            menu.removeItem(&item);
+        }
+        for (offset, entry) in worksets.iter().enumerate() {
+            // A bullet marks where the user is. NSMenuItem's own checkmark
+            // state is not exposed here, and a prefix reads the same. The
+            // shortcut goes in the title because a disabled item does not
+            // render a key equivalent.
+            let title = NSString::from_str(&format!(
+                "{} {}{}",
+                if entry.is_active { "●" } else { "○" },
+                entry.name,
+                match &entry.key_equivalent {
+                    Some(key) => format!("  ⌥{}", key.to_uppercase()),
+                    None => String::new(),
+                },
+            ));
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(self.mtm),
+                    &title,
+                    None,
+                    ns_string!(""),
+                )
+            };
+            // A tick marks where the user is; the rest are shown for
+            // orientation, not as actions, so they stay disabled.
+            item.setEnabled(false);
+            menu.insertItem_atIndex(&item, (self.workset_index + offset) as isize);
+            self.workset_items.push(item);
         }
     }
 

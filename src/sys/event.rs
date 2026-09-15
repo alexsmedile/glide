@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use core_graphics::base::CGError;
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use livesplit_hotkey::{ConsumePreference, Hook};
 pub use livesplit_hotkey::{Hotkey, KeyCode, Modifiers};
 use objc2_app_kit::NSEvent;
@@ -27,6 +29,14 @@ impl HotkeyManager {
         Ok(HotkeyManager { hook, events_tx })
     }
 
+    /// Creates a hotkey observer that leaves matching events in the system
+    /// event stream. Native macOS shortcuts can therefore act on the same
+    /// keypress after Glide has inspected it.
+    pub fn new_passthrough(events_tx: Sender) -> Result<Self, livesplit_hotkey::Error> {
+        let hook = Hook::with_consume_preference(ConsumePreference::MustNotConsume)?;
+        Ok(HotkeyManager { hook, events_tx })
+    }
+
     pub fn register(&self, modifiers: Modifiers, key_code: KeyCode, cmd: Command) {
         self.register_wm(modifiers, key_code, WmCommand::ReactorCommand(cmd))
     }
@@ -42,6 +52,33 @@ impl HotkeyManager {
             })
             .unwrap();
     }
+}
+
+/// Replays the configured native Option+Digit Mission Control shortcut.
+pub fn post_native_space_shortcut(desktop: usize) -> anyhow::Result<()> {
+    let key_code = match desktop {
+        1 => 18,
+        2 => 19,
+        3 => 20,
+        4 => 21,
+        5 => 23,
+        6 => 22,
+        7 => 26,
+        8 => 28,
+        9 => 25,
+        _ => anyhow::bail!("native Desktop shortcut must be between 1 and 9"),
+    };
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("could not create keyboard event source"))?;
+    let down = CGEvent::new_keyboard_event(source.clone(), key_code, true)
+        .map_err(|_| anyhow::anyhow!("could not create key-down event"))?;
+    down.set_flags(CGEventFlags::CGEventFlagAlternate);
+    down.post(CGEventTapLocation::Session);
+    let up = CGEvent::new_keyboard_event(source, key_code, false)
+        .map_err(|_| anyhow::anyhow!("could not create key-up event"))?;
+    up.set_flags(CGEventFlags::CGEventFlagAlternate);
+    up.post(CGEventTapLocation::Session);
+    Ok(())
 }
 
 /// The state of the left mouse button.

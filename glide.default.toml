@@ -9,6 +9,9 @@ animate = true
 # Disable each space by default. When this is set, Use the
 # toggle_space_activated command to enable a space.
 default_disable = true
+# Desktops managed from launch, by their Mission Control number. Empty means
+# each space is decided at runtime with alt-z.
+managed_desktops = []
 
 # Focus the window under the mouse as it moves.
 focus_follows_mouse = true
@@ -40,6 +43,10 @@ inner_gap = 0
 # tiled windows. Setting this keeps a zoomed window visibly distinct from a
 # layout that simply holds one window.
 fullscreen_uses_outer_gap = true
+# Inset of a fullscreen window from the screen edge. Zero falls back to
+# outer_gap; a larger value leaves the tiled windows visible around the
+# edges, so fullscreen reads as "maximized on top" rather than a bare screen.
+fullscreen_gap = 0
 
 # Keep the outer gap when a layout contains only one tiled window. This also
 # covers that window when it is fullscreen, so a lone window looks the same
