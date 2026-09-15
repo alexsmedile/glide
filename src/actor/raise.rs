@@ -19,7 +19,7 @@ use tracing::{Span, debug, trace, warn};
 use crate::actor::app::{AppThreadHandle, Quiet, Request, WindowId};
 use crate::actor::{mouse, reactor};
 use crate::sys::timer::Timer;
-use crate::sys::window_server::{self, OrderMode, WindowServerId};
+use crate::sys::window_server::{self, WindowServerId};
 
 /// Messages that can be sent to the raise manager
 #[derive(Debug)]
@@ -84,12 +84,21 @@ pub struct RaiseManager {
 struct ActiveSequence {
     sequence_id: u64,
     pending_raises: HashSet<WindowId>,
+    serialized_raises: VecDeque<(pid_t, Vec<WindowId>)>,
     focus_batch: Option<(pid_t, Vec<WindowId>, Option<CGPoint>)>,
     workset_stack: Option<WorksetStack>,
+    workset_replay: Option<WorksetReplay>,
     app_handles: HashMap<i32, AppThreadHandle>,
     raise_token: CancellationToken,
     started_at: Instant,
     timed_out: bool,
+}
+
+#[derive(Clone, Debug)]
+struct WorksetReplay {
+    raises: Vec<(pid_t, Vec<WindowId>)>,
+    focus: Option<(pid_t, Vec<WindowId>, Option<CGPoint>)>,
+    attempts: u8,
 }
 
 pub type Sender = mpsc::UnboundedSender<(Span, Event)>;
@@ -260,11 +269,15 @@ impl RaiseManager {
         let sequence_id = self.next_sequence_id;
         self.next_sequence_id += 1;
 
-        // Send all raise requests with completion notification
+        // Ordinary layout work remains concurrent. Workset activation is
+        // deliberately serialized: application activation affects global
+        // window order, and racing app threads can otherwise leave only one
+        // member of the Workset above the inactive windows.
         let mut pending_raises = HashSet::default();
         let raise_token = CancellationToken::new();
 
         let mut focus_batch = None;
+        let mut regular_batches = Vec::new();
         for mut wids in raise_windows {
             let Some(&WindowId { pid, .. }) = wids.first() else {
                 continue;
@@ -280,21 +293,7 @@ impl RaiseManager {
                     continue;
                 }
             }
-            let Some(app_handle) = app_handles.get(&pid) else {
-                warn!("App not found for pid {:?}", pid);
-                continue;
-            };
-            if app_handle
-                .send(Request::Raise(
-                    wids.clone(),
-                    raise_token.clone(),
-                    sequence_id,
-                    Quiet::Yes,
-                ))
-                .is_ok()
-            {
-                pending_raises.extend(wids);
-            }
+            regular_batches.push((pid, wids));
         }
         if let Some((wid, warp)) = focus_window
             && focus_batch.is_none()
@@ -302,17 +301,68 @@ impl RaiseManager {
             focus_batch = Some((wid.pid, vec![wid], warp));
         }
 
-        if !pending_raises.is_empty() || focus_batch.is_some() {
+        let serialize = workset_stack.is_some();
+        if !serialize {
+            for (pid, wids) in &regular_batches {
+                let Some(app_handle) = app_handles.get(pid) else {
+                    warn!("App not found for pid {:?}", pid);
+                    continue;
+                };
+                if app_handle
+                    .send(Request::Raise(
+                        wids.clone(),
+                        raise_token.clone(),
+                        sequence_id,
+                        Quiet::Yes,
+                    ))
+                    .is_ok()
+                {
+                    pending_raises.extend(wids);
+                }
+            }
+        }
+
+        let serialized_raises: VecDeque<(pid_t, Vec<WindowId>)> =
+            serialize.then(|| regular_batches.clone().into()).unwrap_or_default();
+        let workset_replay = serialize.then(|| WorksetReplay {
+            raises: regular_batches,
+            focus: focus_batch.clone(),
+            attempts: 1,
+        });
+
+        if !pending_raises.is_empty() || !serialized_raises.is_empty() || focus_batch.is_some() {
             self.active_sequence = Some(ActiveSequence {
                 sequence_id,
                 pending_raises,
+                serialized_raises,
                 focus_batch,
                 workset_stack,
+                workset_replay,
                 app_handles,
                 raise_token,
                 started_at: Instant::now(),
                 timed_out: false,
             });
+        }
+    }
+
+    fn send_raise(sequence: &mut ActiveSequence, pid: pid_t, wids: Vec<WindowId>, quiet: Quiet) {
+        let Some(app_handle) = sequence.app_handles.get(&pid) else {
+            warn!("App not found for pid {:?}", pid);
+            return;
+        };
+        if app_handle
+            .send(Request::Raise(
+                wids.clone(),
+                sequence.raise_token.clone(),
+                sequence.sequence_id,
+                quiet,
+            ))
+            .is_ok()
+        {
+            sequence.pending_raises.extend(wids);
+            sequence.started_at = Instant::now();
+            sequence.timed_out = false;
         }
     }
 
@@ -323,6 +373,17 @@ impl RaiseManager {
         };
         let mut changed = false;
 
+        // A Workset's application batches must run in a defined order. Each
+        // completion releases the next batch, avoiding the cross-app mutex
+        // race that made repeated shortcut presses gradually assemble a layer.
+        if sequence.pending_raises.is_empty()
+            && let Some((pid, wids)) = sequence.serialized_raises.pop_front()
+        {
+            debug!(?wids, "Raising serialized Workset batch");
+            Self::send_raise(sequence, pid, wids, Quiet::Yes);
+            return true;
+        }
+
         // If all regular raises are complete but we have a focus window, send
         // the focus request.
         if sequence.pending_raises.is_empty()
@@ -330,23 +391,9 @@ impl RaiseManager {
         {
             changed = true;
             debug!(focus_window = ?wids);
-            let app_handle = sequence.app_handles.get(&pid);
-            if let Some(handle) = app_handle {
-                if handle
-                    .send(Request::Raise(
-                        wids.clone(),
-                        sequence.raise_token.clone(),
-                        sequence.sequence_id, // Use proper sequence ID for tracking
-                        Quiet::No,
-                    ))
-                    .is_ok()
-                {
-                    // Add focus window to pending raises so we wait for completion.
-                    sequence.pending_raises.extend(wids);
-                    trace!("Focus window request sent and added to pending raises");
-                } else {
-                    warn!("Failed to send focus window request");
-                }
+            if sequence.app_handles.contains_key(&pid) {
+                Self::send_raise(sequence, pid, wids, Quiet::No);
+                trace!("Focus window request sent and added to pending raises");
 
                 if let Some(warp) = warp
                     && let Some(mouse_tx) = &self.mouse_tx
@@ -360,8 +407,27 @@ impl RaiseManager {
 
         // If all raises (including focus) are complete, remove the active sequence.
         if sequence.pending_raises.is_empty() && sequence.focus_batch.is_none() {
-            if let Some(stack) = sequence.workset_stack.take() {
-                enforce_workset_stack(&stack);
+            if let Some(stack) = &sequence.workset_stack {
+                let order = window_server::get_visible_window_ids();
+                if !workset_stack_is_correct(&order, stack)
+                    && let Some(replay) = &mut sequence.workset_replay
+                    && replay.attempts < 2
+                {
+                    replay.attempts += 1;
+                    sequence.serialized_raises = replay.raises.clone().into();
+                    sequence.focus_batch = replay.focus.clone();
+                    sequence.raise_token = CancellationToken::new();
+                    debug!(?order, "Retrying incomplete Workset layer in a defined order");
+                    return true;
+                }
+                if !workset_stack_is_correct(&order, stack) {
+                    warn!(
+                        ?stack.active,
+                        ?stack.inactive,
+                        ?order,
+                        "Workset windows did not form a complete top layer"
+                    );
+                }
             }
             trace!(
                 "Raise sequence completed after {:?}",
@@ -372,44 +438,6 @@ impl RaiseManager {
         }
 
         changed
-    }
-}
-
-fn enforce_workset_stack(stack: &WorksetStack) {
-    if stack.active.is_empty() || stack.inactive.is_empty() {
-        return;
-    }
-
-    for attempt in 0..2 {
-        let order = window_server::get_visible_window_ids();
-        if workset_stack_is_correct(&order, stack) {
-            return;
-        }
-        let Some(anchor) = order.iter().rev().find(|id| stack.active.contains(id)).copied() else {
-            debug!(?stack.active, "No visible active Workset window to order against");
-            return;
-        };
-        for &window in &stack.inactive {
-            if order.contains(&window)
-                && let Err(error) =
-                    window_server::order_window(window, OrderMode::Below, Some(anchor))
-            {
-                warn!(
-                    ?window,
-                    ?anchor,
-                    ?error,
-                    "Failed to lower inactive Workset window"
-                );
-            }
-        }
-        if attempt == 0 {
-            trace!(?anchor, "Retrying Workset order verification");
-        }
-    }
-
-    let order = window_server::get_visible_window_ids();
-    if !workset_stack_is_correct(&order, stack) {
-        warn!(?stack.active, ?stack.inactive, "Workset windows did not form a complete top layer");
     }
 }
 
@@ -1104,6 +1132,54 @@ mod tests {
             } else {
                 panic!("Expected Raise request for first batch");
             }
+        });
+    }
+
+    #[test]
+    fn workset_batches_are_raised_sequentially_before_focus() {
+        Executor::run(async {
+            let mut raise_manager = RaiseManager::new();
+            let mut app_handles = HashMap::default();
+            let (app1_tx, mut app1_rx) = mpsc::unbounded_channel();
+            let (app2_tx, mut app2_rx) = mpsc::unbounded_channel();
+            let (app3_tx, mut app3_rx) = mpsc::unbounded_channel();
+            app_handles.insert(1, AppThreadHandle::new_for_test(app1_tx));
+            app_handles.insert(2, AppThreadHandle::new_for_test(app2_tx));
+            app_handles.insert(3, AppThreadHandle::new_for_test(app3_tx));
+
+            let w1 = WindowId::new(1, 1);
+            let w2 = WindowId::new(2, 1);
+            let focus = WindowId::new(3, 1);
+            raise_manager.handle_message(Event::RaiseRequest(RaiseRequest {
+                raise_windows: vec![vec![w1], vec![w2], vec![focus]],
+                focus_window: Some((focus, None)),
+                workset_stack: Some(WorksetStack {
+                    active: vec![
+                        WindowServerId::new(1),
+                        WindowServerId::new(2),
+                        WindowServerId::new(3),
+                    ],
+                    inactive: vec![WindowServerId::new(4)],
+                }),
+                app_handles,
+            }));
+
+            let requests = collect_requests(&mut app1_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], w1, 1, Quiet::Yes);
+            assert!(collect_requests(&mut app2_rx).is_empty());
+            assert!(collect_requests(&mut app3_rx).is_empty());
+
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w1, sequence_id: 1 });
+            let requests = collect_requests(&mut app2_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], w2, 1, Quiet::Yes);
+            assert!(collect_requests(&mut app3_rx).is_empty());
+
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w2, sequence_id: 1 });
+            let requests = collect_requests(&mut app3_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], focus, 1, Quiet::No);
         });
     }
 

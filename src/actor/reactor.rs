@@ -1402,13 +1402,20 @@ impl Reactor {
             }
         }
 
-        let mut windows_by_app_and_screen = HashMap::default();
+        // Preserve the layout response order. Workset raises are serialized by
+        // the raise manager, so collecting these groups through a hash map
+        // would make their cross-application stacking order nondeterministic.
+        let mut windows_by_app_and_screen = Vec::<((i32, Option<SpaceId>), Vec<WindowId>)>::new();
         for &wid in &raise_windows {
             let Some(window) = self.windows.get(&wid) else { continue };
-            windows_by_app_and_screen
-                .entry((wid.pid, self.best_space_for_window(&window.frame_monotonic)))
-                .or_insert(vec![])
-                .push(wid);
+            let key = (wid.pid, self.best_space_for_window(&window.frame_monotonic));
+            if let Some((_, windows)) =
+                windows_by_app_and_screen.iter_mut().find(|(k, _)| *k == key)
+            {
+                windows.push(wid);
+            } else {
+                windows_by_app_and_screen.push((key, vec![wid]));
+            }
         }
 
         let focus_window_with_warp = focus_window.map(|wid| {
@@ -1446,7 +1453,10 @@ impl Reactor {
         });
 
         let msg = raise::Event::RaiseRequest(RaiseRequest {
-            raise_windows: windows_by_app_and_screen.into_values().collect(),
+            raise_windows: windows_by_app_and_screen
+                .into_iter()
+                .map(|(_, windows)| windows)
+                .collect(),
             focus_window: focus_window_with_warp,
             workset_stack,
             app_handles,
