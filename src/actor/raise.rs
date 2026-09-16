@@ -366,6 +366,22 @@ impl RaiseManager {
         }
     }
 
+    fn begin_workset_retry(sequence: &mut ActiveSequence, sequence_id: u64) -> bool {
+        let Some(replay) = &mut sequence.workset_replay else {
+            return false;
+        };
+        if replay.attempts >= 2 {
+            return false;
+        }
+
+        replay.attempts += 1;
+        sequence.sequence_id = sequence_id;
+        sequence.serialized_raises = replay.raises.clone().into();
+        sequence.focus_batch = replay.focus.clone();
+        sequence.raise_token = CancellationToken::new();
+        true
+    }
+
     /// Process the active sequence, handling completed raises and focus windows.
     pub fn process_active_sequence(&mut self) -> bool {
         let Some(sequence) = &mut self.active_sequence else {
@@ -407,20 +423,21 @@ impl RaiseManager {
 
         // If all raises (including focus) are complete, remove the active sequence.
         if sequence.pending_raises.is_empty() && sequence.focus_batch.is_none() {
-            if let Some(stack) = &sequence.workset_stack {
+            if let Some(stack) = sequence.workset_stack.clone() {
                 let order = window_server::get_visible_window_ids();
-                if !workset_stack_is_correct(&order, stack)
-                    && let Some(replay) = &mut sequence.workset_replay
-                    && replay.attempts < 2
-                {
-                    replay.attempts += 1;
-                    sequence.serialized_raises = replay.raises.clone().into();
-                    sequence.focus_batch = replay.focus.clone();
-                    sequence.raise_token = CancellationToken::new();
-                    debug!(?order, "Retrying incomplete Workset layer in a defined order");
-                    return true;
+                if !workset_stack_is_correct(&order, &stack) {
+                    let retry_sequence_id = self.next_sequence_id;
+                    if Self::begin_workset_retry(sequence, retry_sequence_id) {
+                        self.next_sequence_id += 1;
+                        debug!(
+                            ?order,
+                            retry_sequence_id,
+                            "Retrying incomplete Workset layer in a defined order"
+                        );
+                        return true;
+                    }
                 }
-                if !workset_stack_is_correct(&order, stack) {
+                if !workset_stack_is_correct(&order, &stack) {
                     warn!(
                         ?stack.active,
                         ?stack.inactive,
@@ -1180,6 +1197,79 @@ mod tests {
             let requests = collect_requests(&mut app3_rx);
             assert_eq!(requests.len(), 1);
             assert_raise_request(&requests[0], focus, 1, Quiet::No);
+        });
+    }
+
+    #[test]
+    fn workset_retry_uses_a_fresh_sequence_and_ignores_stale_completion() {
+        Executor::run(async {
+            let mut raise_manager = RaiseManager::new();
+            let (app_handles, mut app_rx) = create_test_app_handles();
+            let w1 = WindowId::new(1, 1);
+            let w2 = WindowId::new(1, 2);
+            let focus = WindowId::new(1, 3);
+            let queued = WindowId::new(1, 4);
+
+            raise_manager.handle_message(Event::RaiseRequest(RaiseRequest {
+                raise_windows: vec![vec![w1], vec![w2], vec![focus]],
+                focus_window: Some((focus, None)),
+                workset_stack: Some(WorksetStack {
+                    active: vec![
+                        WindowServerId::new(1),
+                        WindowServerId::new(2),
+                        WindowServerId::new(3),
+                    ],
+                    inactive: vec![WindowServerId::new(4)],
+                }),
+                app_handles: app_handles.clone(),
+            }));
+            raise_manager.handle_message(create_layout_response(vec![queued], None, app_handles));
+
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], w1, 1, Quiet::Yes);
+            assert_eq!(raise_manager.queued_sequences.len(), 1);
+
+            raise_manager.handle_message(Event::RaiseTimeout { sequence_id: 1 });
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], w2, 1, Quiet::Yes);
+
+            // Model reaching verification after the remaining first-attempt
+            // work was cleared. Its late completions must not match the retry.
+            let sequence = raise_manager.active_sequence.as_mut().unwrap();
+            sequence.pending_raises.clear();
+            sequence.serialized_raises.clear();
+            sequence.focus_batch = None;
+            assert!(RaiseManager::begin_workset_retry(sequence, 2));
+            raise_manager.next_sequence_id = 3;
+            assert!(raise_manager.process_active_sequence());
+
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], w1, 2, Quiet::Yes);
+            assert!(raise_manager.active_sequence.as_ref().unwrap().pending_raises.contains(&w1));
+
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w1, sequence_id: 1 });
+            let sequence = raise_manager.active_sequence.as_ref().unwrap();
+            assert_eq!(sequence.sequence_id, 2);
+            assert!(sequence.pending_raises.contains(&w1));
+            assert_eq!(raise_manager.queued_sequences.len(), 1);
+
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w1, sequence_id: 2 });
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], w2, 2, Quiet::Yes);
+
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w2, sequence_id: 1 });
+            assert!(raise_manager.active_sequence.as_ref().unwrap().pending_raises.contains(&w2));
+
+            raise_manager.handle_message(Event::RaiseCompleted { window_id: w2, sequence_id: 2 });
+            let requests = collect_requests(&mut app_rx);
+            assert_eq!(requests.len(), 1);
+            assert_raise_request(&requests[0], focus, 2, Quiet::No);
+            assert_eq!(raise_manager.queued_sequences.len(), 1);
+            assert!(collect_requests(&mut app_rx).is_empty());
         });
     }
 
