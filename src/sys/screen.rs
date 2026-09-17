@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::f64;
-use std::ffi::c_int;
+use std::ffi::{c_int, c_void};
 use std::mem::MaybeUninit;
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
@@ -421,19 +421,66 @@ impl Serialize for DisplaySelector {
     }
 }
 
+/// The window server UUID of the display macOS currently treats as the main
+/// one, or `None` if no display reports itself as main.
+///
+/// Used to resolve `DisplaySelector::Builtin` by identity rather than by
+/// position in the window server's display list. The two agree in a settled
+/// configuration, but the list is rebuilt as displays come and go, so on wake
+/// position alone can name a different display than the user meant.
+fn main_display_uuid() -> Option<String> {
+    const MAX_SCREENS: u32 = 64;
+    let mut ids: MaybeUninit<[CGDirectDisplayID; MAX_SCREENS as usize]> = MaybeUninit::uninit();
+    let mut count: u32 = 0;
+    let ids = unsafe {
+        let err = CGGetActiveDisplayList(
+            MAX_SCREENS,
+            ids.as_mut_ptr() as *mut CGDirectDisplayID,
+            &mut count,
+        );
+        if err != CGError::Success {
+            warn!(?err, "Could not list active displays");
+            return None;
+        }
+        std::slice::from_raw_parts(ids.as_ptr() as *const CGDirectDisplayID, count as usize)
+    };
+    let main = ids.iter().copied().find(|&id| unsafe { CGDisplayIsMain(id) } != 0)?;
+    // SAFETY: Both calls return owned (+1) references, per the create rule.
+    // The UUID is released as soon as its string form has been copied out.
+    unsafe {
+        let uuid = CGDisplayCreateUUIDFromDisplayID(main)?;
+        let string = CFUUIDCreateString(std::ptr::null(), uuid.as_ref());
+        CFRelease(uuid.as_ptr() as *const c_void);
+        let string = CFRetained::from_raw(string?);
+        Some(string.to_string())
+    }
+}
+
+/// Picks the display a selector names out of the window server's list.
+///
+/// Split out from `spaces_of_selected_display` so the matching rules can be
+/// tested without a display attached. `main` is the UUID macOS currently
+/// reports as the main display.
+fn select_display(
+    displays: Vec<DisplaySpaces>,
+    selector: &DisplaySelector,
+    main: Option<&str>,
+) -> Option<Vec<SpaceId>> {
+    let wanted = match selector {
+        DisplaySelector::Builtin => main?,
+        DisplaySelector::Uuid(uuid) => uuid.as_str(),
+    };
+    displays
+        .into_iter()
+        .find(|d| d.identifier.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(wanted)))
+        .map(|d| d.spaces)
+}
+
 /// The spaces of the display this selector names, in the order macOS presents
 /// them, or `None` when that display is not currently connected.
 pub fn spaces_of_selected_display(selector: &DisplaySelector) -> Option<Vec<SpaceId>> {
     let displays = displays_with_user_spaces()?;
-    match selector {
-        // macOS lists the main display first, which `update_screen_config`
-        // relies on as well.
-        DisplaySelector::Builtin => displays.into_iter().next().map(|d| d.spaces),
-        DisplaySelector::Uuid(uuid) => displays
-            .into_iter()
-            .find(|d| d.identifier.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(uuid)))
-            .map(|d| d.spaces),
-    }
+    select_display(displays, selector, main_display_uuid().as_deref())
 }
 
 /// The result of looking up a desktop on a named display.
@@ -532,6 +579,13 @@ pub mod diagnostic {
 // Based on https://github.com/asmagill/hs._asm.undocumented.spaces/blob/master/CGSSpace.h.
 // Also see https://github.com/koekeishiya/yabai/blob/d55a647913ab72d8d8b348bee2d3e59e52ce4a5d/src/misc/extern.h.
 
+/// Opaque stand-in for `CFUUIDRef`. The concrete type is not re-exported by
+/// objc2-core-foundation, and only its string form is used here.
+#[repr(C)]
+struct CFUuid {
+    _private: [u8; 0],
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGSMainConnectionID() -> c_int;
@@ -541,6 +595,10 @@ unsafe extern "C" {
     fn CGSCopyManagedDisplaySpaces(cid: c_int) -> *mut NSArray;
     fn CGSManagedDisplayGetCurrentSpace(cid: c_int, uuid: &CFString) -> u64;
     fn CGSCopyBestManagedDisplayForRect(cid: c_int, rect: CGRect) -> Option<NonNull<CFString>>;
+    fn CGDisplayIsMain(display: CGDirectDisplayID) -> u32;
+    fn CGDisplayCreateUUIDFromDisplayID(display: CGDirectDisplayID) -> Option<NonNull<CFUuid>>;
+    fn CFUUIDCreateString(alloc: *const c_void, uuid: &CFUuid) -> Option<NonNull<CFString>>;
+    fn CFRelease(cf: *const c_void);
 }
 
 bitflags! {
@@ -574,9 +632,66 @@ mod test {
     use objc2_core_foundation::{CFRetained, CFString, CGPoint, CGRect, CGSize};
 
     use super::{
-        CGError, CGScreenInfo, DisplaySelector, NSScreenInfo, ScreenCache, ScreenId, System,
-        is_user_space,
+        CGError, CGScreenInfo, DisplaySelector, DisplaySpaces, NSScreenInfo, ScreenCache, ScreenId,
+        SpaceId, System, is_user_space, select_display,
     };
+
+    fn display(uuid: &str, spaces: &[u64]) -> DisplaySpaces {
+        DisplaySpaces {
+            identifier: Some(uuid.to_owned()),
+            spaces: spaces.iter().map(|&id| SpaceId::new(id)).collect(),
+        }
+    }
+
+    const BUILTIN: &str = "F8C4E36C-4313-4104-88FA-C9736A46352C";
+    const EXTERNAL: &str = "84EFFBF0-1178-405C-9D64-3B574C1BE249";
+
+    #[test]
+    fn builtin_follows_the_main_display_not_the_list_order() {
+        // macOS rebuilds the display list as displays come and go, so on wake
+        // the main display is not always first. Resolving by position would
+        // hand back the other display's spaces.
+        let displays = vec![
+            display(EXTERNAL, &[199]),
+            display(BUILTIN, &[166, 167, 168]),
+        ];
+        assert_eq!(
+            Some(vec![SpaceId::new(166), SpaceId::new(167), SpaceId::new(168)]),
+            select_display(displays, &DisplaySelector::Builtin, Some(BUILTIN)),
+        );
+    }
+
+    #[test]
+    fn builtin_is_missing_when_no_display_is_main() {
+        let displays = vec![display(BUILTIN, &[166])];
+        assert_eq!(None, select_display(displays, &DisplaySelector::Builtin, None));
+    }
+
+    #[test]
+    fn a_uuid_matches_regardless_of_case_and_position() {
+        let displays = vec![display(BUILTIN, &[166]), display(EXTERNAL, &[199])];
+        assert_eq!(
+            Some(vec![SpaceId::new(199)]),
+            select_display(
+                displays,
+                &DisplaySelector::Uuid(EXTERNAL.to_ascii_lowercase()),
+                Some(BUILTIN),
+            ),
+        );
+    }
+
+    #[test]
+    fn a_disconnected_display_resolves_to_nothing() {
+        let displays = vec![display(BUILTIN, &[166])];
+        assert_eq!(
+            None,
+            select_display(
+                displays,
+                &DisplaySelector::Uuid(EXTERNAL.to_owned()),
+                Some(BUILTIN),
+            ),
+        );
+    }
 
     struct Stub {
         cg_screens: Vec<CGScreenInfo>,

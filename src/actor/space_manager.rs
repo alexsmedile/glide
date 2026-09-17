@@ -398,6 +398,11 @@ impl SpaceManager {
             }
             DesktopLookup::DisplayMissing => match when_missing {
                 WhenDisplayMissing::Park => None,
+                // Falling back to the display that is already missing cannot
+                // help, and would report the miss twice.
+                WhenDisplayMissing::FallBackToBuiltin if *wanted == DisplaySelector::Builtin => {
+                    None
+                }
                 WhenDisplayMissing::FallBackToBuiltin => {
                     match space_on_display(&DisplaySelector::Builtin, desktop) {
                         DesktopLookup::Found(space) => Some(space),
