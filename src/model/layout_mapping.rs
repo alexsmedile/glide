@@ -143,6 +143,21 @@ impl SpaceLayoutMapping {
         self.workset_names.insert(layout, name);
     }
 
+    /// Drops every Workset name, leaving the layouts as plain screen-size
+    /// variants.
+    ///
+    /// Names are what keep a layout alive past refcount zero and what makes it
+    /// reachable by name, so clearing them lets the Space fall back to the
+    /// single-layout behaviour it had before Worksets existed.
+    pub fn clear_workset_names(&mut self) {
+        self.workset_names.clear();
+    }
+
+    #[cfg(test)]
+    pub fn workset_names_len_for_test(&self) -> usize {
+        self.workset_names.len()
+    }
+
     pub fn workset_name(&self, layout: LayoutId) -> Option<&str> {
         self.workset_names.get(&layout).map(String::as_str)
     }

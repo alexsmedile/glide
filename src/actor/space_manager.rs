@@ -212,9 +212,26 @@ impl SpaceManager {
                     warn!(desktop, "Could not resolve native Space shortcut");
                     return;
                 };
+                // With Worksets off the binding is a plain native Space
+                // shortcut, so it must still switch Spaces rather than cycle.
+                if !self.worksets_enabled() {
+                    _ = self.wm_tx.send((
+                        tracing::Span::current(),
+                        WmEvent::PostNativeSpaceShortcut(desktop),
+                    ));
+                    return;
+                }
                 self.space_or_workset(desktop, target);
             }
             Event::WorksetOnSpace { desktop, name } => {
+                if !self.worksets_enabled() {
+                    warn!(
+                        desktop,
+                        workset = name,
+                        "Ignoring Workset binding: worksets disabled"
+                    );
+                    return;
+                }
                 let Some(target) = self.target_space(desktop) else {
                     warn!(desktop, workset = name, "Could not resolve Workset Space");
                     return;
@@ -226,6 +243,9 @@ impl SpaceManager {
             }
             Event::ConfigUpdated(config) => {
                 self.config = config.clone();
+                if !self.worksets_enabled() {
+                    self.pending_workset = None;
+                }
                 self.reactor_tx.send(reactor::Event::ConfigChanged(config));
                 // Force-send hotkey state since WmController unconditionally
                 // unregisters hotkeys on config reload.
@@ -334,6 +354,10 @@ impl SpaceManager {
     fn target_space(&self, desktop: usize) -> Option<SpaceId> {
         let current = self.focused_space()?;
         space_with_number(desktop, current)
+    }
+
+    fn worksets_enabled(&self) -> bool {
+        self.config.settings.experimental.worksets.enable
     }
 
     fn space_or_workset(&self, desktop: usize, target: SpaceId) {
@@ -770,6 +794,43 @@ mod tests {
         assert!(
             wm_events.iter().any(|e| matches!(e, WmEvent::HotkeysActive(true))),
             "Expected HotkeysActive(true), got {wm_events:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_reload_disabling_worksets_drops_a_pending_activation() {
+        // A cross-Space Workset request parks itself until the native Space
+        // switch lands. Disabling in between must not let it fire afterwards.
+        let mut config = Config::default();
+        config.settings.default_disable = false;
+        config.settings.experimental.worksets.enable = true;
+        let mut h = TestHarness::new_with(false, config);
+        let active = space(10);
+        h.setup_space(screen(1), active);
+
+        h.sm.workset_on_space(2, space(11), "agents".to_owned());
+        assert!(
+            h.sm.pending_workset.is_some(),
+            "expected a pending Workset activation"
+        );
+
+        let mut disabled = Config::default();
+        disabled.settings.default_disable = false;
+        disabled.settings.experimental.worksets.enable = false;
+        h.on_event(Event::ConfigUpdated(Arc::new(disabled)));
+        assert!(
+            h.sm.pending_workset.is_none(),
+            "a pending Workset survived disabling"
+        );
+
+        // The native Space switch it was waiting on must not activate it now.
+        _ = drain(&mut h.reactor_rx);
+        h.send_space_changed(vec![Some(space(11))]);
+        assert!(
+            !drain(&mut h.reactor_rx)
+                .iter()
+                .any(|e| matches!(e, reactor::Event::WorksetCommand { .. })),
+            "a Workset command fired after worksets were disabled"
         );
     }
 

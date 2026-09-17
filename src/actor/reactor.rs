@@ -2044,7 +2044,10 @@ pub mod tests {
         // Regression: the move changed the model but produced no frame
         // writes, so the window stayed where it was and appeared to vanish.
         let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let mut reactor = Reactor::new_for_test_with_config(
+            LayoutManager::new_for_test_with_worksets(),
+            |config| config.settings.experimental.worksets.enable = true,
+        );
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let wid = WindowId::new(1, 1);

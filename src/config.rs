@@ -239,6 +239,21 @@ pub struct Experimental {
     pub status_icon: StatusIconExperimental,
     #[derive_args(ScrollConfigPartial)]
     pub scroll: ScrollConfig,
+    #[derive_args(WorksetsConfigPartial)]
+    pub worksets: WorksetsConfig,
+}
+
+#[derive(PartialConfig!)]
+#[derive_args(WorksetsConfigPartial)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WorksetsConfig {
+    /// Enable Worksets and the commands that select them.
+    ///
+    /// When disabled, every Space keeps the single layout it would have had
+    /// without the feature: Workset commands are ignored, the `workset` field
+    /// on a window rule does not route, and the status menu lists nothing.
+    pub enable: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]

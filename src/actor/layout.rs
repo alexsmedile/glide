@@ -301,6 +301,8 @@ pub struct LayoutManager {
     #[serde(skip)]
     scroll_enabled: bool,
     #[serde(skip)]
+    worksets_enabled: bool,
+    #[serde(skip)]
     window_rules: Vec<WindowRule>,
     /// Rule inputs for each tracked window, kept so a Workset can be
     /// recomputed later. Rules are matched when a window appears, but
@@ -460,6 +462,7 @@ impl LayoutManager {
             default_layout_kind: LayoutKind::default(),
             scroll_cfg: Config::default().settings.experimental.scroll.validated(),
             scroll_enabled: false,
+            worksets_enabled: false,
             window_rules: Vec::new(),
             window_info: Default::default(),
             interactive_resize: None,
@@ -474,6 +477,7 @@ impl LayoutManager {
         self.config = config.clone();
         self.scroll_cfg = config.settings.experimental.scroll.clone().validated();
         self.scroll_enabled = self.scroll_cfg.enable;
+        self.worksets_enabled = config.settings.experimental.worksets.enable;
         self.window_rules = config.window_rules.clone();
         self.default_layout_kind = match (self.scroll_enabled, config.settings.default_layout_kind)
         {
@@ -487,6 +491,43 @@ impl LayoutManager {
         };
         if !self.scroll_enabled {
             self.convert_active_scroll_layouts_to_tree();
+        }
+        if !self.worksets_enabled {
+            self.dissolve_worksets();
+        }
+    }
+
+    /// Folds every Workset back into one layout per Space.
+    ///
+    /// Worksets survive a restart, so disabling the feature has to deal with
+    /// state that already exists: windows parked in an inactive Workset would
+    /// otherwise stay suppressed with no command left to reach them. Their
+    /// windows move into the active layout and the names are dropped, which
+    /// also lets the empty layouts be garbage collected.
+    fn dissolve_worksets(&mut self) {
+        for space in self.layout_mapping.keys().copied().collect::<Vec<_>>() {
+            let Some(mapping) = self.layout_mapping.get(&space) else {
+                continue;
+            };
+            if mapping.layouts().all(|l| mapping.workset_name(l).is_none()) {
+                continue;
+            }
+            let active = mapping.active_layout();
+            let others: Vec<LayoutId> = mapping.layouts().filter(|&l| l != active).collect();
+            let existing: HashSet<WindowId> =
+                self.tree.visible_windows_under(self.tree.root(active)).into_iter().collect();
+            let mut seen = existing.clone();
+            for layout in others {
+                for wid in self.tree.visible_windows_under(self.tree.root(layout)) {
+                    self.tree.remove_window_from(layout, wid);
+                    if seen.insert(wid) {
+                        self.tree.add_window_after(active, self.tree.selection(active), wid);
+                    }
+                }
+            }
+            if let Some(mapping) = self.layout_mapping.get_mut(&space) {
+                mapping.clear_workset_names();
+            }
         }
     }
 
@@ -727,7 +768,10 @@ impl LayoutManager {
                     .entry(wid)
                     .or_insert(FloatingRestoreFrame { frame: info.frame });
                 self.window_info.insert(wid, info.clone());
-                let routed = workset_for_window(&self.window_rules, &info);
+                let routed = self
+                    .worksets_enabled
+                    .then(|| workset_for_window(&self.window_rules, &info))
+                    .flatten();
                 match classify_window(&self.window_rules, &info) {
                     WindowClass::FloatByDefault => self.add_floating_window(wid, Some(space)),
                     WindowClass::Regular => {
@@ -915,6 +959,20 @@ impl LayoutManager {
             )
         {
             warn!("Ignoring {command:?} because scroll layout is disabled");
+            return EventResponse::default();
+        }
+
+        if !self.worksets_enabled
+            && matches!(
+                command,
+                LayoutCommand::NewWorkset
+                    | LayoutCommand::Workset(_)
+                    | LayoutCommand::MoveToNextWorkset
+                    | LayoutCommand::NextWorkset
+                    | LayoutCommand::PrevWorkset
+            )
+        {
+            warn!("Ignoring {command:?} because worksets are disabled");
             return EventResponse::default();
         }
 
@@ -2216,6 +2274,9 @@ impl LayoutManager {
         space: SpaceId,
         windows: impl IntoIterator<Item = WindowId>,
     ) {
+        if !self.worksets_enabled {
+            return;
+        }
         let routed: Vec<(WindowId, String)> = windows
             .into_iter()
             .filter(|wid| !self.floating_windows.contains(wid))
@@ -2285,6 +2346,9 @@ impl LayoutManager {
     /// Windows whose rules name no Workset are left where the user put them,
     /// so hand-placed windows survive a balance.
     fn reapply_window_rules(&mut self, space: SpaceId) -> bool {
+        if !self.worksets_enabled {
+            return false;
+        }
         let Some(mapping) = self.layout_mapping.get(&space) else {
             return false;
         };
@@ -2328,6 +2392,9 @@ impl LayoutManager {
 
     /// The name of the Workset currently active in this Space.
     pub fn active_workset_name(&self, space: SpaceId) -> Option<&str> {
+        if !self.worksets_enabled {
+            return None;
+        }
         let mapping = self.layout_mapping.get(&space)?;
         mapping.workset_name(mapping.active_layout())
     }
@@ -2350,6 +2417,9 @@ impl LayoutManager {
     /// activated. Only Worksets holding windows count: an empty one left
     /// behind on another Space would shadow the real one.
     pub fn space_of_workset(&self, name: &str) -> Option<SpaceId> {
+        if !self.worksets_enabled {
+            return None;
+        }
         self.layout_mapping.iter().find_map(|(&space, mapping)| {
             let layout = mapping.workset_by_name(name)?;
             let populated = !self.tree.visible_windows_under(self.tree.root(layout)).is_empty();
@@ -2359,8 +2429,9 @@ impl LayoutManager {
 
     /// The names of this Space's Worksets, in creation order.
     pub fn workset_names(&self, space: SpaceId) -> impl Iterator<Item = &str> {
-        self.layout_mapping
-            .get(&space)
+        self.worksets_enabled
+            .then_some(&self.layout_mapping)
+            .and_then(|mapping| mapping.get(&space))
             .into_iter()
             .flat_map(|mapping| mapping.layouts().filter_map(|l| mapping.workset_name(l)))
     }
@@ -2392,6 +2463,9 @@ impl LayoutManager {
     /// rather than per Workset, so a floating window belongs to every Workset
     /// in the Space and must stay visible across a switch.
     pub fn inactive_workset_windows(&self, space: SpaceId) -> Vec<WindowId> {
+        if !self.worksets_enabled {
+            return Vec::new();
+        }
         let Some(mapping) = self.layout_mapping.get(&space) else {
             return Vec::new();
         };
@@ -2532,6 +2606,16 @@ fn detect_edges(point: CGPoint, frame: CGRect) -> ResizeEdge {
 impl LayoutManager {
     pub(crate) fn new_for_test() -> Self {
         Self::new(default_config())
+    }
+
+    /// A manager with Worksets enabled, for tests that exercise them.
+    pub(crate) fn new_for_test_with_worksets() -> Self {
+        let mut config = Config::default();
+        config.settings.experimental.worksets.enable = true;
+        let config = Arc::new(config);
+        let mut mgr = Self::new(config.clone());
+        mgr.set_config(&config);
+        mgr
     }
 }
 
@@ -4345,7 +4429,7 @@ mod tests {
     fn inactive_workset_windows_reports_other_layouts() {
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         let space = SpaceId::new(1);
         let pid = 1;
         _ = mgr.handle_event(SpaceExposed(space, rect(0, 0, 500, 300).size));
@@ -4380,7 +4464,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         let space = SpaceId::new(1);
         let pid = 1;
         _ = mgr.handle_event(SpaceExposed(space, rect(0, 0, 500, 300).size));
@@ -4415,7 +4499,7 @@ mod tests {
 
         // Reproduces the reported flow: two tiled windows, create an empty
         // Workset, go back, then send the focused window across.
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         let space = SpaceId::new(1);
         let pid = 1;
         _ = mgr.handle_event(SpaceExposed(space, rect(0, 0, 500, 300).size));
@@ -4442,7 +4526,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         let space = SpaceId::new(1);
         let pid = 1;
         _ = mgr.handle_event(SpaceExposed(space, rect(0, 0, 500, 300).size));
@@ -4473,7 +4557,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         let space = SpaceId::new(1);
         let pid = 1;
         _ = mgr.handle_event(SpaceExposed(space, rect(0, 0, 500, 300).size));
@@ -4493,7 +4577,7 @@ mod tests {
     fn window_rules_route_new_windows_to_their_workset() {
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         mgr.window_rules = vec![WindowRule {
             conditions: WindowRuleConditions {
                 app_id: Some("com.mitchellh.ghostty".into()),
@@ -4533,7 +4617,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         mgr.window_rules = vec![WindowRule {
             conditions: WindowRuleConditions {
                 app_id: Some("com.mitchellh.ghostty".into()),
@@ -4573,7 +4657,7 @@ mod tests {
     fn window_rules_route_already_running_apps_to_their_workset() {
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         mgr.window_rules = vec![WindowRule {
             conditions: WindowRuleConditions {
                 app_id: Some("com.mitchellh.ghostty".into()),
@@ -4610,7 +4694,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         mgr.window_rules = vec![WindowRule {
             conditions: WindowRuleConditions {
                 app_id: Some("com.mitchellh.ghostty".into()),
@@ -4650,7 +4734,7 @@ mod tests {
     fn routing_every_window_away_does_not_empty_the_active_workset() {
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         mgr.window_rules = vec![WindowRule {
             conditions: WindowRuleConditions {
                 app_id: Some("com.mitchellh.ghostty".into()),
@@ -4685,7 +4769,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         mgr.window_rules = vec![
             WindowRule {
                 conditions: WindowRuleConditions {
@@ -4741,7 +4825,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         let home = SpaceId::new(1);
         let elsewhere = SpaceId::new(2);
         let pid = 1;
@@ -4765,7 +4849,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         let two = SpaceId::new(1);
         let three = SpaceId::new(2);
         let pid = 1;
@@ -4811,7 +4895,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         let space = SpaceId::new(1);
         _ = mgr.handle_event(SpaceExposed(space, rect(0, 0, 500, 300).size));
 
@@ -4836,7 +4920,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         let space = SpaceId::new(1);
         let pid = 1;
         _ = mgr.handle_event(SpaceExposed(space, rect(0, 0, 500, 300).size));
@@ -4921,7 +5005,7 @@ mod tests {
         use LayoutCommand::*;
         use LayoutEvent::*;
 
-        let mut mgr = LayoutManager::new_for_test();
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
         let space = SpaceId::new(1);
         let pid = 1;
         _ = mgr.handle_event(SpaceExposed(space, rect(0, 0, 500, 300).size));
@@ -5267,6 +5351,109 @@ mod tests {
                 (window, rect(450, 0, 450, 600)),
             ]
         );
+    }
+
+    #[test]
+    fn worksets_disabled_ignores_commands_and_rule_routing() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.window_rules = vec![WindowRule {
+            conditions: WindowRuleConditions {
+                app_id: Some("com.example.app".parse().unwrap()),
+                ..Default::default()
+            },
+            float: false,
+            workset: Some("agents".to_owned()),
+            suppress: SuppressMode::default(),
+        }];
+        let space = SpaceId::new(1);
+        let pid = 1;
+        _ = mgr.handle_event(SpaceExposed(space, rect(0, 0, 500, 300).size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, make_windows(pid, 2)));
+        let first = mgr.layout_mapping[&space].active_layout();
+
+        // A rule naming a Workset does not route, so the Space keeps one layout.
+        assert_eq!(mgr.layout_mapping[&space].layouts().len(), 1);
+
+        // The commands are ignored rather than creating or selecting anything.
+        for command in [
+            NewWorkset,
+            Workset("agents".to_owned()),
+            NextWorkset,
+            PrevWorkset,
+            MoveToNextWorkset,
+        ] {
+            let response = mgr.handle_command(Some(space), &[space], command);
+            assert_eq!(response.focus_window, None);
+            assert!(response.raise_windows.is_empty());
+        }
+        assert_eq!(mgr.layout_mapping[&space].layouts().len(), 1);
+        assert_eq!(mgr.layout_mapping[&space].active_layout(), first);
+
+        // A new window matching the rule joins the active layout rather than
+        // creating a Workset for it.
+        let term = WindowId::new(pid, 9);
+        let mut info = win_info();
+        info.bundle_id = Some("com.example.app".into());
+        _ = mgr.handle_event(WindowAdded(space, term, info));
+        assert_eq!(mgr.layout_mapping[&space].layouts().len(), 1);
+        assert!(mgr.tree.window_node(first, term).is_some());
+        assert_eq!(mgr.layout_mapping[&space].workset_by_name("agents"), None);
+
+        // Reapplying rules does not route it out either.
+        assert!(!mgr.reapply_window_rules(space));
+        assert!(mgr.tree.window_node(first, term).is_some());
+
+        // Nothing is suppressed and the status menu has nothing to list.
+        assert!(mgr.inactive_workset_windows(space).is_empty());
+        assert_eq!(mgr.workset_names(space).count(), 0);
+        assert_eq!(mgr.active_workset_name(space), None);
+        assert_eq!(mgr.space_of_workset("agents"), None);
+    }
+
+    #[test]
+    fn disabling_worksets_folds_existing_ones_into_one_layout() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+
+        // Worksets survive a restart, so disabling has to reclaim windows
+        // parked in a Workset no command can reach any more.
+        let mut mgr = LayoutManager::new_for_test_with_worksets();
+        let space = SpaceId::new(1);
+        let pid = 1;
+        _ = mgr.handle_event(SpaceExposed(space, rect(0, 0, 500, 300).size));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, make_windows(pid, 2)));
+        let first = mgr.layout_mapping[&space].active_layout();
+        _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, 1)));
+
+        // Create a second Workset and land on it.
+        _ = mgr.handle_command(Some(space), &[space], Workset("agents".to_owned()));
+        let agents = mgr.layout_mapping[&space].active_layout();
+        assert_ne!(agents, first);
+        assert!(mgr.layout_mapping[&space].layouts().len() >= 2);
+
+        // Disabling folds every Workset into the active layout.
+        let mut config = Config::default();
+        config.settings.experimental.worksets.enable = false;
+        mgr.set_config(&Arc::new(config));
+
+        let mapping = &mgr.layout_mapping[&space];
+        assert_eq!(mapping.workset_by_name("agents"), None);
+        assert_eq!(mapping.workset_names_len_for_test(), 0);
+
+        // Every window that existed is reachable in the active layout, so
+        // nothing is left suppressed with no way back.
+        let active = mapping.active_layout();
+        let visible = mgr.tree.visible_windows_under(mgr.tree.root(active));
+        for wid in [WindowId::new(pid, 1), WindowId::new(pid, 2)] {
+            assert!(
+                visible.contains(&wid),
+                "{wid:?} was stranded by disabling worksets"
+            );
+        }
+        assert!(mgr.inactive_workset_windows(space).is_empty());
     }
 
     #[test]

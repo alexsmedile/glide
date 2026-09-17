@@ -272,6 +272,20 @@ status_icon.color = false
 # Ignored; kept for compatibility.
 status_icon.enable = true
 
+# Worksets: switchable window environments inside one Space.
+#
+# When disabled, each Space behaves as it did before Worksets existed: the
+# workset commands are ignored, the `workset` field on a window rule does not
+# route windows, and the status menu lists no Worksets.
+#
+# Workset commands are intentionally not bound by default. After enabling,
+# add explicit keybindings in your personal config under [keys], for example:
+#
+# "Alt + Backquote" = "next_workset"
+# "Alt + Shift + Backquote" = "prev_workset"
+# "Alt + A" = { workset = { name = "agents" } }
+worksets.enable = false
+
 # Scroll layout settings.
 
 # Enable the experimental scroll/niri layout and related commands.

@@ -21,9 +21,21 @@ use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScree
 
 impl Reactor {
     pub fn new_for_test(layout: LayoutManager) -> Reactor {
+        Self::new_for_test_with_config(layout, |_| {})
+    }
+
+    /// A test Reactor whose config is adjusted before it is applied.
+    ///
+    /// `Reactor::new` pushes its own config into the LayoutManager, so a
+    /// setting the test needs has to be set here rather than on the manager.
+    pub fn new_for_test_with_config(
+        layout: LayoutManager,
+        adjust: impl FnOnce(&mut Config),
+    ) -> Reactor {
         let mut config = Config::default();
         config.settings.default_disable = false;
         config.settings.animate = false;
+        adjust(&mut config);
         let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
         let (group_indicators_tx, _) = crate::actor::channel();
         Reactor::new(Arc::new(config), layout, record, group_indicators_tx)
