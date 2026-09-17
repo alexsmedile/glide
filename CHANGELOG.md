@@ -1,5 +1,20 @@
 # Changelog
 
+## Fork v0.2.15 r7 (2026-09-17)
+
+### Features
+
+* Add `settings.experimental.worksets.enable`, so Worksets and their commands, routing, suppression, and status menu can be turned off entirely. Disabling folds existing Worksets back into one layout per Space so no window is left parked out of reach.
+* Let a binding, a window rule, or `managed_desktops` name the display a desktop is on, so the same key reaches the same Workset whether or not an external display is attached. `when_missing` chooses between parking the Workset and falling back to the built-in display.
+* Let a `workset` window rule name the desktop its Workset lives on, so one name no longer means a different Workset on each Space.
+
+### Bug Fixes
+
+* Number desktops the way Mission Control does, skipping the spaces fullscreen and Split View apps occupy. A fullscreen window no longer shifts every desktop after it.
+* Number the active desktop within its own display, so the status icon and a binding agree on what "Desktop 2" means.
+* Apply the missing-display fallback only when the display is absent, not when a connected display has no such desktop.
+* Activate a Workset directly when its Space is already visible on another display, instead of sending a native Space shortcut to the focused one.
+
 ## Fork v0.2.15 r6 (2026-09-16)
 
 ### Bug Fixes

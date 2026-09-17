@@ -24,6 +24,7 @@ workflow.
 
 | Release | Upstream base | Contents |
 |---|---|---|
+| `fork-v0.2.15-r7` | `v0.2.15` | Worksets behind an opt-in flag, desktop numbering that matches Mission Control, and display-aware desktops for bindings, window rules, and managed spaces. |
 | `fork-v0.2.15-r6` | `v0.2.15` | Deterministic complete Workset activation across applications, remembered-focus restoration, and verified retry of incomplete window layers. |
 | `fork-v0.2.15-r5` | `v0.2.15` | Named per-Space Worksets, native Space handoff, Workset HUD and routing, reliable group activation, and transient-window crash/flicker fixes. |
 | `fork-v0.2.15-r4` | `v0.2.15` | Fullscreen gap handling for single-window layouts. |
