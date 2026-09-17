@@ -17,7 +17,8 @@ use tracing::{debug, error, warn};
 use crate::actor::app::{WindowId, pid_t};
 use crate::collections::{BTreeExt, BTreeSet, HashMap, HashSet};
 use crate::config::{
-    Config, NewWindowPlacement, ScrollConfig, SuppressMode, WindowRule, WindowRuleConditions,
+    Config, DesktopSelector, NewWindowPlacement, ScrollConfig, SuppressMode, WindowRule,
+    WindowRuleConditions,
 };
 use crate::model::scroll_viewport::ViewportState;
 use crate::model::{
@@ -25,7 +26,7 @@ use crate::model::{
     SpaceLayoutMapping,
 };
 use crate::sys::geometry::{CGRectDef, CGRectExt, CGSizeExt};
-use crate::sys::screen::SpaceId;
+use crate::sys::screen::{DesktopLookup, SpaceId, space_on_display, space_with_number};
 
 #[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -357,10 +358,50 @@ fn window_rule_matches(conditions: &WindowRuleConditions, info: &LayoutWindowInf
 
 /// The Workset a window belongs to, from the first matching user rule.
 pub fn workset_for_window(rules: &[WindowRule], info: &LayoutWindowInfo) -> Option<String> {
-    rules
-        .iter()
-        .find(|rule| window_rule_matches(&rule.conditions, info))
-        .and_then(|rule| rule.workset.clone())
+    matching_workset_rule(rules, info).map(|(name, _)| name)
+}
+
+/// The Space a window rule's desktop names.
+///
+/// A selector without a display is a position on the display the window's
+/// Space is already on, because a rule describes where a window belongs
+/// rather than where the user happens to be looking.
+fn space_for_rule(selector: &DesktopSelector, opened_on: SpaceId) -> Option<SpaceId> {
+    match &selector.display {
+        Some(display) => match space_on_display(display, selector.desktop) {
+            DesktopLookup::Found(space) => Some(space),
+            _ => None,
+        },
+        None => space_with_number(selector.desktop, opened_on),
+    }
+}
+
+/// Whether a rule that names a desktop applies on this Space.
+///
+/// Placing a window on a Space it did not open on needs system access the
+/// LayoutManager does not have, so a rule naming another desktop is skipped
+/// rather than silently creating a second Workset of the same name here.
+pub fn rule_applies_on_space(
+    on: Option<&DesktopSelector>,
+    space: SpaceId,
+    resolve: impl Fn(&DesktopSelector) -> Option<SpaceId>,
+) -> bool {
+    let Some(on) = on else {
+        return true;
+    };
+    resolve(on) == Some(space)
+}
+
+/// The Workset a window belongs to, with the desktop its rule names.
+///
+/// The desktop is returned rather than applied here: this is the pure part,
+/// and placing a window on another Space needs system access the Reactor has.
+pub fn matching_workset_rule(
+    rules: &[WindowRule],
+    info: &LayoutWindowInfo,
+) -> Option<(String, Option<DesktopSelector>)> {
+    let rule = rules.iter().find(|rule| window_rule_matches(&rule.conditions, info))?;
+    Some((rule.workset.clone()?, rule.on.clone()))
 }
 
 /// The suppression mode for a window, from the first matching user rule.
@@ -770,7 +811,7 @@ impl LayoutManager {
                 self.window_info.insert(wid, info.clone());
                 let routed = self
                     .worksets_enabled
-                    .then(|| workset_for_window(&self.window_rules, &info))
+                    .then(|| self.workset_for_window_on(space, &info))
                     .flatten();
                 match classify_window(&self.window_rules, &info) {
                     WindowClass::FloatByDefault => self.add_floating_window(wid, Some(space)),
@@ -2282,7 +2323,7 @@ impl LayoutManager {
             .filter(|wid| !self.floating_windows.contains(wid))
             .filter_map(|wid| {
                 let info = self.window_info.get(&wid)?;
-                Some((wid, workset_for_window(&self.window_rules, info)?))
+                Some((wid, self.workset_for_window_on(space, info)?))
             })
             .collect();
         let mut moved_to = None;
@@ -2319,6 +2360,24 @@ impl LayoutManager {
         {
             mapping.select_layout(target);
         }
+    }
+
+    /// The Workset a window's rule names, when that rule applies on this Space.
+    ///
+    /// A rule that names another desktop is skipped: moving the window there
+    /// is not implemented, and creating the Workset here would give the same
+    /// name two meanings.
+    fn workset_for_window_on(&self, space: SpaceId, info: &LayoutWindowInfo) -> Option<String> {
+        let (name, on) = matching_workset_rule(&self.window_rules, info)?;
+        if !rule_applies_on_space(on.as_ref(), space, |selector| space_for_rule(selector, space)) {
+            debug!(
+                ?on,
+                workset = name,
+                "Skipping rule: window is not on its desktop"
+            );
+            return None;
+        }
+        Some(name)
     }
 
     /// The layout for a named Workset in this Space, creating it if needed.
@@ -2361,7 +2420,7 @@ impl LayoutManager {
             if !layouts.iter().any(|&l| self.tree.window_node(l, wid).is_some()) {
                 continue;
             }
-            let Some(name) = workset_for_window(&self.window_rules, info) else {
+            let Some(name) = self.workset_for_window_on(space, info) else {
                 continue;
             };
             moves.push((wid, name));
@@ -2674,6 +2733,7 @@ mod tests {
             },
             float: true,
             workset: None,
+            on: None,
             suppress: SuppressMode::Order,
         }];
 
@@ -2696,6 +2756,7 @@ mod tests {
                 },
                 float: true,
                 workset: None,
+                on: None,
                 suppress: SuppressMode::Order,
             },
             WindowRule {
@@ -2705,6 +2766,7 @@ mod tests {
                 },
                 float: false,
                 workset: None,
+                on: None,
                 suppress: SuppressMode::Order,
             },
         ];
@@ -2730,6 +2792,7 @@ mod tests {
             },
             float: true,
             workset: None,
+            on: None,
             suppress: SuppressMode::Order,
         }];
 
@@ -2758,6 +2821,7 @@ mod tests {
             },
             float: true,
             workset: None,
+            on: None,
             suppress: SuppressMode::Order,
         }];
 
@@ -2781,6 +2845,7 @@ mod tests {
             },
             float: true,
             workset: None,
+            on: None,
             suppress: SuppressMode::Order,
         }];
         let mut info = win_info();
@@ -2798,6 +2863,7 @@ mod tests {
             },
             float: false,
             workset: None,
+            on: None,
             suppress: SuppressMode::Order,
         }];
         let mut info = win_info();
@@ -2812,6 +2878,7 @@ mod tests {
             },
             float: false,
             workset: None,
+            on: None,
             suppress: SuppressMode::Order,
         }];
         let mut info = win_info();
@@ -2826,6 +2893,7 @@ mod tests {
             conditions: WindowRuleConditions::default(),
             float: true,
             workset: None,
+            on: None,
             suppress: SuppressMode::Order,
         }];
         let mut info = win_info();
@@ -2842,6 +2910,7 @@ mod tests {
             },
             float: false,
             workset: Some("browser".into()),
+            on: None,
             suppress: SuppressMode::Order,
         }];
         let mut info = win_info();
@@ -4585,6 +4654,7 @@ mod tests {
             },
             float: false,
             workset: Some("terminal".into()),
+            on: None,
             suppress: SuppressMode::Order,
         }];
 
@@ -4625,6 +4695,7 @@ mod tests {
             },
             float: false,
             workset: Some("terminal".into()),
+            on: None,
             suppress: SuppressMode::Order,
         }];
 
@@ -4665,6 +4736,7 @@ mod tests {
             },
             float: false,
             workset: Some("terminal".into()),
+            on: None,
             suppress: SuppressMode::Offscreen,
         }];
 
@@ -4702,6 +4774,7 @@ mod tests {
             },
             float: false,
             workset: Some("terminal".into()),
+            on: None,
             suppress: SuppressMode::Order,
         }];
 
@@ -4742,6 +4815,7 @@ mod tests {
             },
             float: false,
             workset: Some("terminal".into()),
+            on: None,
             suppress: SuppressMode::Offscreen,
         }];
 
@@ -4778,6 +4852,7 @@ mod tests {
                 },
                 float: false,
                 workset: Some("terminal".into()),
+                on: None,
                 suppress: SuppressMode::Offscreen,
             },
             WindowRule {
@@ -4787,6 +4862,7 @@ mod tests {
                 },
                 float: false,
                 workset: Some("agents".into()),
+                on: None,
                 suppress: SuppressMode::Offscreen,
             },
         ];
@@ -5354,6 +5430,24 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_naming_a_desktop_applies_only_there() {
+        let here = SpaceId::new(1);
+        let there = SpaceId::new(2);
+        let selector = DesktopSelector::focused(3);
+
+        // No desktop named: the rule applies wherever the window opens.
+        assert!(rule_applies_on_space(None, here, |_| unreachable!()));
+
+        // Named: only on the Space that number resolves to.
+        assert!(rule_applies_on_space(Some(&selector), here, |_| Some(here)));
+        assert!(!rule_applies_on_space(Some(&selector), here, |_| Some(there)));
+
+        // A desktop that does not resolve, such as one on an unplugged
+        // display, matches nothing rather than falling back to here.
+        assert!(!rule_applies_on_space(Some(&selector), here, |_| None));
+    }
+
+    #[test]
     fn worksets_disabled_ignores_commands_and_rule_routing() {
         use LayoutCommand::*;
         use LayoutEvent::*;
@@ -5366,6 +5460,7 @@ mod tests {
             },
             float: false,
             workset: Some("agents".to_owned()),
+            on: None,
             suppress: SuppressMode::default(),
         }];
         let space = SpaceId::new(1);

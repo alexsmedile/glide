@@ -189,6 +189,14 @@ pub struct WindowRule {
     /// happens to be active, creating it if necessary.
     #[serde(default)]
     pub workset: Option<String>,
+    /// The desktop matching windows belong on.
+    ///
+    /// Without this, a `workset` rule places the window in that Workset of
+    /// whichever Space the window opened on, so the same name can end up
+    /// naming a different Workset on each Space. Naming a desktop makes the
+    /// rule mean one place.
+    #[serde(default, flatten)]
+    pub on: Option<DesktopSelector>,
     /// How to suppress matching windows when their Workset is inactive.
     ///
     /// Defaults to ordering the window below the active Workset, which is the
@@ -663,6 +671,7 @@ mod tests {
                     },
                     float: true,
                     workset: None,
+                    on: None,
                     suppress: SuppressMode::Order,
                 },
                 WindowRule {
@@ -673,6 +682,7 @@ mod tests {
                     },
                     float: true,
                     workset: None,
+                    on: None,
                     suppress: SuppressMode::Order,
                 },
             ]
@@ -699,6 +709,7 @@ mod tests {
                 },
                 float: true,
                 workset: None,
+                on: None,
                 suppress: SuppressMode::Order,
             }]
         );

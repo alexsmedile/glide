@@ -355,6 +355,23 @@ scroll.single_column_aspect_ratio = ""
 #
 # Action:
 #   float           - true to float matching windows, false to tile them
+#   workset         - the Workset matching windows belong to
+#   display/desktop - the desktop that Workset lives on (see below)
+#
+# A `workset` rule without a desktop places the window in that Workset of
+# whichever Space it opened on, so the same name can mean a different Workset
+# on each Space. Naming a desktop makes the rule mean one place:
+#
+#   [[window_rules]]
+#   if.app_id = "com.apple.Safari"
+#   float = false
+#   workset = "browser"
+#   display = "builtin"
+#   desktop = 3
+#
+# The rule then applies only on that desktop. A matching window that opens
+# somewhere else is left where it is, because moving a window to another Space
+# is not implemented yet.
 #
 # Example:
 #   [[window_rules]]
