@@ -13,8 +13,10 @@ use tracing::{debug, info, instrument, warn};
 use crate::actor::wm_controller::WmEvent;
 use crate::actor::{group_bars, mouse, reactor, status, window_server, wm_controller};
 use crate::collections::HashSet;
-use crate::config::Config;
-use crate::sys::screen::{CoordinateConverter, ScreenId, SpaceId, space_with_number};
+use crate::config::{Config, DesktopSelector, DesktopSelectorOrNumber, WhenDisplayMissing};
+use crate::sys::screen::{
+    CoordinateConverter, DisplaySelector, ScreenId, SpaceId, space_on_display, space_with_number,
+};
 use crate::sys::window_server::WindowsOnScreen;
 
 #[derive(Debug)]
@@ -46,7 +48,7 @@ pub enum Event {
     /// Activate a named Workset on a native Space, switching Spaces first if
     /// necessary.
     WorksetOnSpace {
-        desktop: usize,
+        desktop: DesktopSelector,
         name: String,
     },
     ReactorCommand(reactor::Command),
@@ -225,18 +227,18 @@ impl SpaceManager {
             }
             Event::WorksetOnSpace { desktop, name } => {
                 if !self.worksets_enabled() {
-                    warn!(
-                        desktop,
-                        workset = name,
-                        "Ignoring Workset binding: worksets disabled"
-                    );
+                    warn!(workset = name, "Ignoring Workset binding: worksets disabled");
                     return;
                 }
-                let Some(target) = self.target_space(desktop) else {
-                    warn!(desktop, workset = name, "Could not resolve Workset Space");
+                let Some(target) = self.selected_space(&desktop) else {
+                    warn!(
+                        ?desktop,
+                        workset = name,
+                        "Could not resolve Workset Space; is its display connected?"
+                    );
                     return;
                 };
-                self.workset_on_space(desktop, target, name);
+                self.workset_on_space(desktop.desktop, target, name);
             }
             Event::ReactorCommand(cmd) => {
                 self.reactor_tx.send(reactor::Event::Command(cmd));
@@ -307,7 +309,13 @@ impl SpaceManager {
     /// launch.
     fn is_configured_desktop(&self, space: SpaceId) -> bool {
         let wanted = &self.config.settings.managed_desktops;
-        !wanted.is_empty() && wanted.iter().any(|&n| space_with_number(n, space) == Some(space))
+        !wanted.is_empty()
+            && wanted.iter().any(|DesktopSelectorOrNumber(selector)| match &selector.display {
+                // A bare number is a position on any display, so it is matched
+                // against the space's own display rather than the focused one.
+                None => space_with_number(selector.desktop, space) == Some(space),
+                Some(display) => space_on_display(display, selector.desktop) == Some(space),
+            })
     }
 
     fn toggle_space(&mut self, space: SpaceId) {
@@ -354,6 +362,23 @@ impl SpaceManager {
     fn target_space(&self, desktop: usize) -> Option<SpaceId> {
         let current = self.focused_space()?;
         space_with_number(desktop, current)
+    }
+
+    /// The Space a selector names, or `None` when it names a display that is
+    /// not connected and the config says to park rather than fall back.
+    fn selected_space(&self, selector: &DesktopSelector) -> Option<SpaceId> {
+        let Some(display) = &selector.display else {
+            return self.target_space(selector.desktop);
+        };
+        if let Some(space) = space_on_display(display, selector.desktop) {
+            return Some(space);
+        }
+        match selector.when_missing {
+            WhenDisplayMissing::Park => None,
+            WhenDisplayMissing::FallBackToBuiltin => {
+                space_on_display(&DisplaySelector::Builtin, selector.desktop)
+            }
+        }
     }
 
     fn worksets_enabled(&self) -> bool {

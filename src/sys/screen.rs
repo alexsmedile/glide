@@ -6,6 +6,7 @@ use std::ffi::c_int;
 use std::mem::MaybeUninit;
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
+use std::str::FromStr;
 
 use bitflags::bitflags;
 use objc2::rc::Retained;
@@ -13,7 +14,7 @@ use objc2::{ClassType, msg_send};
 use objc2_app_kit::NSScreen;
 use objc2_core_foundation::{CFArray, CFRetained, CFString, CGPoint, CGRect};
 use objc2_core_graphics::{CGDisplayBounds, CGError, CGGetActiveDisplayList};
-use objc2_foundation::{MainThreadMarker, NSArray, NSDictionary, NSNumber, ns_string};
+use objc2_foundation::{MainThreadMarker, NSArray, NSDictionary, NSNumber, NSString, ns_string};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -288,9 +289,9 @@ impl NSScreenExt for NSScreen {
 /// second space *of one display*, matching what Mission Control shows. A
 /// space number is only meaningful together with a display.
 fn spaces_of_display(on_display: SpaceId) -> Option<Vec<SpaceId>> {
-    for ids in displays_with_user_spaces()? {
-        if ids.contains(&on_display) {
-            return Some(ids);
+    for display in displays_with_user_spaces()? {
+        if display.spaces.contains(&on_display) {
+            return Some(display.spaces);
         }
     }
     None
@@ -317,7 +318,7 @@ fn is_user_space(ty: Option<i64>) -> bool {
 /// the native Desktop shortcut. Counting them here would shift every desktop
 /// number after the fullscreen window for as long as it stays fullscreen, so
 /// they are filtered out and only `type == 0` spaces are numbered.
-fn displays_with_user_spaces() -> Option<Vec<Vec<SpaceId>>> {
+fn displays_with_user_spaces() -> Option<Vec<DisplaySpaces>> {
     let cid = unsafe { CGSMainConnectionID() };
     let space_info = unsafe { Retained::from_raw(CGSCopyManagedDisplaySpaces(cid))? };
     let mut displays = Vec::new();
@@ -325,6 +326,10 @@ fn displays_with_user_spaces() -> Option<Vec<Vec<SpaceId>>> {
         let Ok(screen) = screen.downcast::<NSDictionary>() else {
             continue;
         };
+        let identifier = screen
+            .valueForKey(ns_string!("Display Identifier"))
+            .and_then(|id| id.downcast::<NSString>().ok())
+            .map(|id| id.to_string());
         let Some(spaces) = screen
             .valueForKey(ns_string!("Spaces"))
             .and_then(|s| s.downcast::<NSArray>().ok())
@@ -345,9 +350,84 @@ fn displays_with_user_spaces() -> Option<Vec<Vec<SpaceId>>> {
                 is_user_space(ty).then_some(id)
             })
             .collect();
-        displays.push(ids);
+        displays.push(DisplaySpaces { identifier, spaces: ids });
     }
     Some(displays)
+}
+
+/// One display's user-facing desktops, with the identifier macOS knows it by.
+struct DisplaySpaces {
+    /// The window server's identifier for this display. A UUID for a real
+    /// display; `None` if macOS did not report one.
+    identifier: Option<String>,
+    spaces: Vec<SpaceId>,
+}
+
+/// Names a display in config.
+///
+/// Display ids are reassigned when a display is reconnected, so config names a
+/// display by the UUID the window server knows it by, or by `Builtin` for
+/// whichever display macOS treats as the main one.
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub enum DisplaySelector {
+    /// The display macOS reports at the origin, whatever it is currently
+    /// called. This is the built-in screen on a laptop.
+    Builtin,
+    /// A display by its window server UUID, matched case-insensitively.
+    Uuid(String),
+}
+
+impl FromStr for DisplaySelector {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "builtin" | "main" | "primary" => DisplaySelector::Builtin,
+            _ => DisplaySelector::Uuid(s.to_owned()),
+        })
+    }
+}
+
+/// Deserialized from a plain string, so config writes `display = "builtin"` or
+/// a UUID rather than a tagged table.
+impl<'de> Deserialize<'de> for DisplaySelector {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(name.parse().expect("parsing a display selector cannot fail"))
+    }
+}
+
+impl Serialize for DisplaySelector {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            DisplaySelector::Builtin => serializer.serialize_str("builtin"),
+            DisplaySelector::Uuid(uuid) => serializer.serialize_str(uuid),
+        }
+    }
+}
+
+/// The spaces of the display this selector names, in the order macOS presents
+/// them, or `None` when that display is not currently connected.
+pub fn spaces_of_selected_display(selector: &DisplaySelector) -> Option<Vec<SpaceId>> {
+    let displays = displays_with_user_spaces()?;
+    match selector {
+        // macOS lists the main display first, which `update_screen_config`
+        // relies on as well.
+        DisplaySelector::Builtin => displays.into_iter().next().map(|d| d.spaces),
+        DisplaySelector::Uuid(uuid) => displays
+            .into_iter()
+            .find(|d| d.identifier.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(uuid)))
+            .map(|d| d.spaces),
+    }
+}
+
+/// The space at a user-facing position on a named display.
+///
+/// Returns `None` when the display is disconnected or has no such desktop, so
+/// the caller can decide whether to fall back or to wait for the display.
+pub fn space_on_display(selector: &DisplaySelector, number: usize) -> Option<SpaceId> {
+    let spaces = spaces_of_selected_display(selector)?;
+    spaces.get(number.checked_sub(1)?).copied()
 }
 
 /// Returns the space at a user-facing position on the display that currently
@@ -373,8 +453,8 @@ pub fn space_with_number(number: usize, on_display: SpaceId) -> Option<SpaceId> 
 pub fn get_active_space_number() -> Option<usize> {
     let cid = unsafe { CGSMainConnectionID() };
     let active_id = NonZeroU64::new(unsafe { CGSGetActiveSpace(cid) }).map(SpaceId)?;
-    for ids in displays_with_user_spaces()? {
-        if let Some(index) = ids.iter().position(|&id| id == active_id) {
+    for display in displays_with_user_spaces()? {
+        if let Some(index) = display.spaces.iter().position(|&id| id == active_id) {
             return Some(index + 1);
         }
     }

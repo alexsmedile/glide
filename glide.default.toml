@@ -11,6 +11,17 @@ animate = true
 default_disable = true
 # Desktops managed from launch, by their Mission Control number. Empty means
 # each space is decided at runtime with alt-z.
+#
+# A bare number applies to that position on every display. To manage only one
+# display's desktops, name the display instead:
+#
+# managed_desktops = [
+#   { display = "builtin", desktop = 2 },
+#   { display = "84EFFBF0-1178-405C-9D64-3B574C1BE249", desktop = 1 },
+# ]
+#
+# `display` is "builtin" for the main screen, or the window server UUID of a
+# particular display. Run `glide` with RUST_LOG=debug to see the UUIDs.
 managed_desktops = []
 
 # Focus the window under the mouse as it moves.
@@ -284,6 +295,18 @@ status_icon.enable = true
 # "Alt + Backquote" = "next_workset"
 # "Alt + Shift + Backquote" = "prev_workset"
 # "Alt + A" = { workset = { name = "agents" } }
+#
+# A Workset binding follows focus by default, so `desktop = 3` means the third
+# desktop of whichever display is focused. Name a display to pin it there, so
+# the same key reaches the same Workset at home and at the office:
+#
+# "Alt + H" = { workset_on_space = { display = "builtin", desktop = 3, name = "home" } }
+# "Alt + O" = { workset_on_space = { display = "84EFFBF0-...", desktop = 1, name = "office", when_missing = "fall_back_to_builtin" } }
+#
+# `when_missing` decides what happens when that display is unplugged:
+#   "park"                  (default) do nothing, and keep the Workset intact
+#                           so it is reachable again on reconnect
+#   "fall_back_to_builtin"  use the same desktop number on the built-in display
 worksets.enable = false
 
 # Scroll layout settings.

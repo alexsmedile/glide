@@ -24,6 +24,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::actor::wm_controller::WmCommand;
 use crate::model::{LayoutKind, RootOrientation};
+use crate::sys::screen::DisplaySelector;
 
 pub fn data_dir() -> PathBuf {
     dirs::home_dir().unwrap().join(".glide")
@@ -96,8 +97,11 @@ pub struct Settings {
     /// Space ids are reassigned across reboots, so a restored session names
     /// desktops by position instead. Empty means "decide per space at
     /// runtime", which is `default_disable`'s behaviour.
+    ///
+    /// A bare number applies to that position on every display. Name a display
+    /// to manage only its desktops.
     #[serde(default)]
-    pub managed_desktops: Vec<usize>,
+    pub managed_desktops: Vec<DesktopSelectorOrNumber>,
     pub mouse_follows_focus: bool,
     pub mouse_hides_on_focus: bool,
     pub focus_follows_mouse: bool,
@@ -254,6 +258,84 @@ pub struct WorksetsConfig {
     /// without the feature: Workset commands are ignored, the `workset` field
     /// on a window rule does not route, and the status menu lists nothing.
     pub enable: bool,
+}
+
+/// Which desktop a command acts on.
+///
+/// A bare number means the desktop at that position on whichever display has
+/// focus, which is how the native Desktop shortcut behaves. Naming a display
+/// pins the command to that display instead, so the same binding reaches the
+/// same Workset whether an external display is attached or not.
+// No `deny_unknown_fields`: this is flattened into the commands that take a
+// desktop, and a flattened struct cannot tell its own keys from its host's.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
+pub struct DesktopSelector {
+    /// Position of the desktop, as Mission Control numbers it.
+    pub desktop: usize,
+    /// The display to count on. Omitted, the command follows focus, which is
+    /// how the native Desktop shortcut behaves.
+    #[serde(default)]
+    pub display: Option<DisplaySelector>,
+    /// What to do when the named display is not connected. Only meaningful
+    /// together with `display`.
+    #[serde(default)]
+    pub when_missing: WhenDisplayMissing,
+}
+
+impl DesktopSelector {
+    /// A selector for a position on whichever display has focus.
+    pub fn focused(desktop: usize) -> Self {
+        DesktopSelector {
+            desktop,
+            display: None,
+            when_missing: WhenDisplayMissing::default(),
+        }
+    }
+}
+
+/// Accepts a bare number as shorthand for a position on the focused display,
+/// so `managed_desktops = [2, 3]` keeps working alongside the display-aware
+/// table form.
+impl<'de> Deserialize<'de> for DesktopSelectorOrNumber {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Number(usize),
+            Table(DesktopSelector),
+        }
+        Ok(DesktopSelectorOrNumber(match Repr::deserialize(deserializer)? {
+            Repr::Number(n) => DesktopSelector::focused(n),
+            Repr::Table(selector) => selector,
+        }))
+    }
+}
+
+/// A [`DesktopSelector`] that also accepts a bare number in config.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct DesktopSelectorOrNumber(pub DesktopSelector);
+
+impl Serialize for DesktopSelectorOrNumber {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0.display.is_none() {
+            self.0.desktop.serialize(serializer)
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
+
+/// What a command does when the display it names is not connected.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WhenDisplayMissing {
+    /// Do nothing until the display comes back. The Workset keeps its windows
+    /// and is reachable again once the display is reconnected.
+    #[default]
+    Park,
+    /// Use the same desktop position on the built-in display instead, so the
+    /// Workset stays reachable on a laptop away from its external display.
+    FallBackToBuiltin,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
@@ -873,6 +955,8 @@ mod tests {
             "Alt + Digit2" = { space_or_workset = 2 }
             "Alt + A" = { workset_on_space = { desktop = 2, name = "agents" } }
             "Alt + T" = { workset_on_space = { desktop = 2, name = "terminal" } }
+            "Alt + H" = { workset_on_space = { display = "builtin", desktop = 3, name = "home" } }
+            "Alt + O" = { workset_on_space = { display = "84EFFBF0-1178-405C-9D64-3B574C1BE249", desktop = 1, name = "office", when_missing = "fall_back_to_builtin" } }
             "#,
         )
         .unwrap();
@@ -881,12 +965,39 @@ mod tests {
             command,
             WmCommand::Wm(crate::actor::wm_controller::WmCmd::SpaceOrWorkset(2))
         )));
-        assert!(config.keys.iter().any(|(_, command)| matches!(
-            command,
-            WmCommand::Wm(crate::actor::wm_controller::WmCmd::WorksetOnSpace {
-                desktop: 2,
-                name
-            }) if name == "terminal"
-        )));
+        let workset = |want: &str| {
+            config.keys.iter().find_map(|(_, command)| match command {
+                WmCommand::Wm(crate::actor::wm_controller::WmCmd::WorksetOnSpace {
+                    desktop,
+                    name,
+                }) if name == want => Some(desktop.clone()),
+                _ => None,
+            })
+        };
+
+        // Without a display the command follows focus, as it always has.
+        assert_eq!(workset("terminal"), Some(DesktopSelector::focused(2)));
+
+        // Naming a display pins the binding to it, and parks by default.
+        assert_eq!(
+            workset("home"),
+            Some(DesktopSelector {
+                desktop: 3,
+                display: Some(DisplaySelector::Builtin),
+                when_missing: WhenDisplayMissing::Park,
+            })
+        );
+
+        // A UUID names one physical display, and the fallback is opt-in.
+        assert_eq!(
+            workset("office"),
+            Some(DesktopSelector {
+                desktop: 1,
+                display: Some(DisplaySelector::Uuid(
+                    "84EFFBF0-1178-405C-9D64-3B574C1BE249".to_owned()
+                )),
+                when_missing: WhenDisplayMissing::FallBackToBuiltin,
+            })
+        );
     }
 }

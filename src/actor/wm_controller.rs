@@ -24,6 +24,7 @@ type StartupReceiver = mpsc::UnboundedReceiver<()>;
 
 use crate::actor::app::AppInfo;
 use crate::actor::{self, mouse, reactor, space_manager, status, window_server};
+use crate::config::DesktopSelector;
 use crate::sys;
 use crate::sys::bundle::CommandOutput;
 use crate::sys::event::HotkeyManager;
@@ -65,7 +66,8 @@ pub enum WmCmd {
     SpaceOrWorkset(usize),
     /// Activates a named Workset on a particular native macOS Space.
     WorksetOnSpace {
-        desktop: usize,
+        #[serde(flatten)]
+        desktop: DesktopSelector,
         name: String,
     },
     Exec(ExecCmd),
