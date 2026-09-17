@@ -32,6 +32,20 @@ const LAYER_STATUS: i32 = 8; // kCGStatusWindowLevel (used by some panels)
 
 /// Actor that takes events from app actors and adds information from the window
 /// server before sending them on to the Reactor via the SpaceManager.
+/// How long to wait before re-reading an inconsistent screen configuration.
+///
+/// Waking from sleep re-enumerates displays far more slowly than unlocking
+/// does, especially with external displays powered off, so the ladder runs
+/// longer than the sub-second one unlock needs.
+const RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_millis(1000),
+    Duration::from_millis(2000),
+    Duration::from_millis(4000),
+];
+
 pub struct WindowServer {
     screen_cache: ScreenCache,
     /// Window server IDs currently visible on screen.
@@ -223,11 +237,6 @@ impl WindowServer {
     }
 
     fn schedule_screen_config_retry(&mut self) {
-        const RETRY_DELAYS: [Duration; 3] = [
-            Duration::from_millis(100),
-            Duration::from_millis(250),
-            Duration::from_millis(500),
-        ];
         if self.screen_config_retry_pending {
             return;
         }
@@ -475,7 +484,7 @@ mod tests {
         let mut h = TestHarness::new();
         // Pretend the retries for one inconsistent update are exhausted. This
         // takes the give-up branch, so no retry is scheduled.
-        h.ws.screen_config_retry_attempt = 3;
+        h.ws.screen_config_retry_attempt = super::RETRY_DELAYS.len() as u8;
         h.ws.schedule_screen_config_retry();
         assert!(!h.ws.screen_config_retry_pending);
         // The next inconsistent update should get its own retries rather than
