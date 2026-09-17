@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-09-16
 **Current objective:** Evolve the stable private fork into a hybrid tiling and snapping window manager for keyboard and mouse power users.
-**Overall state:** `fork-v0.2.15-r7` stable checkpoint · Worksets opt-in behind a config flag · display-aware desktops for bindings, window rules, and managed spaces · 314 automated tests passing
+**Overall state:** `fork-v0.2.15-r8` stable checkpoint · Worksets opt-in behind a config flag · display-aware desktops resolved by display identity · 318 automated tests passing
 
 ---
 
@@ -12,7 +12,7 @@
 - `src/model/layout_tree.rs` and `src/model/size.rs`: tree/group manipulation, exact proportions, balancing, automatic root orientation, and configurable gapless fullscreen/single-window layouts.
 - `src/actor/drop_preview.rs` and `src/ui/group_bar.rs`: visual drop previews and indicators for stacked/tabbed groups.
 - `glide.default.toml`: upstream-compatible defaults for fork commands and settings.
-- `FORK.md` and `CHANGELOG.md`: fork behavior, release history, and versioning documented through `fork-v0.2.15-r7`.
+- `FORK.md` and `CHANGELOG.md`: fork behavior, release history, and versioning documented through `fork-v0.2.15-r8`.
 - `TODO.md`: make-a-change roadmap prioritizing Worksets, precision placement, a scriptable API, Recipes, and pinned windows.
 - `WORKSETS.md`: canonical Space, Workset, Layout, Window, Role, Slot, Recipe, pinning, and Stage Manager ontology.
 - Named Worksets: per-Space layouts, direct selection, cycling, rule-based routing, focus restoration, inactive-window suppression, and HUD feedback.

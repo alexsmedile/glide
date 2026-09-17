@@ -1,5 +1,12 @@
 # Changelog
 
+## Fork v0.2.15 r8 (2026-09-17)
+
+### Bug Fixes
+
+* Resolve `display = "builtin"` by asking macOS which display is main, instead of taking the first entry of the window server's display list. After waking with an external display powered off, that list could put the other display first, and every binding and window rule pinned to `builtin` resolved against the wrong display's desktops. `when_missing` now applies to `builtin` too.
+* Keep retrying an inconsistent screen configuration for about 7.8s instead of 850ms. Waking from sleep re-enumerates displays more slowly than unlocking, and giving up early left the reactor working from stale screen frames.
+
 ## Fork v0.2.15 r7 (2026-09-17)
 
 ### Features

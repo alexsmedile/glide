@@ -7,7 +7,7 @@ The config that drives it lives in its own repo at
 `~/code/utils/glide-config`, and requires this fork — upstream rejects it with
 a parse error.
 
-The library contains 307 tests. Of those, 303 pass in the automation
+The library contains 318 tests. Of those, 314 pass in the automation
 environment; four macOS GUI/IPC integration tests require a live LaunchServices
 and message-port context.
 
@@ -24,6 +24,7 @@ workflow.
 
 | Release | Upstream base | Contents |
 |---|---|---|
+| `fork-v0.2.15-r8` | `v0.2.15` | Correct `builtin` display resolution and screen-configuration recovery after waking from sleep. |
 | `fork-v0.2.15-r7` | `v0.2.15` | Worksets behind an opt-in flag, desktop numbering that matches Mission Control, and display-aware desktops for bindings, window rules, and managed spaces. |
 | `fork-v0.2.15-r6` | `v0.2.15` | Deterministic complete Workset activation across applications, remembered-focus restoration, and verified retry of incomplete window layers. |
 | `fork-v0.2.15-r5` | `v0.2.15` | Named per-Space Worksets, native Space handoff, Workset HUD and routing, reliable group activation, and transient-window crash/flicker fixes. |
