@@ -288,8 +288,39 @@ impl NSScreenExt for NSScreen {
 /// second space *of one display*, matching what Mission Control shows. A
 /// space number is only meaningful together with a display.
 fn spaces_of_display(on_display: SpaceId) -> Option<Vec<SpaceId>> {
+    for ids in displays_with_user_spaces()? {
+        if ids.contains(&on_display) {
+            return Some(ids);
+        }
+    }
+    None
+}
+
+/// The type macOS reports for an ordinary desktop, as opposed to the tile a
+/// fullscreen or Split View app gets.
+const SPACE_TYPE_USER: i64 = 0;
+
+/// Whether a space with this reported type is one of the desktops macOS
+/// numbers.
+///
+/// A space whose type is missing or unreadable counts as a desktop: wrongly
+/// skipping one renumbers every desktop after it, which is worse than counting
+/// a fullscreen tile we failed to identify.
+fn is_user_space(ty: Option<i64>) -> bool {
+    ty.is_none_or(|ty| ty == SPACE_TYPE_USER)
+}
+
+/// Each display's user-facing desktops, in the order macOS presents them.
+///
+/// Fullscreen and Split View apps occupy spaces of their own in the window
+/// server's list, but Mission Control does not number them and neither does
+/// the native Desktop shortcut. Counting them here would shift every desktop
+/// number after the fullscreen window for as long as it stays fullscreen, so
+/// they are filtered out and only `type == 0` spaces are numbered.
+fn displays_with_user_spaces() -> Option<Vec<Vec<SpaceId>>> {
     let cid = unsafe { CGSMainConnectionID() };
     let space_info = unsafe { Retained::from_raw(CGSCopyManagedDisplaySpaces(cid))? };
+    let mut displays = Vec::new();
     for screen in space_info {
         let Ok(screen) = screen.downcast::<NSDictionary>() else {
             continue;
@@ -304,16 +335,19 @@ fn spaces_of_display(on_display: SpaceId) -> Option<Vec<SpaceId>> {
             .iter()
             .filter_map(|space| {
                 let space = space.downcast::<NSDictionary>().ok()?;
+                let ty = space
+                    .valueForKey(ns_string!("type"))
+                    .and_then(|ty| ty.downcast::<NSNumber>().ok())
+                    .map(|ty| ty.as_i64());
                 let id: Retained<NSNumber> =
                     space.valueForKey(ns_string!("ManagedSpaceID"))?.downcast().ok()?;
-                NonZeroU64::new(id.as_u64()).map(SpaceId)
+                let id = NonZeroU64::new(id.as_u64()).map(SpaceId)?;
+                is_user_space(ty).then_some(id)
             })
             .collect();
-        if ids.contains(&on_display) {
-            return Some(ids);
-        }
+        displays.push(ids);
     }
-    None
+    Some(displays)
 }
 
 /// Returns the space at a user-facing position on the display that currently
@@ -330,29 +364,18 @@ pub fn space_with_number(number: usize, on_display: SpaceId) -> Option<SpaceId> 
 
 /// Returns the user-facing number of the currently active space.
 ///
+/// Numbered within its own display, the same way [`space_with_number`] reads a
+/// number from config, so the status icon and a binding agree on what "Desktop
+/// 2" means. Numbering across displays instead would label the second
+/// display's only desktop with whatever the first display's count reached.
+///
 /// Note: This relies on private APIs and might break.
 pub fn get_active_space_number() -> Option<usize> {
     let cid = unsafe { CGSMainConnectionID() };
-    let space_info = unsafe { Retained::from_raw(CGSCopyManagedDisplaySpaces(cid))? };
-    let active_id = unsafe { CGSGetActiveSpace(cid) };
-    let mut count = 0;
-    for screen in space_info {
-        let screen: Retained<NSDictionary> = screen.downcast().ok()?;
-        let spaces: Retained<NSArray> =
-            screen.valueForKey(ns_string!("Spaces"))?.downcast().ok()?;
-        for space in spaces {
-            count += 1;
-            let Some(id) = (|| {
-                let space: Retained<NSDictionary> = space.downcast().ok()?;
-                let id: Retained<NSNumber> =
-                    space.valueForKey(ns_string!("ManagedSpaceID"))?.downcast().ok()?;
-                Some(id)
-            })() else {
-                continue;
-            };
-            if id.as_u64() == active_id {
-                return Some(count);
-            }
+    let active_id = NonZeroU64::new(unsafe { CGSGetActiveSpace(cid) }).map(SpaceId)?;
+    for ids in displays_with_user_spaces()? {
+        if let Some(index) = ids.iter().position(|&id| id == active_id) {
+            return Some(index + 1);
         }
     }
     None
@@ -438,7 +461,9 @@ bitflags! {
 mod test {
     use objc2_core_foundation::{CFRetained, CFString, CGPoint, CGRect, CGSize};
 
-    use super::{CGError, CGScreenInfo, NSScreenInfo, ScreenCache, ScreenId, System};
+    use super::{
+        CGError, CGScreenInfo, NSScreenInfo, ScreenCache, ScreenId, System, is_user_space,
+    };
 
     struct Stub {
         cg_screens: Vec<CGScreenInfo>,
@@ -517,5 +542,16 @@ mod test {
         });
         assert!(sc.update_screen_config(ns_screens).is_none());
         assert_eq!(sc.uuids.len(), 1);
+    }
+
+    #[test]
+    fn only_desktops_are_numbered() {
+        // Mission Control numbers desktops but not the tile a fullscreen or
+        // Split View app gets, so a number from config has to skip those.
+        assert!(is_user_space(Some(0)));
+        assert!(!is_user_space(Some(4)));
+
+        // An unreadable type counts, so a desktop is never skipped by accident.
+        assert!(is_user_space(None));
     }
 }
