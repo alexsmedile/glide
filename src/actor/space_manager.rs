@@ -15,7 +15,8 @@ use crate::actor::{group_bars, mouse, reactor, status, window_server, wm_control
 use crate::collections::HashSet;
 use crate::config::{Config, DesktopSelector, DesktopSelectorOrNumber, WhenDisplayMissing};
 use crate::sys::screen::{
-    CoordinateConverter, DisplaySelector, ScreenId, SpaceId, space_on_display, space_with_number,
+    CoordinateConverter, DesktopLookup, DisplaySelector, ScreenId, SpaceId, space_on_display,
+    space_with_number,
 };
 use crate::sys::window_server::WindowsOnScreen;
 
@@ -314,7 +315,12 @@ impl SpaceManager {
                 // A bare number is a position on any display, so it is matched
                 // against the space's own display rather than the focused one.
                 None => space_with_number(selector.desktop, space) == Some(space),
-                Some(display) => space_on_display(display, selector.desktop) == Some(space),
+                // Resolved the same way a command is, so a managed desktop
+                // follows its `when_missing` policy onto the fallback display.
+                Some(display) => {
+                    Self::resolve_on_display(display, selector.desktop, selector.when_missing)
+                        == Some(space)
+                }
             })
     }
 
@@ -370,14 +376,35 @@ impl SpaceManager {
         let Some(display) = &selector.display else {
             return self.target_space(selector.desktop);
         };
-        if let Some(space) = space_on_display(display, selector.desktop) {
-            return Some(space);
-        }
-        match selector.when_missing {
-            WhenDisplayMissing::Park => None,
-            WhenDisplayMissing::FallBackToBuiltin => {
-                space_on_display(&DisplaySelector::Builtin, selector.desktop)
+        Self::resolve_on_display(display, selector.desktop, selector.when_missing)
+    }
+
+    /// The Space at `desktop` on a named display, applying `when_missing` only
+    /// when that display is absent.
+    ///
+    /// A connected display that simply has no such desktop is a config error,
+    /// and falling back to another display would put the Workset somewhere the
+    /// user never named.
+    fn resolve_on_display(
+        wanted: &DisplaySelector,
+        desktop: usize,
+        when_missing: WhenDisplayMissing,
+    ) -> Option<SpaceId> {
+        match space_on_display(wanted, desktop) {
+            DesktopLookup::Found(space) => Some(space),
+            DesktopLookup::NoSuchDesktop => {
+                warn!(?wanted, desktop, "Display has no such desktop");
+                None
             }
+            DesktopLookup::DisplayMissing => match when_missing {
+                WhenDisplayMissing::Park => None,
+                WhenDisplayMissing::FallBackToBuiltin => {
+                    match space_on_display(&DisplaySelector::Builtin, desktop) {
+                        DesktopLookup::Found(space) => Some(space),
+                        _ => None,
+                    }
+                }
+            },
         }
     }
 
@@ -400,7 +427,11 @@ impl SpaceManager {
     }
 
     fn workset_on_space(&mut self, desktop: usize, target: SpaceId, name: String) {
-        if self.focused_space() == Some(target) {
+        // Displays have their own Spaces, so the target can already be on
+        // screen without being the focused one. Switching in that case would
+        // send the native shortcut to the focused display and land somewhere
+        // else entirely.
+        if self.cur_space.contains(&Some(target)) {
             self.activate_workset(target, name);
         } else {
             self.pending_workset = Some(PendingWorkset { target, name });

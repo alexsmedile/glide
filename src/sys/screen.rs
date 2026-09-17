@@ -378,14 +378,29 @@ pub enum DisplaySelector {
 }
 
 impl FromStr for DisplaySelector {
-    type Err = std::convert::Infallible;
+    type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s.to_ascii_lowercase().as_str() {
-            "builtin" | "main" | "primary" => DisplaySelector::Builtin,
-            _ => DisplaySelector::Uuid(s.to_owned()),
-        })
+        match s.to_ascii_lowercase().as_str() {
+            "builtin" | "main" | "primary" => Ok(DisplaySelector::Builtin),
+            _ if is_display_uuid(s) => Ok(DisplaySelector::Uuid(s.to_owned())),
+            _ => Err(format!(
+                "expected \"builtin\" or a display UUID like \
+                 \"84EFFBF0-1178-405C-9D64-3B574C1BE249\", found {s:?}"
+            )),
+        }
     }
+}
+
+/// Whether this is the UUID shape the window server uses for a display.
+///
+/// Checked so a misspelled alias such as `"buitlin"` is a config error rather
+/// than a UUID that silently never matches any display.
+fn is_display_uuid(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.len() == 5
+        && [8, 4, 4, 4, 12] == groups.iter().map(|g| g.len()).collect::<Vec<_>>()[..]
+        && groups.iter().all(|g| g.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Deserialized from a plain string, so config writes `display = "builtin"` or
@@ -393,7 +408,7 @@ impl FromStr for DisplaySelector {
 impl<'de> Deserialize<'de> for DisplaySelector {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let name = String::deserialize(deserializer)?;
-        Ok(name.parse().expect("parsing a display selector cannot fail"))
+        name.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -421,13 +436,30 @@ pub fn spaces_of_selected_display(selector: &DisplaySelector) -> Option<Vec<Spac
     }
 }
 
-/// The space at a user-facing position on a named display.
+/// The result of looking up a desktop on a named display.
 ///
-/// Returns `None` when the display is disconnected or has no such desktop, so
-/// the caller can decide whether to fall back or to wait for the display.
-pub fn space_on_display(selector: &DisplaySelector, number: usize) -> Option<SpaceId> {
-    let spaces = spaces_of_selected_display(selector)?;
-    spaces.get(number.checked_sub(1)?).copied()
+/// A disconnected display and a display without that many desktops are
+/// different situations: the first is temporary and the caller may want to
+/// wait for the display or fall back, while the second is a config error that
+/// falling back would only hide.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum DesktopLookup {
+    Found(SpaceId),
+    /// The display is connected, but has no desktop at that position.
+    NoSuchDesktop,
+    /// The display is not currently connected.
+    DisplayMissing,
+}
+
+/// The space at a user-facing position on a named display.
+pub fn space_on_display(selector: &DisplaySelector, number: usize) -> DesktopLookup {
+    let Some(spaces) = spaces_of_selected_display(selector) else {
+        return DesktopLookup::DisplayMissing;
+    };
+    match number.checked_sub(1).and_then(|index| spaces.get(index)) {
+        Some(&space) => DesktopLookup::Found(space),
+        None => DesktopLookup::NoSuchDesktop,
+    }
 }
 
 /// Returns the space at a user-facing position on the display that currently
@@ -542,7 +574,8 @@ mod test {
     use objc2_core_foundation::{CFRetained, CFString, CGPoint, CGRect, CGSize};
 
     use super::{
-        CGError, CGScreenInfo, NSScreenInfo, ScreenCache, ScreenId, System, is_user_space,
+        CGError, CGScreenInfo, DisplaySelector, NSScreenInfo, ScreenCache, ScreenId, System,
+        is_user_space,
     };
 
     struct Stub {
@@ -622,6 +655,29 @@ mod test {
         });
         assert!(sc.update_screen_config(ns_screens).is_none());
         assert_eq!(sc.uuids.len(), 1);
+    }
+
+    #[test]
+    fn display_selector_rejects_a_misspelled_alias() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            DisplaySelector::from_str("builtin"),
+            Ok(DisplaySelector::Builtin)
+        );
+        assert_eq!(DisplaySelector::from_str("MAIN"), Ok(DisplaySelector::Builtin));
+        assert_eq!(
+            DisplaySelector::from_str("84EFFBF0-1178-405C-9D64-3B574C1BE249"),
+            Ok(DisplaySelector::Uuid(
+                "84EFFBF0-1178-405C-9D64-3B574C1BE249".to_owned()
+            ))
+        );
+
+        // A typo would otherwise become a UUID that never matches a display,
+        // silently parking or falling back forever.
+        assert!(DisplaySelector::from_str("buitlin").is_err());
+        assert!(DisplaySelector::from_str("").is_err());
+        assert!(DisplaySelector::from_str("not-a-uuid").is_err());
     }
 
     #[test]

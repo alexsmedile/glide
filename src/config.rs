@@ -298,15 +298,30 @@ impl DesktopSelector {
 /// table form.
 impl<'de> Deserialize<'de> for DesktopSelectorOrNumber {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A standalone entry is a table of its own, so unknown keys are a
+        // typo rather than a neighbouring field of some larger table, and
+        // silently managing every display is worse than a config error.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Strict {
+            desktop: usize,
+            #[serde(default)]
+            display: Option<DisplaySelector>,
+            #[serde(default)]
+            when_missing: WhenDisplayMissing,
+        }
+
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Repr {
             Number(usize),
-            Table(DesktopSelector),
+            Table(Strict),
         }
         Ok(DesktopSelectorOrNumber(match Repr::deserialize(deserializer)? {
             Repr::Number(n) => DesktopSelector::focused(n),
-            Repr::Table(selector) => selector,
+            Repr::Table(Strict { desktop, display, when_missing }) => {
+                DesktopSelector { desktop, display, when_missing }
+            }
         }))
     }
 }
