@@ -95,6 +95,14 @@ checkpoint before it earns a `feat/*` branch.
   - [ ] Reinsert before or after a target and shift its siblings
   - [ ] Move a selected container when selection has ascended
   - [ ] Give swap, insertion, split, and group operations visually distinct previews
+- [ ] [layout] Make an unmodified drag reorder or swap tiled windows
+  - [ ] Drop a window onto a sibling in a single-axis container to reorder it: dragging `[1][2][3]` so 1 lands past 3 gives `[2][3][1]`
+  - [ ] Drop a window onto a target in any other layout to swap the two windows in place, leaving both containers otherwise unchanged
+  - [ ] Choose reorder or swap from the drop target's container, not from a modifier or a separate binding
+  - [ ] Keep Alt for tree editing, so unmodified drags never split a container or build a group
+  - [ ] Distinguish reorder from swap in the drop overlay before the button is released
+  - [ ] Leave the existing screen-edge snap targets reachable for a drag that ends outside any tiled window
+  - [ ] Lift the `modifiers.alt_held` gate on layout drags in `reactor.rs:817`, which currently routes every unmodified drag to floating snap
 - [ ] [history] Add bounded per-Space undo and redo for layout mutations
   - [ ] Record split, group, ungroup, move, swap, float, snap, resize, balance, placeholder, and recipe operations
   - [ ] Exclude focus-only changes from history
