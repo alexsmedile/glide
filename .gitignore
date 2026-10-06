@@ -13,3 +13,7 @@
 # Agents
 .claude/settings.local.json
 /agents.local.md
+
+# OPF local companions (shared content is committed; personal notes stay local)
+*.local.*
+.octopus.local/

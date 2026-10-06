@@ -1,12 +1,24 @@
+---
+schema: make-a-change/status/v1
+updated: 2026-09-19
+summary: "Stable private fork at fork-v0.2.15-r8; Worksets opt-in; 318 automated tests passing."
+next: "Keep runtime-checking transient surfaces and Workset switching; next roadmap item is the Workset domain model."
+branch: main
+---
+
 # Status — Glide Fork
 
-**Last updated:** 2026-09-16
+## Resume here
+
+1. `git status --short --branch`
+2. Read «Current state» below, then the Now section of [TODO.md](TODO.md) (Worksets, precision placement, scriptable API).
+
 **Current objective:** Evolve the stable private fork into a hybrid tiling and snapping window manager for keyboard and mouse power users.
 **Overall state:** `fork-v0.2.15-r8` stable checkpoint · Worksets opt-in behind a config flag · display-aware desktops resolved by display identity · 318 automated tests passing
 
 ---
 
-## 1. Verified Completed Outputs
+## Current state
 
 - `src/actor/reactor.rs` and `src/actor/layout.rs`: reliable remembered focus on multi-display Space changes, mouse drop handling, floating restoration, screen snapping, and group navigation.
 - `src/model/layout_tree.rs` and `src/model/size.rs`: tree/group manipulation, exact proportions, balancing, automatic root orientation, and configurable gapless fullscreen/single-window layouts.
@@ -38,7 +50,7 @@
 - There is no user-facing undo history for accidental tree restructuring.
 - Focus and group navigation exist, but recent-focus navigation, marks, scratchpads, sticky windows, and a searchable window switcher do not.
 
-## 4. Next Concrete Steps (Ordered)
+## Next
 
 1. [ ] Continue runtime-checking Chrome/Chromium transient surfaces and Workset switching over normal work sessions.
 2. [ ] Specify configurable snap targets: activation region, destination frame, display orientation, modifier, priority, and repeated-action cycle.
