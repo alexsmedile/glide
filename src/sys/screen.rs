@@ -307,6 +307,12 @@ pub fn get_active_space_number() -> Option<usize> {
     None
 }
 
+/// Returns whether `space` is a native fullscreen space.
+pub fn is_native_fullscreen_space(space: SpaceId) -> bool {
+    const FULLSCREEN: c_int = 4;
+    unsafe { CGSSpaceGetType(CGSMainConnectionID(), space.0.get()) == FULLSCREEN }
+}
+
 /// Utilities for querying the current system configuration. For diagnostic purposes only.
 #[allow(dead_code)]
 pub mod diagnostic {
@@ -354,6 +360,7 @@ unsafe extern "C" {
     fn CGSCopyManagedDisplays(cid: c_int) -> Option<NonNull<CFArray>>;
     fn CGSCopyManagedDisplaySpaces(cid: c_int) -> *mut NSArray;
     fn CGSManagedDisplayGetCurrentSpace(cid: c_int, uuid: &CFString) -> u64;
+    fn CGSSpaceGetType(cid: c_int, sid: u64) -> c_int;
     fn CGSCopyBestManagedDisplayForRect(cid: c_int, rect: CGRect) -> Option<NonNull<CFString>>;
 }
 

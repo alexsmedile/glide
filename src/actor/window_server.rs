@@ -14,7 +14,7 @@ use crate::actor::app::{self, AppInfo, AppThreadHandle, Quiet, WindowId, WindowI
 use crate::actor::{self, reactor, space_manager, wm_controller};
 use crate::collections::HashMap;
 use crate::sys::event::MouseState;
-use crate::sys::screen::{NSScreenInfo, ScreenCache, ScreenInfo, SpaceId};
+use crate::sys::screen::{self, NSScreenInfo, ScreenCache, ScreenInfo, SpaceId};
 use crate::sys::window_server::{
     self as sys_ws, SkylightConnection, SkylightNotifier, WindowServerId, WindowsOnScreen,
     kCGSWindowIsTerminated,
@@ -141,7 +141,7 @@ impl WindowServer {
                 self.handle_screen_parameters(screens);
             }
             Event::SpaceChanged | Event::RequestSpaceRefresh => {
-                let spaces = self.screen_cache.get_screen_spaces();
+                let spaces = self.screen_spaces();
                 let on_screen = self.get_windows_on_screen();
                 self.sm_tx.send(space_manager::Event::SpaceChanged(spaces, on_screen));
             }
@@ -185,6 +185,15 @@ impl WindowServer {
         }
     }
 
+    // Returns the screen spaces, leaving out native fullscreen spaces, which aren't managed.
+    fn screen_spaces(&self) -> Vec<Option<SpaceId>> {
+        self.screen_cache
+            .get_screen_spaces()
+            .into_iter()
+            .map(|space| space.filter(|&space| !screen::is_native_fullscreen_space(space)))
+            .collect()
+    }
+
     fn handle_screen_parameters(&mut self, ns_screens: Vec<NSScreenInfo>) {
         let Some((screens, converter)) = self.screen_cache.update_screen_config(ns_screens) else {
             self.schedule_screen_config_retry();
@@ -202,7 +211,7 @@ impl WindowServer {
         let on_screen = self.get_windows_on_screen();
         let config = ScreenConfig {
             screens,
-            spaces: self.screen_cache.get_screen_spaces(),
+            spaces: self.screen_spaces(),
             visible: on_screen.visible.clone(),
         };
         if self.last_screen_config.as_ref() == Some(&config) {
