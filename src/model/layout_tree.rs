@@ -1009,6 +1009,10 @@ impl tree::Observer for Components {
         // Decide whether to cull the parent node (which must be a container).
         if parent.parent(&tree.map).is_none() {
             // Don't cull the root node, which would require extra bookkeeping.
+            // Reset it once empty so there's no group bar.
+            if parent.is_empty(&tree.map) {
+                tree.data.size.reset_root(parent);
+            }
             return;
         }
         if parent.is_empty(&tree.map) {
@@ -1446,6 +1450,18 @@ mod tests {
 
         tree.remove_window(WindowId::new(2, 1));
         tree.assert_children_are([a1, a3], root);
+    }
+
+    #[test]
+    fn remove_last_window_resets_root() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        tree.set_container_kind(root, ContainerKind::Stacked);
+        tree.add_window_under(layout, root, WindowId::new(1, 1));
+
+        tree.remove_window(WindowId::new(1, 1));
+        assert_eq!(tree.container_kind(root), ContainerKind::Horizontal);
     }
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> CGRect {

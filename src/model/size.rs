@@ -200,6 +200,13 @@ impl Size {
         }
     }
 
+    pub(super) fn reset_root(&mut self, node: NodeId) {
+        let info = &mut self.info[node];
+        info.kind = ContainerKind::default();
+        info.last_ungrouped_kind = ContainerKind::default();
+        info.is_fullscreen = false;
+    }
+
     pub(super) fn kind(&self, node: NodeId) -> ContainerKind {
         self.info[node].kind
     }
@@ -474,6 +481,7 @@ impl<'a, 'out> Visitor<'a, 'out> {
                     );
                 }
 
+                debug_assert!(num_children > 0, "empty group {node:?}");
                 if let Some(groups) = self.groups.as_deref_mut()
                     && let Some(indicator_frame) = indicator_frame
                 {
