@@ -1009,7 +1009,7 @@ impl tree::Observer for Components {
         // Decide whether to cull the parent node (which must be a container).
         if parent.parent(&tree.map).is_none() {
             // Don't cull the root node, which would require extra bookkeeping.
-            // Reset it once empty instead.
+            // Reset it once empty so there's no group bar.
             if parent.is_empty(&tree.map) {
                 tree.data.size.reset_root(parent);
             }
