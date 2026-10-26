@@ -535,7 +535,11 @@ impl LayoutManager {
             LayoutEvent::SpaceExposed(space, size) => {
                 self.debug_tree(space);
                 let kind = self.default_layout_kind;
-                let orientation = self.config.settings.default_root_orientation.resolve(size);
+                let orientation = if size.height > size.width {
+                    Orientation::Vertical
+                } else {
+                    Orientation::Horizontal
+                };
                 {
                     let mapping = self.layout_mapping.entry(space).or_insert_with(|| {
                         SpaceLayoutMapping::new(size, &mut self.tree, kind, orientation)
@@ -2978,19 +2982,10 @@ mod tests {
         );
     }
 
-    use crate::model::RootOrientation;
-
-    fn config_with_root_orientation(orientation: RootOrientation) -> Arc<Config> {
-        let mut config = Config::default();
-        config.settings.default_root_orientation = orientation;
-        Arc::new(config)
-    }
-
     #[test]
-    fn auto_root_orientation_stacks_windows_on_a_portrait_screen() {
+    fn it_arranges_windows_vertically_on_a_portrait_screen() {
         use LayoutEvent::*;
         let mut mgr = LayoutManager::new_for_test();
-        mgr.set_config(&config_with_root_orientation(RootOrientation::Auto));
         let space = SpaceId::new(1);
         let pid = 1;
         let windows = make_windows(pid, 2);
@@ -3009,10 +3004,9 @@ mod tests {
     }
 
     #[test]
-    fn auto_root_orientation_leaves_a_landscape_screen_side_by_side() {
+    fn it_arranges_windows_horizontally_on_a_landscape_screen() {
         use LayoutEvent::*;
         let mut mgr = LayoutManager::new_for_test();
-        mgr.set_config(&config_with_root_orientation(RootOrientation::Auto));
         let space = SpaceId::new(1);
         let pid = 1;
         let windows = make_windows(pid, 2);
@@ -3025,29 +3019,6 @@ mod tests {
             vec![
                 (WindowId::new(pid, 1), rect(0, 0, 150, 100)),
                 (WindowId::new(pid, 2), rect(150, 0, 150, 100)),
-            ],
-            mgr.layout_sorted(space, screen),
-        );
-    }
-
-    #[test]
-    fn default_root_orientation_ignores_the_screen_shape() {
-        use LayoutEvent::*;
-        let mut mgr = LayoutManager::new_for_test();
-        let space = SpaceId::new(1);
-        let pid = 1;
-        let windows = make_windows(pid, 2);
-
-        // The default is horizontal, so a portrait screen still splits
-        // across rather than stacking.
-        let screen = rect(0, 0, 100, 300);
-        _ = mgr.handle_event(SpaceExposed(space, screen.size));
-        _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, windows));
-
-        assert_eq!(
-            vec![
-                (WindowId::new(pid, 1), rect(0, 0, 50, 300)),
-                (WindowId::new(pid, 2), rect(50, 0, 50, 300)),
             ],
             mgr.layout_sorted(space, screen),
         );
