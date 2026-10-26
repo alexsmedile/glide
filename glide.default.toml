@@ -138,7 +138,7 @@ default_keys = false
 
 # Reset every container on the space to divide its space evenly, undoing any
 # resizing.
-"Alt + Shift + Digit0" = "balance"
+"Alt + Ctrl + Digit0" = "balance"
 
 # Float the current node. Floating windows are allowed to overlap and keep
 # whatever size and position you give them. Note that they do not actually
